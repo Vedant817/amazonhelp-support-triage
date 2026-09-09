@@ -34,9 +34,7 @@ class PolicyVerificationResult:
 
 
 class ProductionPolicyGuard:
-    """
-    Enterprise-grade pre-dispatch safety and grounding guardrail for @AmazonHelp.
-    """
+    """Deterministic pre-dispatch safety checks for the prototype."""
     def __init__(self):
         # Whitelisted authoritative Amazon service endpoints
         self.allowed_domains = [

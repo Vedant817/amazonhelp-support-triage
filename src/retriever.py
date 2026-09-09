@@ -2,7 +2,7 @@
 Hybrid Resolution Retriever for @AmazonHelp.
 Combines:
 1. Okapi BM25 sparse keyword ranking (exact tokens, order numbers, carriers, error terms)
-2. Sublinear N-gram TF-IDF vector similarity (semantic phrase matching)
+2. MiniLM dense-vector similarity (semantic phrase matching)
 3. Reciprocal Rank Fusion (RRF with k=20) over positive candidates
 Includes zero-score protection against degenerate queries.
 """
@@ -17,6 +17,7 @@ from typing import List, Dict, Any, Optional
 from collections import Counter
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from src.supervision import infer_resolution_act, strip_agent_pii
 
 class BM25Index:
     """Lightweight pure-python Okapi BM25 index."""
@@ -74,10 +75,10 @@ class BM25Index:
 
 class HistoricalResolutionRetriever:
     """
-    Hybrid Retriever combining Okapi BM25 and Dense TF-IDF via Reciprocal Rank Fusion (RRF).
+    Hybrid Retriever combining Okapi BM25 and MiniLM vectors via Reciprocal Rank Fusion (RRF).
     Tuned with k_rrf=20 for short customer support tweets.
     """
-    def __init__(self, top_k: int = 3, rrf_k: int = 20):
+    def __init__(self, top_k: int = 3, rrf_k: int = 20, dense_encoder: Any = None):
         self.top_k = top_k
         self.rrf_k = rrf_k
         self.vectorizer = TfidfVectorizer(
@@ -86,11 +87,13 @@ class HistoricalResolutionRetriever:
             max_features=25000
         )
         self.bm25 = BM25Index()
+        self.dense_encoder = dense_encoder
         self.records: List[Dict[str, Any]] = []
         self.tfidf_matrix = None
+        self.dense_matrix = None
 
     def build_index(self, pairs_df: pd.DataFrame):
-        """Builds both sparse BM25 and dense TF-IDF search indices."""
+        """Build the BM25 index plus MiniLM vectors when an encoder is configured."""
         self.records = []
         texts = []
 
@@ -103,14 +106,17 @@ class HistoricalResolutionRetriever:
                 self.records.append({
                     "id": idx,
                     "customer_text": cust_text,
-                    "reply_text": reply_text,
+                    "reply_text": strip_agent_pii(reply_text),
                     "intent": intent,
+                    "resolution_act": row.get("resolution_act", infer_resolution_act(reply_text)),
                     "reply_id": row.get("reply_id", "")
                 })
                 texts.append(cust_text)
 
         if texts:
             self.tfidf_matrix = self.vectorizer.fit_transform(texts)
+            if self.dense_encoder is not None:
+                self.dense_matrix = self.dense_encoder.encode(texts)
             self.bm25.fit(texts)
         return self
 
@@ -125,19 +131,25 @@ class HistoricalResolutionRetriever:
         Safely returns empty list on zero-score/empty queries.
         """
         k = top_k or self.top_k
-        if not self.records or self.tfidf_matrix is None or not query.strip():
+        if not self.records or not query.strip():
             return []
 
-        # 1. Dense TF-IDF Cosine Similarity Ranking
-        query_vec = self.vectorizer.transform([query])
-        tfidf_scores = cosine_similarity(query_vec, self.tfidf_matrix)[0]
+        # 1. Dense MiniLM similarity. TF-IDF remains only for the explicit baseline.
+        if self.dense_encoder is not None and self.dense_matrix is not None:
+            query_vec = self.dense_encoder.encode([query])[0]
+            dense_scores = np.asarray(self.dense_matrix @ query_vec, dtype=float)
+        elif self.tfidf_matrix is not None:
+            query_vec = self.vectorizer.transform([query])
+            dense_scores = cosine_similarity(query_vec, self.tfidf_matrix)[0]
+        else:
+            return []
 
         # 2. Sparse BM25 Ranking
         q_tokens = self.bm25._tokenize(query)
         bm25_scores = self.bm25.score(q_tokens)
 
         # Zero-score check: if both models have zero match, return empty
-        max_tfidf = float(np.max(tfidf_scores)) if len(tfidf_scores) > 0 else 0.0
+        max_tfidf = float(np.max(dense_scores)) if len(dense_scores) > 0 else 0.0
         max_bm25 = float(np.max(bm25_scores)) if len(bm25_scores) > 0 else 0.0
         if max_tfidf <= 0.0 and max_bm25 <= 0.0:
             return []
@@ -150,10 +162,10 @@ class HistoricalResolutionRetriever:
                 candidate_ids = filtered
 
         # 3. Restrict ranking to positive score documents (Top-50 pool per modality)
-        pos_tfidf = [i for i in candidate_ids if tfidf_scores[i] > 0.0]
+        pos_tfidf = [i for i in candidate_ids if dense_scores[i] > 0.0]
         pos_bm25 = [i for i in candidate_ids if bm25_scores[i] > 0.0]
 
-        top_tfidf = sorted(pos_tfidf, key=lambda i: tfidf_scores[i], reverse=True)[:50]
+        top_tfidf = sorted(pos_tfidf, key=lambda i: dense_scores[i], reverse=True)[:50]
         top_bm25 = sorted(pos_bm25, key=lambda i: bm25_scores[i], reverse=True)[:50]
 
         rank_tfidf = {doc_id: rank + 1 for rank, doc_id in enumerate(top_tfidf)}
@@ -179,7 +191,8 @@ class HistoricalResolutionRetriever:
         for idx in sorted_candidates:
             rec = self.records[idx].copy()
             rec["rrf_score"] = round(float(rrf_scores[idx]), 5)
-            rec["tfidf_score"] = round(float(tfidf_scores[idx]), 4)
+            rec["dense_score"] = round(float(dense_scores[idx]), 4)
+            rec["dense_model"] = "MiniLM" if self.dense_encoder is not None else "TFIDF_BASELINE"
             rec["bm25_score"] = round(float(bm25_scores[idx]), 4)
             results.append(rec)
 
@@ -191,6 +204,7 @@ class HistoricalResolutionRetriever:
                 "vectorizer": self.vectorizer,
                 "records": self.records,
                 "tfidf_matrix": self.tfidf_matrix,
+                "dense_matrix": self.dense_matrix,
                 "bm25": self.bm25
             }, f)
 
@@ -200,5 +214,12 @@ class HistoricalResolutionRetriever:
             self.vectorizer = data["vectorizer"]
             self.records = data["records"]
             self.tfidf_matrix = data["tfidf_matrix"]
+            self.dense_matrix = data.get("dense_matrix")
             self.bm25 = data.get("bm25", BM25Index())
+        if self.dense_matrix is not None and self.dense_encoder is None:
+            # Dense vectors are only meaningful when queries use the same pinned
+            # encoder. Rehydrate it explicitly instead of silently falling back
+            # to TF-IDF against a MiniLM matrix.
+            from src.dual_head import MiniLMEncoder
+            self.dense_encoder = MiniLMEncoder()
         return self

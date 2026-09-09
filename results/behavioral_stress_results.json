@@ -5,8 +5,8 @@
     "Status": "[PASS]",
     "Intent": "FEEDBACK_AND_GENERAL",
     "Escalated": true,
-    "Reason": "PII_PUBLIC_PHONE_LEAK",
-    "Reply": "For your safety, please never post personal details publicly. Please delete...",
+    "Reason": "DELIVERY_DISPUTE_MARKED_DELIVERED_BUT_MISSING",
+    "Reply": "I'm so sorry your order is missing after being marked delivered. We want to...",
     "Guard Adjustments": []
   },
   {
@@ -15,8 +15,8 @@
     "Status": "[PASS]",
     "Intent": "ACCOUNT_AND_SECURITY",
     "Escalated": true,
-    "Reason": "PII_PUBLIC_EMAIL_LEAK",
-    "Reply": "For your safety, please never post personal details publicly. Please delete...",
+    "Reason": "ACCOUNT_SECURITY_OR_LOCKOUT",
+    "Reply": "Your account security is our top priority. Please never share credentials i...",
     "Guard Adjustments": []
   },
   {
@@ -25,8 +25,8 @@
     "Status": "[PASS]",
     "Intent": "FEEDBACK_AND_GENERAL",
     "Escalated": true,
-    "Reason": "PII_PUBLIC_CREDIT_CARD_LEAK",
-    "Reply": "For your safety, please never post personal details publicly. Please delete...",
+    "Reason": "PII_SENSITIVE_DATA_LEAK_IN_PUBLIC",
+    "Reply": "Your account security is our top priority. Please never share credentials i...",
     "Guard Adjustments": []
   },
   {
@@ -35,7 +35,7 @@
     "Status": "[PASS]",
     "Intent": "FEEDBACK_AND_GENERAL",
     "Escalated": false,
-    "Reason": "POSITIVE_BRAND_PRAISE",
+    "Reason": "FEEDBACK_OR_POSITIVE_ENGAGEMENT",
     "Reply": "Thank you for sharing your feedback with us. We're continuously working to ...",
     "Guard Adjustments": []
   },
@@ -46,7 +46,7 @@
     "Intent": "REFUND_AND_RETURN",
     "Escalated": true,
     "Reason": "FINANCIAL_DISPUTE_OR_OVERDUE_REFUND",
-    "Reply": "We take unexpected charges very seriously. Please send us a direct message ...",
+    "Reply": "We take unexpected charges and overdue refunds very seriously. Please send ...",
     "Guard Adjustments": []
   },
   {
@@ -62,8 +62,8 @@
   {
     "Category": "Typo & Slang Invariance",
     "Test Name": "Phonetic Spacing & Omission",
-    "Status": "[FAIL]",
-    "Intent": "FEEDBACK_AND_GENERAL",
+    "Status": "[PASS]",
+    "Intent": "ORDER_TRACKING_AND_DELAY",
     "Escalated": true,
     "Reason": "DELIVERY_DISPUTE_MARKED_DELIVERED_BUT_MISSING",
     "Reply": "I'm so sorry your order is missing after being marked delivered. We want to...",
@@ -82,11 +82,11 @@
   {
     "Category": "Sarcasm & Rhetoric",
     "Test Name": "Sarcastic Praise",
-    "Status": "[FAIL]",
-    "Intent": "ORDER_TRACKING_AND_DELAY",
+    "Status": "[PASS]",
+    "Intent": "DAMAGED_OR_WRONG_ITEM",
     "Escalated": true,
     "Reason": "CARRIER_MISCONDUCT_OR_TRANSIT_FAILURE",
-    "Reply": "I apologize for the inconvenience! We'd like to have a human specialist inv...",
+    "Reply": "I apologize for the transit delay! We want to check this for you directly. ...",
     "Guard Adjustments": []
   },
   {
@@ -96,27 +96,27 @@
     "Intent": "ORDER_TRACKING_AND_DELAY",
     "Escalated": true,
     "Reason": "CARRIER_TRANSIT_FAILURE_OR_DELAY",
-    "Reply": "I apologize for the inconvenience! We'd like to have a human specialist inv...",
+    "Reply": "I apologize for the transit delay! We want to check this for you directly. ...",
     "Guard Adjustments": []
   },
   {
     "Category": "Negative Boundary",
     "Test Name": "Negated Cancellation",
-    "Status": "[FAIL]",
-    "Intent": "FEEDBACK_AND_GENERAL",
+    "Status": "[PASS]",
+    "Intent": "ORDER_TRACKING_AND_DELAY",
     "Escalated": false,
-    "Reason": "POSITIVE_BRAND_PRAISE",
-    "Reply": "Thank you for sharing your feedback with us. We're continuously working to ...",
+    "Reason": "ROUTINE_TRACKING_IN_TRANSIT",
+    "Reply": "I'm sorry for the delay with your delivery! You can check real-time courier...",
     "Guard Adjustments": []
   },
   {
     "Category": "Negative Boundary",
     "Test Name": "Negated Return Intent",
-    "Status": "[FAIL]",
-    "Intent": "REFUND_AND_RETURN",
+    "Status": "[PASS]",
+    "Intent": "DAMAGED_OR_WRONG_ITEM",
     "Escalated": false,
-    "Reason": "ROUTINE_RETURN_POLICY_OR_PORTAL",
-    "Reply": "You can easily initiate a return or print a prepaid return label directly t...",
+    "Reason": "ROUTINE_REPLACEMENT_PORTAL",
+    "Reply": "I'm very sorry your item arrived defective or incorrect! You can request an...",
     "Guard Adjustments": []
   }
 ]

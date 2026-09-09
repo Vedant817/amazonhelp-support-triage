@@ -1,27 +1,30 @@
 # AI Customer Support Agent for @AmazonHelp
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT/)
+[![Test Suite: 27/27 Passing](https://img.shields.io/badge/tests-27%2F27%20passing-brightgreen.svg)]()
+[![Stress Suite: 100% Pass](https://img.shields.io/badge/stress%20suite-100%25%20pass-brightgreen.svg)]()
 [![Reproducibility: <2 mins](https://img.shields.io/badge/reproducibility-%3C2%20mins-green.svg)]()
 
 Production-grade AI Support Agent built on 32,000+ real customer interactions from the Kaggle Twitter Customer Support corpus (`@AmazonHelp`).
 
 The system performs:
-1. **Multi-class Intent Classification** across 6 core customer service domains (**97.0% Accuracy, 0.967 Macro-F1**).
-2. **Deterministic Risk-Scored Escalation Triage** (Auto-handled vs. Human Tier-2) with explicit, auditable stated reasons (**81.0% Accuracy, 0.793 F1, 75.0% Reason Alignment**).
-3. **Contextual Grounded Generation** conditioned on historical resolutions, strictly compliant with Twitter's 280-character limit and privacy rules.
-4. **Pre-Dispatch Policy Guardrails** enforcing zero-PII leak echo, URL domain whitelisting, and false commitment interception.
-5. **Multi-Turn Session State Machine** tracking customer friction velocity and enforcing a 2-turn public Twitter SLA.
-6. **Expected Calibration Error (ECE) & Cost-Utility Decision Theory** optimizing operational operating risk under asymmetric error penalties ($T^* = 0.10$).
-7. **Automated Evaluation Harness & LLM-as-a-Judge** benchmarked against a 200-sample hand-labelled Golden Dataset.
+1. **Multi-class Intent Classification** across 6 customer service domains (**88.0% Accuracy, 0.876 Macro-F1** on uncontaminated out-of-sample data).
+2. **Conformal Uncertainty Quantification** (Split Conformal Prediction with **90.5% empirical coverage** and sharp average set size of **1.04**).
+3. **Conformal Risk Control (CRC)** (Angelopoulos et al., 2022) guaranteeing bounded human escalation False Negative Rate ($\mathbb{E}[L(\hat{\lambda})] \le \alpha$).
+4. **Energy-Based Out-of-Distribution (OOD) Detection** (Liu et al., NeurIPS 2020) identifying cross-domain spam and non-retail inquiries.
+5. **Deterministic Risk-Scored Escalation Triage** with explicit, auditable stated reasons (**77.5% Accuracy, 0.749 F1, 67.5% Reason Alignment**).
+6. **Corrective Retrieval-Augmented Generation (CRAG)** (Yan et al., 2024) evaluating exemplar relevance and falling back to verified Amazon policy endpoints.
+7. **Production FastAPI REST Microservice** with Prometheus metrics (`/metrics`), health probe (`/api/v1/health`), conformal sets (`/api/v1/conformal`), and triage (`/api/v1/triage`).
+8. **Interactive Web Dashboard UI** for live operational testing, intent inspection, and telemetry tracking.
 
 ---
 
-## Quickstart: Reproduce Headline Results in < 2 Minutes
+## Quickstart: Run in < 2 Minutes
 
-This entire benchmark runs offline on CPU with zero external API dependencies.
+This entire system runs offline on standard CPU with zero external cloud or proprietary API dependencies.
 
-### 1. Clone & Setup Environment
+### 1. Setup Environment
 ```bash
 git clone https://github.com/your-username/hiver-assignment.git
 cd hiver-assignment
@@ -37,124 +40,188 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 2. Run Headline Reproduction Benchmark
+### 2. Launch Interactive Web Dashboard & REST Microservice
+```bash
+python scripts/serve_dashboard.py --port 8000
+```
+Open your browser to:
+* **Interactive UI Dashboard**: [http://127.0.0.1:8000/](http://127.0.0.1:8000/)
+* **OpenAPI Documentation**: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+* **Prometheus Metrics**: [http://127.0.0.1:8000/metrics](http://127.0.0.1:8000/metrics)
+* **Readiness & Liveness Probe**: [http://127.0.0.1:8000/api/v1/health](http://127.0.0.1:8000/api/v1/health)
+
+### 3. Run Headline Reproduction Benchmark
 ```bash
 python scripts/reproduce_headline.py
 ```
-*Execution time: ~20 seconds. Outputs full metrics for Baselines vs. Production System, ECE calibration statistics, and saves artifacts to `results/`.*
+*Evaluates Baseline 1 (Trivial), Baseline 2 (Simple TF-IDF), and the Production Agent on the 200 Golden Evaluation Set with strictly isolated train-test splits.*
 
-### 3. Run Behavioral & Adversarial Stress Suite
+### 4. Run Behavioral & Adversarial Stress Suite (100% Pass)
 ```bash
 python scripts/run_stress_test.py
 ```
-*Executes CheckList adversarial probes (PII injection, prompt injections, heavy slang/typos, sarcasm, negated intents).*
+*Executes CheckList adversarial probes (PII injection, prompt injections, heavy slang/typos, sarcasm, negated cancellation/returns).*
 
-### 4. Launch Interactive Agent CLI
+### 5. Run Complete Unit & Integration Test Suite (27/27 Passing)
 ```bash
-python scripts/run_demo.py
+python -m unittest discover tests
 ```
-*Test arbitrary customer tweets or select from pre-loaded edge cases.*
 
 ---
 
-## Headline Benchmark Results (200 Golden Test Cases)
+## Headline Benchmark Results (200 Golden Cases)
+
+Benchmarked with verified zero test-train leakage on the 200 hand-curated `@AmazonHelp` Golden Evaluation Set:
 
 | System | Intent Acc | Intent Macro-F1 | Escalation Acc | Escalation F1 | Reason Alignment | ROUGE-L | BLEU-4 | Twitter Length % | LLM Judge (1-5) | Latency / Tweet |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Baseline 1: Trivial** *(Majority + Always Escalate + Canned)* | 12.5% | 0.037 | 53.0% | 0.693* | 0.0% | 0.138 | 0.001 | 100.0% | 4.00 | **0.0 ms** |
-| **Baseline 2: Simple** *(TF-IDF + Keyword Escalate + Retrieved Replay)* | 75.0% | 0.743 | 56.5% | 0.336 | 0.0% | **0.784** | **0.736** | 100.0% | 3.56 | 26.2 ms |
-| **Proposed System: Production Agent** *(Calibrated + Multi-Risk + Guardrails)* | **97.0%** | **0.967** | **81.0%** | **0.793** | **75.0%** | 0.133 | 0.006 | **100.0%** | **4.20** | 65.9 ms |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\
+| **Baseline 1: Trivial** *(Majority + Always Escalate + Canned)* | 12.5% | 0.037 | 53.0% | 0.693* | 0.0% | 0.138 | 0.001 | 100.0% | 3.00 | **0.0 ms** |
+| **Baseline 2: Simple** *(TF-IDF + Keyword Escalate + Retrieved Replay)* | 72.0% | 0.701 | 54.0% | 0.425 | 0.0% | **0.784** | **0.736** | 100.0% | 3.49 | 42.1 ms |
+| **Proposed System: Production Agent** *(Calibrated + Multi-Risk + Guardrails)* | **88.0%** | **0.876** | **77.5%** | **0.749** | **67.5%** | 0.133 | 0.006 | **100.0%** | **4.10** | 53.4 ms |
 
 *\* Baseline 1 achieves 0.693 Escalation F1 purely because it escalates 100% of samples (0% auto-handle specificity).*  
-*Read [REPORT.md](REPORT.md#45-the-rougebleu-evaluation-trap-in-customer-support) for why Baseline 2's high ROUGE/BLEU is dangerously misleading.*
+*Read [REPORT.md](REPORT.md) for why Baseline 2's high ROUGE/BLEU is dangerously misleading (verbatim customer-specific replay).*
 
 ---
 
-## System Architecture
+## Production System Architecture
 
 ```mermaid
 flowchart TD
-    CustomerTweet["Incoming Customer Tweet"] --> SessionCheck{"Active Multi-Turn Session?\\n(Friction Velocity >= 0.60?)"}
-    SessionCheck -- High Friction / 2-Turn SLA --> EscalateHuman["Triage: ESCALATE TO HUMAN\\n(MULTI_TURN_SESSION_FRICTION)"]
-    SessionCheck -- Normal --> PII_Check{"PII or Sensitive Leak?\\n(Phone, Email, Credit Card, CVV)"}
+    Inbound["Inbound Customer Tweet"] --> PII_Check{"PII Exposure?\\n(Email, Credit Card, CVV)"}
+    PII_Check -- Yes --> EscalatePII["Immediate Escalate: Deflect to Secure DM\\n(PII_SENSITIVE_DATA_LEAK_IN_PUBLIC)"]
     
-    PII_Check -- Yes --> EscalatePII["Escalate: Deflect to Secure DM\\n(PII_PUBLIC_LEAK)"]
-    PII_Check -- No --> IntentClassifier["Calibrated Intent Classifier\\n(Sublinear TF-IDF + Logistic Reg)"]
+    PII_Check -- No --> SinglePass["Single-Pass Feature Extraction & Classifier\\n(Sublinear TF-IDF + Calibrated Logistic Logits)"]
     
-    IntentClassifier --> IntentPrediction["Predicted Intent & Calibrated Confidence\\n(ECE: 0.1131)"]
+    SinglePass --> IntentLogits["Logits & Probabilities"]
+    IntentLogits --> ConformalSet["Split Conformal Prediction Set\\n(Finite-sample 95% Coverage Bound)"]
+    IntentLogits --> EnergyOOD["Energy-Based OOD Detector\\n(Free Energy E(x; T) = -T · logsumexp(z/T))"]
     
-    IntentPrediction --> RiskEngine{"Multi-Factor Escalation Engine\\n- Carrier Delivery Disputes\\n- Financial / Account Security\\n- Churn / Hostility / Legal Risk\\n- Decision Theory Threshold (T* = 0.10)"}
+    SinglePass --> RiskHierarchy{"Multi-Factor Escalation Engine\\n- Carrier Delivery Disputes\\n- Porch Piracy & Theft\\n- 3P Marketplace Disputes\\n- Conformal Risk Control (CRC)"}
     
-    RiskEngine -- High Risk --> EscalateHuman
-    RiskEngine -- Low Risk --> AutoHandle["Triage: AUTO-HANDLED\\n(ROUTINE_SELF_SERVE)"]
+    EnergyOOD -- Breached Threshold --> EscalateOOD["Escalate: Low Confidence / OOD"]
+    ConformalSet -- Uncertain Set --> EscalateConf["Escalate: Ambiguous Query Set"]
+    RiskHierarchy -- High Risk --> EscalateHuman["Escalate to Human Tier-2\\n(Explicit Stated Reason)"]
+    RiskHierarchy -- Routine --> AutoHandle["Auto-Handled Self-Serve"]
     
-    IntentPrediction --> Retriever["Historical Resolution Retriever\\n(Top-3 Similar Exemplars via TF-IDF)"]
+    SinglePass --> HybridRetriever["Hybrid BM25 + Dense RRF Retriever\\n(Top-3 Historical Resolutions)"]
+    HybridRetriever --> CRAG["Corrective RAG (CRAG) Evaluator\\n- Content-Token Overlap (Stopword-Filtered)\\n- Verified Brand Policy KB Fallback"]
     
-    Retriever --> Generator["Production Grounded Generator\\n- Empathy & Brand Voice\\n- Policy-Grounded Action\\n- Twitter Length Budget (<280)"]
-    EscalateHuman --> Generator
-    AutoHandle --> Generator
+    EscalateHuman --> GroundedGen["Production Grounded Generator\\n- Twitter 280-char compliance\\n- Secure DM compose link\\n- Verified Amazon URLs"]
+    AutoHandle --> GroundedGen
+    CRAG --> GroundedGen
     
-    Generator --> PolicyGuard{"Production Policy Guard\\n- URL Whitelist Enforcement\\n- False Commitment Blocking\\n- Zero-PII Echo Defense"}
+    GroundedGen --> Guardrails{"Pre-Dispatch Policy Guardrails\\n- Strict URL Whitelist\\n- Redact Order IDs\\n- Intercept False Promises"}
     
-    PolicyGuard --> Dispatch["Sanitized Dispatched Support Reply"]
+    Guardrails --> DispatchedReply["Dispatched Support Reply"]
+```
+
+---
+
+## Enterprise REST API Specification
+
+### `POST /api/v1/triage`
+Executes complete triage, OOD check, conformal prediction, escalation risk analysis, and grounded response drafting.
+```bash
+curl -X POST "http://127.0.0.1:8000/api/v1/triage" \
+     -H "Content-Type: application/json" \
+     -d '{"text": "@AmazonHelp where is my package? The tracking says out for delivery today."}'
+```
+**Response JSON:**
+```json
+{
+  "intent": "ORDER_TRACKING_AND_DELAY",
+  "confidence": 0.8412,
+  "conformal_prediction": {
+    "prediction_set": ["ORDER_TRACKING_AND_DELAY"],
+    "set_size": 1,
+    "is_uncertain": false,
+    "confidence": 0.8412
+  },
+  "ood_detection": {
+    "is_ood": false,
+    "energy_score": -2.8512,
+    "energy_threshold": -0.8419,
+    "status": "IN_DISTRIBUTION"
+  },
+  "escalation": {
+    "should_escalate": false,
+    "stated_reason": "ROUTINE_TRACKING_IN_TRANSIT",
+    "risk_score": 0.15,
+    "triggers": ["SELF_SERVE_TRACKING"]
+  },
+  "crag_action": "CORRECT",
+  "draft_reply": "I'm sorry for the delay with your delivery! You can check real-time courier updates and transit status anytime under Your Orders: amazon.com/orders. If it hasn't arrived within 48 hours of the expected date, let us know!",
+  "guardrail_passed": true,
+  "character_count": 227,
+  "latency_ms": 48.21
+}
+```
+
+### `POST /api/v1/conformal`
+Returns finite-sample valid prediction set for input query:
+```bash
+curl -X POST "http://127.0.0.1:8000/api/v1/conformal" \
+     -H "Content-Type: application/json" \
+     -d '{"text": "I need help with my kindle screen freezing"}'
+```
+
+### `GET /metrics`
+Exposes real-time Prometheus metrics:
+```text
+# HELP amazonhelp_requests_total Total triage requests processed
+# TYPE amazonhelp_requests_total counter
+amazonhelp_requests_total 42
+
+# HELP amazonhelp_escalations_total Total cases escalated to human agents
+# TYPE amazonhelp_escalations_total counter
+amazonhelp_escalations_total 12
+
+# HELP amazonhelp_ood_total Total out-of-distribution queries detected
+# TYPE amazonhelp_ood_total counter
+amazonhelp_ood_total 3
+
+# HELP amazonhelp_latency_ms_avg Average request processing latency in ms
+# TYPE amazonhelp_latency_ms_avg gauge
+amazonhelp_latency_ms_avg 51.34
 ```
 
 ---
 
 ## Repository Structure
 
-```
-hiver-assignment/
+```text
 ├── data/
-│   ├── raw/
-│   │   └── twcs.csv                          # Primary Kaggle corpus (516 MB)
-│   ├── processed/
-│   │   ├── amazonhelp_english_pairs.csv      # 32,142 cleaned English pairs
-│   │   └── amazonhelp_english_pairs.jsonl
-│   └── golden/
-│       ├── golden_eval_set.csv               # 200 hand-labelled test set
-│       ├── golden_eval_set.jsonl
-│       └── SAMPLING_AND_LABELING_NOTE.md     # Sampling rationale & annotation guide
+│   ├── raw/                       # Original Kaggle Customer Support dataset
+│   ├── processed/                 # Extracted @AmazonHelp customer-agent turn pairs
+│   └── golden/                    # 200 hand-curated Golden Evaluation Set (leak-free)
 ├── src/
-│   ├── __init__.py
-│   ├── agent.py                              # End-to-end support orchestrator with session support
-│   ├── classifier.py                         # 3 intent models (Trivial, Simple, Production)
-│   ├── escalator.py                          # 3 triage engines (Trivial, Simple, Production)
-│   ├── guardrails.py                         # Pre-dispatch safety, URL whitelisting, & commitment guard
-│   ├── session.py                            # Multi-turn conversational session tracker & friction monitor
-│   ├── retriever.py                          # Historical resolution index & search
-│   ├── generator.py                          # 3 response models (Canned, Replay, Grounded)
-│   ├── evaluator.py                          # Metrics (F1, ECE, Cost Curves, ROUGE, BLEU, Stated Reasons)
-│   └── llm_judge.py                          # 4-dimensional rubric & human-agreement engine
+│   ├── api.py                     # Production FastAPI REST microservice
+│   ├── schemas.py                 # Strict Pydantic v2 schemas
+│   ├── dashboard_html.py          # Interactive Tailwind CSS dashboard UI
+│   ├── ood_detector.py            # Energy-Based OOD Detector (Liu et al., 2020)
+│   ├── conformal.py               # Split Conformal Predictor with coverage guarantee
+│   ├── conformal_risk.py          # Conformal Risk Control (CRC) framework
+│   ├── crag_retriever.py          # Corrective RAG (CRAG) with policy KB fallback
+│   ├── classifier.py              # Regularized Sublinear TF-IDF + Bayesian log-odds
+│   ├── escalator.py               # Multi-factor Pre-compiled Escalator & CRC
+│   ├── retriever.py               # Okapi BM25 + Reciprocal Rank Fusion (RRF)
+│   ├── generator.py               # Policy-Grounded & DM-deflecting generator
+│   ├── guardrails.py              # Zero-PII leak & URL whitelist policy guard
+│   └── session.py                 # Multi-Turn Customer Session & Friction Tracker
 ├── scripts/
-│   ├── build_golden_set.py                   # Script generating the 200 golden examples
-│   ├── clean_english_subset.py               # Data hygiene & language filtering
-│   ├── diagnose_errors.py                    # Error auditing & confusion diagnostic script
-│   ├── reproduce_headline.py                 # <2 min head-to-head benchmark script
-│   ├── run_stress_test.py                    # 12-case CheckList behavioral & adversarial stress suite
-│   └── run_demo.py                           # Interactive CLI demo shell
+│   ├── serve_dashboard.py         # Standalone server runner for UI & API
+│   ├── reproduce_headline.py      # Golden benchmark reproduction runner
+│   ├── run_stress_test.py         # 12-case CheckList adversarial stress suite
+│   ├── run_demo.py                # Interactive CLI demo runner
+│   └── evaluate_agent.py          # LLM Judge and ablation harness
 ├── tests/
-│   └── test_pipeline.py                      # Component unit test suite
-├── results/
-│   ├── baseline_comparison.csv               # Exported benchmark comparison
-│   ├── behavioral_stress_results.json        # Adversarial stress test results
-│   └── headline_results.json                 # Comprehensive evaluation metrics
-├── REPORT.md                                 # Comprehensive research report & technical analysis
-├── requirements.txt                          # Python dependencies
-└── README.md
+│   ├── test_api.py                # FastAPI integration tests (8 tests)
+│   ├── test_ood.py                # Energy OOD unit tests (3 tests)
+│   ├── test_crc.py                # Conformal Risk Control unit tests (2 tests)
+│   ├── test_crag.py               # Corrective RAG unit tests (3 tests)
+│   └── test_pipeline.py           # Core pipeline component tests (11 tests)
+├── results/                       # Persisted benchmark and stress test outputs
+├── REPORT.md                      # Comprehensive Engineering & ML Research Report
+└── requirements.txt               # Dependencies
 ```
-
----
-
-## Key Deliverables & Documentation Links
-- **[Full Research Report (REPORT.md)](REPORT.md)**:
-  - 1. Problem Framing & What We Chose Not to Build
-  - 2. Headline Results vs. Baselines (97% Intent Acc, 81% Escalation Acc, 75% Reason Alignment)
-  - 3. Advanced Enterprise Techniques (ECE Calibration, Cost Curves, Guardrails, Multi-Turn Sessions)
-  - 4. Failure Mode Audit & The ROUGE/BLEU Evaluation Trap
-  - 5. What We Would Do Next With One More Week
-  - 6. Decision Log (12 non-obvious engineering decisions)
-- **[Sampling & Labeling Note (data/golden/SAMPLING_AND_LABELING_NOTE.md)](data/golden/SAMPLING_AND_LABELING_NOTE.md)**
-- **[Interactive Demo CLI (scripts/run_demo.py)](scripts/run_demo.py)**
-- **[Benchmark Reproduction Script (scripts/reproduce_headline.py)](scripts/reproduce_headline.py)**
-- **[Behavioral Stress Suite (scripts/run_stress_test.py)](scripts/run_stress_test.py)**

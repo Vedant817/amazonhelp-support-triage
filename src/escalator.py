@@ -1,28 +1,25 @@
 """
-Escalation and Triage Engine for @AmazonHelp.
-Decides whether incoming customer support messages should be auto-handled or escalated
-to a human tier-2 agent, with explicit, structured, and auditable stated reasons.
+Escalation Engine and Triage Rules for @AmazonHelp.
+Implements 3 comparative systems:
+1. TrivialEscalationBaseline (Always escalate unconditionally)
+2. SimpleKeywordEscalationBaseline (Heuristic regex keyword matching)
+3. ProductionEscalator (Multi-Factor Risk Triage with Stated Reasons, 3P Marketplace Detection, & Porch Piracy Handling)
 """
 
 import re
 from typing import Dict, Any, List, Optional
+from dataclasses import dataclass, field
 
+@dataclass
 class EscalationDecision:
-    def __init__(
-        self,
-        should_escalate: bool,
-        stated_reason: str,
-        risk_score: float,
-        triggers: List[str]
-    ):
-        self.should_escalate = should_escalate
-        self.stated_reason = stated_reason
-        self.risk_score = risk_score
-        self.triggers = triggers
+    should_escalate: bool
+    stated_reason: str
+    risk_score: float
+    triggers: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "escalate": self.should_escalate,
+            "should_escalate": self.should_escalate,
             "stated_reason": self.stated_reason,
             "risk_score": round(self.risk_score, 3),
             "triggers": self.triggers
@@ -30,29 +27,29 @@ class EscalationDecision:
 
 
 class TrivialEscalationBaseline:
-    """Trivial Baseline: Always escalates everything to human agent."""
-    def evaluate(self, text: str, intent: str = "UNKNOWN", confidence: float = 1.0, is_uncertain: bool = False) -> EscalationDecision:
+    """Always escalates unconditionally with default risk."""
+    def evaluate(self, text: str, **kwargs) -> EscalationDecision:
         return EscalationDecision(
             should_escalate=True,
-            stated_reason="BASELINE_ALWAYS_ESCALATE_TO_HUMAN",
+            stated_reason="UNCONDITIONAL_POLICY_ESCALATION",
             risk_score=1.0,
-            triggers=["TRIVIAL_BASELINE_POLICY"]
+            triggers=["TRIVIAL_BASELINE_ALWAYS_ESCALATE"]
         )
 
 
 class SimpleKeywordEscalationBaseline:
-    """Simple Baseline: Escalates based strictly on a naive keyword blacklist."""
+    """Simple escalation on basic critical terms."""
     def __init__(self):
-        self.blacklist = ["scam", "fraud", "lawyer", "sue", "stolen", "police", "cancel prime", "supervisor"]
+        self.keywords = ["stolen", "police", "lawyer", "hacked", "fraud", "scam", "damaged", "refund", "cancel"]
 
-    def evaluate(self, text: str, intent: str = "UNKNOWN", confidence: float = 1.0, is_uncertain: bool = False) -> EscalationDecision:
-        lower_text = text.lower()
-        matched = [kw for kw in self.blacklist if kw in lower_text]
+    def evaluate(self, text: str, **kwargs) -> EscalationDecision:
+        t_low = text.lower()
+        matched = [kw for kw in self.keywords if kw in t_low]
         if matched:
             return EscalationDecision(
                 should_escalate=True,
-                stated_reason=f"KEYWORD_FLAGGED_{matched[0].upper().replace(' ', '_')}",
-                risk_score=0.8,
+                stated_reason=f"KEYWORD_TRIGGER_{matched[0].upper()}",
+                risk_score=0.7,
                 triggers=matched
             )
         return EscalationDecision(
@@ -68,11 +65,12 @@ class ProductionEscalator:
     Production-grade Multi-Factor Escalation Engine:
     Evaluates:
     1. Financial & fulfillment delivery disputes (marked delivered but missing, lost in transit, double charges)
-    2. Physical package condition (severe damage, missing items from box)
-    3. Account security, credential compromise, & PII vulnerability
-    4. Sentiment escalation, legal threats, churn risk
-    5. Classifier margin uncertainty
-    6. Self-serve capability (standard tracking/returns)
+    2. 3rd-Party Marketplace (MFN) seller disputes vs direct Amazon retail
+    3. Physical package condition (severe damage, missing items from box, porch piracy)
+    4. Account security, credential compromise, & PII vulnerability
+    5. High-friction churn, legal/regulatory threats, multi-attempt loops
+    6. Classifier margin uncertainty
+    7. Self-serve capability (standard tracking/returns)
     """
     def __init__(self, confidence_threshold: float = 0.32):
         self.confidence_threshold = confidence_threshold
@@ -95,6 +93,14 @@ class ProductionEscalator:
             (r"(not\s+possible\s+to\s+get\s+in\s+touch|carrier.*not\s+responding)", "CARRIER_TRANSIT_FAILURE_OR_DELAY"),
             (r"(driver|courier)\s+(threw|damaged|stole|forged|lied|refused|rude)", "CARRIER_MISCONDUCT_OR_TRANSIT_FAILURE"),
             (r"(thrown\s+over|hurled\s+over|tossed\s+over|dumped\s+over)", "CARRIER_MISCONDUCT_OR_TRANSIT_FAILURE")
+        ]
+
+        # 3rd-Party Marketplace (MFN) Disputes
+        self.marketplace_disputes = [
+            (r"(third[- ]party\s+seller|3p\s+seller|marketplace\s+seller)", "MARKETPLACE_3P_SELLER_DISPUTE"),
+            (r"seller\s+(hasn\'?t|won\'?t|refused|not|declined|ignoring)\s+(responded?|replied?|help|refund|message)", "MARKETPLACE_3P_SELLER_DISPUTE"),
+            (r"(seller\s+has\s+a\s+problem|seller\s+marked\s+item|contact(ed)?\s+the\s+seller)", "MARKETPLACE_3P_SELLER_DISPUTE"),
+            (r"(a[- ]to[- ]z\s+guarantee|a[- ]to[- ]z\s+claim)", "MARKETPLACE_3P_SELLER_DISPUTE")
         ]
 
         # Severe Damage & Missing Contents (Physical Product Damage)
@@ -133,162 +139,169 @@ class ProductionEscalator:
         self.security_escalations = [
             (r"(hacked|unauthorized access|someone.*logged into|account.*taken over|stolen account)", "ACCOUNT_SECURITY_OR_LOCKOUT"),
             (r"(otp|verification code|password reset).*(not working|loop|locked out|can\'?t\s+sign\s+in)", "ACCOUNT_SECURITY_OR_LOCKOUT"),
-            (r"(locked\s+out|account\s+locked|can\'?t\s+access\s+(my\s+)?(account|acct))", "ACCOUNT_SECURITY_OR_LOCKOUT"),
+            (r"(locked\s+(me\s+)?out|account\s+locked|can\'?t\s+access\s+(my\s+)?(account|acct|prime))", "ACCOUNT_SECURITY_OR_LOCKOUT"),
             (r"(couldn\'?t\s+access|cannot\s+access|can\'?t\s+sign\s+in|cannot\s+sign\s+in|cannot\s+log\s*in|can\'?t\s+log\s*in)", "ACCOUNT_SECURITY_OR_LOCKOUT"),
             (r"(reset.*password.*multiple\s+times|still\s+cannot\s+log\s*in)", "ACCOUNT_SECURITY_OR_LOCKOUT"),
             (r"(changed\s+my\s+account\s+email|unauthorized\s+email)", "ACCOUNT_SECURITY_OR_LOCKOUT"),
             (r"(scam|phishing|fake email|fraudulent order)", "ACCOUNT_SECURITY_OR_LOCKOUT")
         ]
 
-        # Hostility, Legal, Churn (fixed \bsue\b and explicit cancellation intent)
-        self.hostility_escalations = [
-            (r"(lawyer|attorney|legal action|court|\bsue\b|bbb|better business bureau|consumer court|police)", "LEGAL_OR_REGULATORY_THREAT"),
-            (r"(i\'?m\s+canceling\s+(my\s+)?prime|cancel\s+my\s+prime\s+right\s+now|boycott\s+amazon|done\s+with\s+amazon|never\s+buying\s+again|never\s+ordering\s+again)", "HIGH_HOSTILITY_OR_LEGAL_RISK"),
-            (r"(fuck|shitty|bitch|bastard|scumbag|liar|thieves|horrible service|worst service)", "HIGH_HOSTILITY_OR_LEGAL_RISK"),
-            (r"screwed\s+up.*beyond\s+a\s+joke", "HIGH_HOSTILITY_OR_LEGAL_RISK")
-        ]
-
-        # Explicit Human Request
-        self.human_agent_requests = [
-            r"talk to a (human|person|agent|representative|supervisor|manager)",
-            r"speak with an agent",
-            r"transfer me",
-            r"real person please"
-        ]
-
-        # PII exposure patterns in public tweets
-        self.pii_patterns = [
-            (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", "PII_PUBLIC_EMAIL_LEAK"),
-            (r"\b\d{3}[-.\s]??\d{3}[-.\s]??\d{4}\b", "PII_PUBLIC_PHONE_LEAK"),
-            (r"\b(?:\d{4}[-\s]?){4}\b", "PII_PUBLIC_CREDIT_CARD_LEAK"),
-            (r"\bcvv\b", "PII_PUBLIC_CVV_LEAK"),
-            (r"\b\d{3}-\d{7}-\d{7}\b", "PII_PUBLIC_DEFLECTION_TO_PRIVATE_CHANNEL")
+        # High-Friction Legal, Regulatory & Ombudsman Threats
+        self.legal_and_churn_threats = [
+            (r"(better\s+business\s+bureau|\bbbb\b|ombudsman|trading\s+standards|consumer\s+protection)", "LEGAL_REGULATORY_OR_OMBUDSMAN_THREAT"),
+            (r"(lawyer|attorney|small\s+claims|take\s+legal\s+action|court|sue\s+you)", "LEGAL_REGULATORY_OR_OMBUDSMAN_THREAT"),
+            (r"(cancelled?\s+my\s+(prime|membership)|canceling\s+(prime|membership)|never\s+using\s+amazon)", "HIGH_CHURN_OR_CANCEL_INTENT"),
+            (r"(called\s+(\d+|several|multiple)\s+times|no\s+response\s+after\s+\d+\s+calls)", "REPEATED_CONTACT_FAILURE_ESCALATION"),
+            (r"(waiting\s+for\s+(\d+|several)\s+weeks|pending\s+after\s+a\s+month)", "HIGH_FRICTION_CHURN_OR_LEGAL_RISK")
         ]
 
     def evaluate(
         self,
         text: str,
-        intent: str = "UNKNOWN",
+        intent: Optional[str] = None,
         confidence: float = 1.0,
         is_uncertain: bool = False
     ) -> EscalationDecision:
-        triggers = []
-        lower = text.lower()
+        """
+        Evaluates input text against multi-factor risk hierarchy.
+        Returns explicit EscalationDecision with stated reason and risk score.
+        """
+        t_low = text.lower()
 
-        # Check if this is an already-resolved refund statement
-        is_resolved_refund = any(re.search(pat, lower) for pat in self.resolved_refunds)
-
-        # 1. PII Exposed in Public Tweet
-        for pat, reason in self.pii_patterns:
-            if re.search(pat, text, re.IGNORECASE):
-                triggers.append(f"PII:{reason}")
-                return EscalationDecision(
-                    should_escalate=True,
-                    stated_reason=reason,
-                    risk_score=0.95,
-                    triggers=triggers
-                )
-
-        # 2. Explicit Human Request Check
-        for pat in self.human_agent_requests:
-            if re.search(pat, lower):
-                triggers.append("EXPLICIT_HUMAN_REQUEST")
-                return EscalationDecision(
-                    should_escalate=True,
-                    stated_reason="EXPLICIT_CUSTOMER_REQUEST_FOR_HUMAN_AGENT",
-                    risk_score=1.0,
-                    triggers=triggers
-                )
-
-        # 3. Security & Account Threats (Critical Risk)
+        # 1. Security Threat / Account Takeover (Severity 0)
         for pat, reason in self.security_escalations:
-            if re.search(pat, lower):
-                triggers.append(f"SECURITY:{reason}")
+            if re.search(pat, t_low):
+                return EscalationDecision(
+                    should_escalate=True,
+                    stated_reason=reason,
+                    risk_score=0.98,
+                    triggers=[f"PATTERN_{pat}"]
+                )
+
+        # 2. PII & Sensitive Data Exposure in Public Timeline
+        if re.search(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", text):
+            return EscalationDecision(
+                should_escalate=True,
+                stated_reason="PII_SENSITIVE_DATA_LEAK_IN_PUBLIC",
+                risk_score=0.95,
+                triggers=["EMAIL_ADDRESS_EXPOSED"]
+            )
+        if re.search(r"\b\d{16}\b|\b\d{4}[- ]\d{4}[- ]\d{4}[- ]\d{4}\b", text):
+            return EscalationDecision(
+                should_escalate=True,
+                stated_reason="PII_SENSITIVE_DATA_LEAK_IN_PUBLIC",
+                risk_score=0.95,
+                triggers=["CREDIT_CARD_NUMBER_EXPOSED"]
+            )
+        if re.search(r"\bcvv\b|\bsecurity\s+code\b", t_low):
+            return EscalationDecision(
+                should_escalate=True,
+                stated_reason="PII_SENSITIVE_DATA_LEAK_IN_PUBLIC",
+                risk_score=0.95,
+                triggers=["CVV_EXPOSED"]
+            )
+
+        # 3. Legal / Regulatory / Ombudsman Threats (Severity 1)
+        for pat, reason in self.legal_and_churn_threats:
+            if re.search(pat, t_low):
                 return EscalationDecision(
                     should_escalate=True,
                     stated_reason=reason,
                     risk_score=0.95,
-                    triggers=triggers
+                    triggers=[f"PATTERN_{pat}"]
                 )
 
-        # 4. Hostility / Legal Threats
-        for pat, reason in self.hostility_escalations:
-            if re.search(pat, lower):
-                triggers.append(f"HOSTILITY:{reason}")
+        # 4. 3P Marketplace Seller Disputes
+        for pat, reason in self.marketplace_disputes:
+            if re.search(pat, t_low):
                 return EscalationDecision(
                     should_escalate=True,
                     stated_reason=reason,
-                    risk_score=0.90,
-                    triggers=triggers
+                    risk_score=0.88,
+                    triggers=[f"PATTERN_{pat}"]
                 )
 
-        # 5. Financial Disputes & Overdue Refunds (skip if resolved)
-        if not is_resolved_refund:
-            for pat, reason in self.financial_escalations:
-                if re.search(pat, lower):
-                    triggers.append(f"FINANCIAL:{reason}")
-                    return EscalationDecision(
-                        should_escalate=True,
-                        stated_reason=reason,
-                        risk_score=0.88,
-                        triggers=triggers
-                    )
-
-        # 6. Fulfillment Delivery Disputes
-        for pat, reason in self.fulfillment_disputes:
-            if re.search(pat, lower):
-                triggers.append(f"FULFILLMENT:{reason}")
+        # 5. Severe Damage & Missing Contents
+        for pat, reason in self.damage_escalations:
+            if re.search(pat, t_low):
                 return EscalationDecision(
                     should_escalate=True,
                     stated_reason=reason,
                     risk_score=0.85,
-                    triggers=triggers
+                    triggers=[f"PATTERN_{pat}"]
                 )
 
-        # 7. Severe Damage & Tampered Packages
-        for pat, reason in self.damage_escalations:
-            if re.search(pat, lower):
-                triggers.append(f"DAMAGE:{reason}")
+        # 6. Delivery & Fulfillment Disputes (Delivered but Missing, Porch Piracy, Carrier Misconduct)
+        for pat, reason in self.fulfillment_disputes:
+            if re.search(pat, t_low):
                 return EscalationDecision(
                     should_escalate=True,
                     stated_reason=reason,
-                    risk_score=0.82,
-                    triggers=triggers
+                    risk_score=0.85,
+                    triggers=[f"PATTERN_{pat}"]
                 )
 
-        # 8. Intent Classifier Uncertainty & Ambiguity
+        # 7. Financial & Refund Disputes (Checking if not past-resolved)
+        is_past_resolved = any(re.search(res_pat, t_low) for res_pat in self.resolved_refunds)
+        if not is_past_resolved:
+            for pat, reason in self.financial_escalations:
+                if re.search(pat, t_low):
+                    return EscalationDecision(
+                        should_escalate=True,
+                        stated_reason=reason,
+                        risk_score=0.82,
+                        triggers=[f"PATTERN_{pat}"]
+                    )
+
+        # 8. Model Uncertainty / Margin Ambiguity
         if is_uncertain or confidence < self.confidence_threshold:
-            triggers.append("LOW_CLASSIFIER_CONFIDENCE")
             return EscalationDecision(
                 should_escalate=True,
-                stated_reason=f"AMBIGUOUS_QUERY_LOW_MODEL_CONFIDENCE_{confidence:.2f}",
-                risk_score=0.60,
-                triggers=triggers
+                stated_reason="LOW_CLASSIFIER_CONFIDENCE_AMBIGUOUS_QUERY",
+                risk_score=0.65,
+                triggers=[f"CONFIDENCE_{confidence:.3f}"]
             )
 
-        # 9. Otherwise Auto-Handleable
+        # 9. Default Self-Serve Resolutions
         if intent == "ORDER_TRACKING_AND_DELAY":
-            reason = "ROUTINE_TRACKING_IN_TRANSIT"
-            risk_score = 0.15
+            return EscalationDecision(
+                should_escalate=False,
+                stated_reason="ROUTINE_TRACKING_IN_TRANSIT",
+                risk_score=0.15,
+                triggers=["SELF_SERVE_TRACKING"]
+            )
         elif intent == "REFUND_AND_RETURN":
-            reason = "ROUTINE_RETURN_POLICY_OR_PORTAL"
-            risk_score = 0.20
-        elif intent == "DAMAGED_OR_WRONG_ITEM":
-            reason = "ROUTINE_REPLACEMENT_ELIGIBLE"
-            risk_score = 0.25
+            return EscalationDecision(
+                should_escalate=False,
+                stated_reason="ROUTINE_RETURN_POLICY_OR_PORTAL",
+                risk_score=0.20,
+                triggers=["SELF_SERVE_RETURN"]
+            )
         elif intent == "PRODUCT_AND_TECHNICAL":
-            reason = "DEVICE_TROUBLESHOOTING_SELF_SERVE"
-            risk_score = 0.15
+            return EscalationDecision(
+                should_escalate=False,
+                stated_reason="DEVICE_TROUBLESHOOTING_SELF_SERVE",
+                risk_score=0.25,
+                triggers=["SELF_SERVE_TECH"]
+            )
         elif intent == "ACCOUNT_AND_SECURITY":
-            reason = "GENERAL_ACCOUNT_SETTINGS_SELF_SERVE"
-            risk_score = 0.30
+            return EscalationDecision(
+                should_escalate=False,
+                stated_reason="GENERAL_ACCOUNT_SETTINGS_SELF_SERVE",
+                risk_score=0.30,
+                triggers=["SELF_SERVE_ACCOUNT"]
+            )
+        elif intent == "DAMAGED_OR_WRONG_ITEM":
+            return EscalationDecision(
+                should_escalate=False,
+                stated_reason="ROUTINE_REPLACEMENT_PORTAL",
+                risk_score=0.35,
+                triggers=["SELF_SERVE_REPLACEMENT"]
+            )
         else:
-            reason = "POSITIVE_BRAND_PRAISE"
-            risk_score = 0.10
-
-        return EscalationDecision(
-            should_escalate=False,
-            stated_reason=reason,
-            risk_score=risk_score,
-            triggers=["SELF_SERVE_ELIGIBLE"]
-        )
+            return EscalationDecision(
+                should_escalate=False,
+                stated_reason="FEEDBACK_OR_POSITIVE_ENGAGEMENT",
+                risk_score=0.10,
+                triggers=["SELF_SERVE_GENERAL"]
+            )

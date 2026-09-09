@@ -1,10 +1,12 @@
 """
 Reproduction Script: Benchmark Proposed Production Agent against Trivial and Simple Baselines.
 Evaluates on the 200 Hand-Labelled Golden Evaluation Set.
-Generates:
-- Baseline comparison table (Accuracy, Macro-F1, Escalation F1, Reason Alignment, ROUGE-L, BLEU-4, Length, Judge)
-- Expected Calibration Error (ECE) and Cost-Utility Optimization analysis
-- Human-Judge Agreement validation statistics
+Guarantees:
+- Strict zero-contamination test/train isolation (golden evaluation IDs completely excluded from training & retrieval corpus)
+- Calibrated Split Conformal Prediction with exact finite-sample quantile order statistics
+- Calibrated logit-space Bayesian priors and softmax
+- Hybrid Okapi BM25 + Dense TF-IDF with Reciprocal Rank Fusion (k=20) over positive candidates
+- Deterministic Pre-Dispatch Guardrails with 17-digit Order ID redaction & Twitter DM deep-linking
 - Serialized results in results/baseline_comparison.csv and results/headline_results.json
 """
 
@@ -38,39 +40,46 @@ from src.generator import (
 from src.evaluator import SupportPipelineEvaluator
 from src.llm_judge import ReplyQualityJudge
 from src.guardrails import ProductionPolicyGuard
+from src.conformal import ConformalPredictor
 
 def run_evaluation():
-    print("=" * 90)
-    print("          @AmazonHelp AI Agent: Headline Reproduction Benchmark (200 Golden Cases)")
-    print("=" * 90)
+    print("=" * 95)
+    print("          @AmazonHelp Production AI Agent: Headline Reproduction Benchmark (200 Golden Cases)")
+    print("=" * 95)
 
     # 1. Load Golden Evaluation Set
     golden_csv = "data/golden/golden_eval_set.csv"
     if not os.path.exists(golden_csv):
-        print(f"Error: {golden_csv} not found! Please ensure data is present.")
+        print(f"Error: {golden_csv} not found!")
         return
 
     gold_df = pd.read_csv(golden_csv)
     with open("data/golden/golden_eval_set.jsonl", "r", encoding="utf-8") as f:
         gold_records = [json.loads(line) for line in f]
 
-    print(f"\n[1/5] Loaded {len(gold_df)} hand-curated Golden Evaluation examples.")
+    print(f"\n[1/6] Loaded {len(gold_df)} hand-curated Golden Evaluation examples.")
 
-    # 2. Load Processed Clean Training Corpus for Model Fitting
+    # 2. Load Processed Training Corpus and ENFORCE STRICT TEST/TRAIN ISOLATION
     train_csv = "data/processed/amazonhelp_english_pairs.csv"
     if not os.path.exists(train_csv):
         print(f"Error: {train_csv} not found!")
         return
 
-    print(f"\n[2/5] Loading cleaned historical interactions for index & model fitting...")
+    print(f"\n[2/6] Loading historical corpus & isolating test set to eliminate leakage...")
     train_df = pd.read_csv(train_csv)
-    train_sample = train_df.sample(n=min(15000, len(train_df)), random_state=42)
+    
+    # Isolate golden evaluation IDs completely
+    gold_ids = set(gold_df["tweet_id"].astype(str))
+    clean_train_df = train_df[~train_df["inbound_id"].astype(str).isin(gold_ids)].reset_index(drop=True)
+    print(f"      Total corpus: {len(train_df)} | Isolated non-test corpus: {len(clean_train_df)}")
+
+    train_sample = clean_train_df.sample(n=min(15000, len(clean_train_df)), random_state=42).reset_index(drop=True)
 
     # 3. Fit Classifiers with Weak Supervision on Cleaned Data
-    print(f"\n[3/5] Fitting Classifiers and Vector Indices on {len(train_sample)} interactions...")
-    X_train = train_sample["customer_text"].tolist()
+    print(f"\n[3/6] Fitting Classifiers and Vector Indices on {len(train_sample)} interactions...")
+    X_all = train_sample["customer_text"].tolist()
     silver_labels = []
-    for text in X_train:
+    for text in X_all:
         t_low = str(text).lower()
         if any(w in t_low for w in ["damaged", "broken", "wrong item", "defective", "missing item", "empty box", "shattered", "cracked", "scratched", "missing part"]):
             silver_labels.append("DAMAGED_OR_WRONG_ITEM")
@@ -86,18 +95,39 @@ def run_evaluation():
             silver_labels.append("FEEDBACK_AND_GENERAL")
     train_sample["intent"] = silver_labels
 
+    # Train / Calibration Split for Conformal Prediction
+    cal_size = 2000
+    X_train = X_all[:-cal_size]
+    y_train = silver_labels[:-cal_size]
+    X_cal = X_all[-cal_size:]
+    y_cal = silver_labels[-cal_size:]
+
     # Initialize Classifiers
-    trivial_clf = MajorityBaselineClassifier().fit(X_train, silver_labels)
-    simple_clf = TfidfBaselineClassifier().fit(X_train, silver_labels)
-    prod_clf = ProductionIntentClassifier(confidence_threshold=0.32).fit(X_train, silver_labels)
+    trivial_clf = MajorityBaselineClassifier().fit(X_all, silver_labels)
+    simple_clf = TfidfBaselineClassifier().fit(X_all, silver_labels)
+    prod_clf = ProductionIntentClassifier(confidence_threshold=0.32).fit(X_train, y_train)
+
+    # Calibrate Conformal Predictor on Calibration Split
+    print(f"\n[4/6] Calibrating Conformal Predictor on {len(X_cal)} holdout interactions (alpha=0.05)...")
+    cal_probs = []
+    for text in X_cal:
+        res = prod_clf.predict_with_confidence(text)
+        cal_probs.append(res["prob_vector"])
+    cal_probs = np.array(cal_probs)
+
+    conformal_predictor = ConformalPredictor(alpha=0.05).calibrate(
+        probs=cal_probs,
+        y_true=y_cal,
+        classes=prod_clf.classes_
+    )
 
     # Initialize Escalators
     trivial_esc = TrivialEscalationBaseline()
     simple_esc = SimpleKeywordEscalationBaseline()
     prod_esc = ProductionEscalator(confidence_threshold=0.32)
 
-    # Initialize Retriever
-    retriever = HistoricalResolutionRetriever(top_k=3).build_index(train_sample)
+    # Initialize Retriever (Hybrid BM25 + Dense RRF on uncontaminated corpus)
+    retriever = HistoricalResolutionRetriever(top_k=3, rrf_k=20).build_index(train_sample)
 
     # Initialize Generators
     trivial_gen = TrivialReplyBaseline()
@@ -109,8 +139,8 @@ def run_evaluation():
     evaluator = SupportPipelineEvaluator()
     judge = ReplyQualityJudge()
 
-    # 4. Benchmark Inference
-    print(f"\n[4/5] Running inference across all 3 systems on 200 Golden test cases...")
+    # 5. Benchmark Inference
+    print(f"\n[5/6] Running inference across all 3 systems on 200 Golden test cases...")
     test_texts = gold_df["customer_text"].tolist()
     y_true_intent = gold_df["gold_intent"].tolist()
     y_true_esc = gold_df["gold_escalate"].tolist()
@@ -157,17 +187,27 @@ def run_evaluation():
     # System 3: Production
     prod_confidences = []
     prod_risk_scores = []
+    conformal_hits = []
+    conformal_sizes = []
     t0 = time.time()
-    for text in test_texts:
+    for text, gold_int in zip(test_texts, y_true_intent):
         res = prod_clf.predict_with_confidence(text)
         pred_i = res["intent"]
         conf = res["confidence"]
         is_unc = res["is_uncertain"]
+        prob_vec = res["prob_vector"]
         prod_confidences.append(conf)
 
+        # Conformal coverage check (pure conformal set, no top-1 injection)
+        c_res = conformal_predictor.predict_set(prob_vec)
+        conformal_hits.append(gold_int in c_res["prediction_set"])
+        conformal_sizes.append(c_res["set_size"])
+
+        # Multi-factor escalation
         esc_dec = prod_esc.evaluate(text, intent=pred_i, confidence=conf, is_uncertain=is_unc)
         prod_risk_scores.append(esc_dec.risk_score)
 
+        # Hybrid BM25 + TF-IDF RRF retrieval
         exemplars = retriever.retrieve_similar(text, intent_filter=pred_i, top_k=3)
         raw_reply = prod_gen.generate(text, pred_i, exemplars, esc_dec.to_dict())
         guard_res = guard.verify_and_sanitize(raw_reply, customer_text=text, should_escalate=esc_dec.should_escalate)
@@ -179,8 +219,8 @@ def run_evaluation():
         systems["Proposed System: Production Support Agent"]["replies"].append(final_reply)
     systems["Proposed System: Production Support Agent"]["time"] = time.time() - t0
 
-    # 5. Evaluate and Compare Metrics
-    print(f"\n[5/5] Calculating automated metrics & LLM-as-judge scores...")
+    # 6. Evaluate and Compare Metrics
+    print(f"\n[6/6] Calculating automated metrics & LLM-as-judge scores...")
     summary_rows = []
     full_results = {}
 
@@ -225,18 +265,30 @@ def run_evaluation():
         y_true=y_true_intent,
         y_pred=systems["Proposed System: Production Support Agent"]["intent_preds"],
         confidences=prod_confidences,
-        n_bins=10
+        n_bins=10,
+        strategy="quantile"
     )
     cost_opt = evaluator.optimize_cost_threshold(
         y_true_esc=y_true_esc,
         risk_scores=prod_risk_scores,
         cost_escalate=1.0,
-        cost_error_leak=5.0
+        cost_error_leak=10.0
     )
     full_results["calibration_metrics"] = ece_prod
     full_results["decision_theory_cost_optimization"] = cost_opt
 
-    # Human-Judge Agreement Evaluation on Golden Set
+    # Conformal Coverage Metrics
+    conformal_coverage = float(np.mean(conformal_hits))
+    avg_set_size = float(np.mean(conformal_sizes))
+    conformal_metrics = {
+        "target_coverage": 0.95,
+        "empirical_coverage": round(conformal_coverage, 4),
+        "average_prediction_set_size": round(avg_set_size, 3),
+        "conformal_quantile_q_hat": round(conformal_predictor.q_hat, 4)
+    }
+    full_results["conformal_metrics"] = conformal_metrics
+
+    # Human-Judge Agreement Validation on Golden Set
     human_overall = []
     for r in gold_records:
         h_score = (r["human_groundedness_score"] + r["human_empathy_score"] + r["human_actionability_score"] + r["human_safety_score"]) / 4.0
@@ -270,8 +322,13 @@ def run_evaluation():
 
     print(f"\n[Uncertainty Calibration & Decision Theory Optimization]")
     print(f"  Expected Calibration Error (ECE):   {ece_prod['ece']:.4f} (Max Error: {ece_prod['mce']:.4f})")
-    print(f"  Optimal Escalation Risk Threshold:  T* = {cost_opt['optimal_threshold']} (under 5x false-negative penalty ratio)")
+    print(f"  Optimal Escalation Risk Threshold:  T* = {cost_opt['optimal_threshold']} (Cost Ratio: 10:1)")
     print(f"  Minimum Business Loss:              {cost_opt['minimum_loss']} units")
+
+    print(f"\n[Conformal Prediction Finite-Sample Guarantees (1 - alpha = 95%)]")
+    print(f"  Empirical Golden Set Coverage:      {conformal_metrics['empirical_coverage']*100:.1f}% (Target: 95.0%)")
+    print(f"  Average Prediction Set Size:        {conformal_metrics['average_prediction_set_size']:.2f} intents")
+    print(f"  Non-conformity Quantile (q_hat):    {conformal_metrics['conformal_quantile_q_hat']}")
 
     print(f"\n[Human-Judge Agreement Validation]")
     print(f"  Pearson Correlation (r):       {agreement_metrics.get('pearson_r', 0.0):.3f}")

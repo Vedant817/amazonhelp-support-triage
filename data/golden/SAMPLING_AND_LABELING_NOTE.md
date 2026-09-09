@@ -27,20 +27,20 @@ The taxonomy was derived bottom-up by inspecting real customer tweets to `@Amazo
 
 | Intent Class | Description | Volume in Golden Set | % of Golden Set | Auto-Handled | Escalated |
 | :--- | :--- | :---: | :---: | :---: | :---: |
-| **`ORDER_TRACKING_AND_DELAY`** | Package tracking, delivery delays, courier inquiries, transit status | 45 | 22.5% | 22 | 23 |
-| **`REFUND_AND_RETURN`** | Initiating returns, refund turnaround time, return labels, billing | 35 | 17.5% | 17 | 18 |
-| **`DAMAGED_OR_WRONG_ITEM`** | Broken items, empty packages, wrong product shipped, missing parts | 35 | 17.5% | 17 | 18 |
+| **`ORDER_TRACKING_AND_DELAY`** | Package tracking, delivery delays, courier inquiries, transit status | 45 | 22.5% | 18 | 27 |
+| **`REFUND_AND_RETURN`** | Initiating returns, refund turnaround time, return labels, billing | 35 | 17.5% | 16 | 19 |
+| **`DAMAGED_OR_WRONG_ITEM`** | Broken items, empty packages, wrong product shipped, missing parts | 35 | 17.5% | 16 | 19 |
 | **`ACCOUNT_AND_SECURITY`** | Account lockouts, 2FA/OTP login failures, unauthorized access | 35 | 17.5% | 15 | 20 |
 | **`PRODUCT_AND_TECHNICAL`** | Device troubleshooting (Kindle, Fire TV, Echo/Alexa, Prime Video) | 25 | 12.5% | 13 | 12 |
-| **`FEEDBACK_AND_GENERAL`** | Feedback, brand praise, store policies, general inquiries | 25 | 12.5% | 10 | 15 |
-| **Total** | | **200** | **100.0%** | **94 (47.0%)** | **106 (53.0%)** |
+| **`FEEDBACK_AND_GENERAL`** | Feedback, brand praise, store policies, general inquiries | 25 | 12.5% | 12 | 13 |
+| **Total** | | **200** | **100.0%** | **90 (45.0%)** | **110 (55.0%)** |
 
 ---
 
 ## 3. Stratification & Triage Strategy (Auto-Handle vs. Escalate)
 A critical requirement of customer support AI is deciding what can be safely automated versus what presents financial, security, or customer satisfaction risk requiring human intervention:
 
-- **Auto-Handled (94 examples / 47.0%)**:
+- **Auto-Handled (90 examples / 45.0%)**:
   - Routine order tracking while inside the standard carrier delivery window (`ROUTINE_TRACKING_IN_TRANSIT`).
   - Standard return initiation instructions and links to `amazon.com/returns` (`ROUTINE_RETURN_POLICY_OR_PORTAL`).
   - Self-serve replacement workflows under `Your Orders` (`ROUTINE_REPLACEMENT_ELIGIBLE`).
@@ -48,7 +48,7 @@ A critical requirement of customer support AI is deciding what can be safely aut
   - Standard account management and preference configuration (`GENERAL_ACCOUNT_SETTINGS_SELF_SERVE`).
   - Courteous acknowledgments of positive customer feedback (`POSITIVE_BRAND_PRAISE`).
 
-- **Escalated to Human Specialist (106 examples / 53.0%)**:
+- **Escalated to Human Specialist (110 examples / 55.0%)**:
   - **Carrier Delivery Disputes**: Package marked as "delivered" by courier but customer did not receive it (doorstep theft or driver scan error requiring courier investigation).
   - **Account Security & Compromise**: Suspicious login attempts, 2FA lockout loops, suspected credential takeover.
   - **Financial & Billing Disputes**: Multiple unauthorized charges, missing refunds past SLA.
@@ -61,4 +61,9 @@ A critical requirement of customer support AI is deciding what can be safely aut
 ## 4. Quality Control & Labeling Process
 1. **Deduplication & Hygiene**: All tweets were normalized, stripped of non-printable characters, and checked for pure English syntax.
 2. **Ambiguity Resolution**: Multi-intent tweets (e.g., "My package was delayed AND damaged") were labelled by primary root cause (`DAMAGED_OR_WRONG_ITEM`) while flagging escalation due to complexity.
-3. **Reference Response Auditing**: Each historical brand response was scored across 4 dimensions (Groundedness, Empathy, Actionability, Safety) to establish human ground truth for LLM-as-judge calibration.
+3. **Historical-response ratings**: The four score columns rate Amazon's original
+   historical replies. They are not treated as agreement evidence for generated system
+   drafts. Judge agreement requires separate human ratings joined to the exact generated
+   reply IDs in `results/human_rating_template.csv`.
+4. **Policy correction audit**: Four documented contradictions were corrected after the
+   initial labeling pass. See `LABEL_AUDIT.md`; the counts above reflect that audited set.

@@ -40,9 +40,17 @@ class RetrievalEvidence(BaseModel):
     bm25_score: float
 
 
+class PipelineStageResponse(BaseModel):
+    stage: str
+    status: str
+    duration_ms: float
+    details: Dict[str, Any]
+
+
 class TriageResponse(BaseModel):
     intent: str
     confidence: float
+    all_probabilities: Dict[str, float]
     should_abstain: bool
     escalation: EscalationResponse
     resolution_act: str
@@ -53,6 +61,7 @@ class TriageResponse(BaseModel):
     guardrail_violations: List[str]
     character_count: int
     latency_ms: float
+    pipeline_trace: List[PipelineStageResponse]
 
 
 class HealthResponse(BaseModel):
@@ -63,4 +72,14 @@ class HealthResponse(BaseModel):
     intent_temperature: float
     escalation_temperature: float
     escalation_threshold: float
+    high_precision_escalation_threshold: float
+    intent_confidence_threshold: float
+    target_escalation_recall: float
     generation_mode: str
+    generation_backend: str
+    generation_model_revision: Optional[str]
+    intent_encoder: str
+    intent_encoder_revision: str
+    retrieval_method: str
+    inference_device: str
+    hosted_api_required: bool

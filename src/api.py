@@ -16,12 +16,14 @@ from src.dashboard_html import DASHBOARD_HTML
 from src.escalator import EscalationDecision, SafetyGatedEscalator
 from src.generator import ProductionGroundedGenerator
 from src.guardrails import ProductionPolicyGuard
+from src.local_llm import QWEN_MODEL_ID, QWEN_REVISION
 from src.model_factory import build_learned_pipeline
 from src.schemas import (
     ConfidenceRequest,
     ConfidenceResponse,
     EscalationResponse,
     HealthResponse,
+    PipelineStageResponse,
     RetrievalEvidence,
     TriageRequest,
     TriageResponse,
@@ -87,6 +89,8 @@ def serve_dashboard():
 @app.get("/api/v1/health", response_model=HealthResponse)
 def health():
     model = pipeline_state["model"]
+    encoder_device = getattr(getattr(model.encoder, "_model", None), "device", None)
+    generation_mode = pipeline_state["generation_mode"]
     return HealthResponse(
         status="healthy",
         brand="@AmazonHelp",
@@ -95,7 +99,17 @@ def health():
         intent_temperature=round(model.intent_temperature.temperature_, 4),
         escalation_temperature=round(model.escalation_temperature.temperature_, 4),
         escalation_threshold=round(model.escalation_threshold_, 4),
-        generation_mode=pipeline_state["generation_mode"],
+        high_precision_escalation_threshold=round(model.high_precision_escalation_threshold_, 4),
+        intent_confidence_threshold=round(model.intent_confidence_threshold, 4),
+        target_escalation_recall=round(model.target_escalation_recall, 4),
+        generation_mode=generation_mode,
+        generation_backend=QWEN_MODEL_ID if generation_mode == "local" else "act-conditioned deterministic rewrite",
+        generation_model_revision=QWEN_REVISION if generation_mode == "local" else None,
+        intent_encoder=model.encoder.model_name,
+        intent_encoder_revision=model.encoder.revision,
+        retrieval_method="BM25 + MiniLM reciprocal-rank fusion",
+        inference_device=str(encoder_device or model.encoder.device or "cpu"),
+        hosted_api_required=False,
     )
 
 
@@ -114,10 +128,26 @@ def confidence_lookup(req: ConfidenceRequest):
 
 @app.post("/api/v1/triage", response_model=TriageResponse)
 def triage(req: TriageRequest):
-    started = time.time()
+    started = time.perf_counter()
     model = pipeline_state["model"]
+
+    stage_started = time.perf_counter()
     classification = model.predict_with_confidence(req.text)
+    classification_ms = (time.perf_counter() - stage_started) * 1000.0
+
+    stage_started = time.perf_counter()
     learned_escalation = model.predict_escalation(req.text, classification["embedding"])
+    risk_scoring_ms = (time.perf_counter() - stage_started) * 1000.0
+
+    stage_started = time.perf_counter()
+    exemplars = pipeline_state["retriever"].retrieve_similar(
+        req.text, intent_filter=classification["intent"], top_k=3
+    )
+    generator = pipeline_state["generator"]
+    evidence_act = generator.select_act(exemplars, classification["intent"], False)
+    retrieval_ms = (time.perf_counter() - stage_started) * 1000.0
+
+    stage_started = time.perf_counter()
     escalator = pipeline_state["escalator"]
     decision = escalator.evaluate(
         req.text,
@@ -125,6 +155,8 @@ def triage(req: TriageRequest):
         learned_escalation["risk_score"],
         is_uncertain=classification["is_uncertain"],
         learned_threshold=learned_escalation["threshold"],
+        high_precision_threshold=model.high_precision_escalation_threshold_,
+        resolution_act=evidence_act,
     )
 
     session = None
@@ -138,21 +170,24 @@ def triage(req: TriageRequest):
                 max(float(friction["friction_score"]), decision.risk_score),
                 decision.triggers + ["MULTI_TURN_FRICTION"],
             )
+    escalation_ms = (time.perf_counter() - stage_started) * 1000.0
 
-    exemplars = pipeline_state["retriever"].retrieve_similar(
-        req.text, intent_filter=classification["intent"], top_k=3
-    )
-    generator = pipeline_state["generator"]
     resolution_act = generator.select_act(exemplars, classification["intent"], decision.should_escalate)
+
+    stage_started = time.perf_counter()
     raw_reply = generator.generate(
         req.text,
         classification["intent"],
         exemplars,
         escalate_decision=decision.to_dict(),
     )
+    generation_ms = (time.perf_counter() - stage_started) * 1000.0
+
+    stage_started = time.perf_counter()
     guarded = pipeline_state["guard"].verify_and_sanitize(
         raw_reply, customer_text=req.text, should_escalate=decision.should_escalate
     )
+    guardrail_ms = (time.perf_counter() - stage_started) * 1000.0
 
     if session is not None:
         session.add_turn(
@@ -163,7 +198,7 @@ def triage(req: TriageRequest):
             guarded.sanitized_reply,
         )
 
-    latency_ms = round((time.time() - started) * 1000.0, 2)
+    latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
     with metrics_lock:
         metrics_counters["total_requests"] += 1
         metrics_counters["escalated_requests"] += int(decision.should_escalate)
@@ -182,9 +217,81 @@ def triage(req: TriageRequest):
         )
         for ex in exemplars
     ]
+    hard_gate_triggered = any(str(trigger).startswith("HARD_GATE") for trigger in decision.triggers)
+    pipeline_trace = [
+        PipelineStageResponse(
+            stage="Intent classification",
+            status="abstained" if classification["is_uncertain"] else "complete",
+            duration_ms=round(classification_ms, 2),
+            details={
+                "encoder": model.encoder.model_name,
+                "predicted_intent": classification["intent"],
+                "confidence": round(classification["confidence"], 4),
+                "confidence_threshold": round(model.intent_confidence_threshold, 4),
+                "resolution_method": classification["intent_resolution"],
+            },
+        ),
+        PipelineStageResponse(
+            stage="Escalation risk scoring",
+            status="complete",
+            duration_ms=round(risk_scoring_ms, 2),
+            details={
+                "risk_score": round(learned_escalation["risk_score"], 4),
+                "recall_threshold": round(learned_escalation["threshold"], 4),
+                "high_precision_threshold": round(model.high_precision_escalation_threshold_, 4),
+            },
+        ),
+        PipelineStageResponse(
+            stage="Historical retrieval",
+            status="complete" if evidence else "no_match",
+            duration_ms=round(retrieval_ms, 2),
+            details={
+                "method": "BM25 + MiniLM RRF",
+                "neighbors_returned": len(evidence),
+                "evidence_resolution_act": evidence_act,
+                "top_rrf_score": evidence[0].rrf_score if evidence else None,
+            },
+        ),
+        PipelineStageResponse(
+            stage="Routing policy fusion",
+            status="escalate" if decision.should_escalate else "auto_handle",
+            duration_ms=round(escalation_ms, 2),
+            details={
+                "risk_score": round(decision.risk_score, 4),
+                "recall_threshold": round(learned_escalation["threshold"], 4),
+                "high_precision_threshold": round(model.high_precision_escalation_threshold_, 4),
+                "retrieval_evidence_act": evidence_act,
+                "hard_gate_triggered": hard_gate_triggered,
+                "triggers": decision.triggers,
+            },
+        ),
+        PipelineStageResponse(
+            stage="Reply generation",
+            status="complete",
+            duration_ms=round(generation_ms, 2),
+            details={
+                "mode": pipeline_state["generation_mode"],
+                "backend": QWEN_MODEL_ID if pipeline_state["generation_mode"] == "local" else "act-conditioned deterministic rewrite",
+                "resolution_act": resolution_act,
+            },
+        ),
+        PipelineStageResponse(
+            stage="Pre-dispatch guardrails",
+            status="passed" if guarded.is_valid else "adjusted",
+            duration_ms=round(guardrail_ms, 2),
+            details={
+                "character_count": len(guarded.sanitized_reply),
+                "violations": guarded.violations,
+                "adjustments": guarded.adjustments_made,
+            },
+        ),
+    ]
     return TriageResponse(
         intent=classification["intent"],
         confidence=round(classification["confidence"], 4),
+        all_probabilities={
+            key: round(value, 4) for key, value in classification["all_probabilities"].items()
+        },
         should_abstain=classification["is_uncertain"],
         escalation=EscalationResponse(
             should_escalate=decision.should_escalate,
@@ -201,6 +308,7 @@ def triage(req: TriageRequest):
         guardrail_violations=guarded.violations,
         character_count=len(guarded.sanitized_reply),
         latency_ms=latency_ms,
+        pipeline_trace=pipeline_trace,
     )
 
 

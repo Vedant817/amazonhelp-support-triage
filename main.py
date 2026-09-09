@@ -6,7 +6,7 @@ Running:
     python main.py serve               # Start the local server & UI
     python main.py test                # Run complete unit & integration test suite
     python main.py benchmark           # Run the 200 Golden Evaluation benchmark
-    python main.py stress              # Run the 12-case CheckList adversarial stress suite
+    python main.py stress              # Run the safety regression suite
 """
 
 import sys
@@ -21,22 +21,31 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
 
-def run_serve(host: str = "127.0.0.1", port: int = 8000, reload: bool = False):
+def run_serve(
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    reload: bool = False,
+    generation_mode: str | None = None,
+):
     """Start the local FastAPI REST API and web dashboard."""
     import uvicorn
+    if generation_mode is not None:
+        os.environ["SUPPORT_GENERATION_MODE"] = generation_mode
+    active_mode = os.getenv("SUPPORT_GENERATION_MODE", "offline")
     print("\n" + "=" * 80)
     print("      @AmazonHelp AI Support Agent - Local Prototype")
     print("=" * 80)
-    print(f"  • Interactive Web Dashboard: http://{host}:{port}/")
-    print(f"  • OpenAPI Specification:     http://{host}:{port}/docs")
-    print(f"  • Health & Readiness Probe:  http://{host}:{port}/api/v1/health")
-    print(f"  • Prometheus Metrics:        http://{host}:{port}/metrics")
+    print(f"  Dashboard:        http://{host}:{port}/")
+    print(f"  OpenAPI:          http://{host}:{port}/docs")
+    print(f"  Health:           http://{host}:{port}/api/v1/health")
+    print(f"  Metrics:          http://{host}:{port}/metrics")
+    print(f"  Generation mode:  {active_mode}")
     print("=" * 80 + "\n")
     uvicorn.run("src.api:app", host=host, port=port, reload=reload)
 
 
 def run_test():
-    """Run all 27 unit and integration tests."""
+    """Run the discovered unit and integration tests."""
     print("\n" + "=" * 80)
     print("      Running Full Test Suite (Unit + Integration)")
     print("=" * 80 + "\n")
@@ -50,7 +59,7 @@ def run_test():
 
 
 def run_stress():
-    """Run the 12-case behavioral & adversarial stress suite."""
+    """Run the behavioral and adversarial safety suite."""
     print("\n" + "=" * 80)
     print("      Running Behavioral & Adversarial CheckList Stress Suite")
     print("=" * 80 + "\n")
@@ -84,14 +93,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:
-  serve      Start the production FastAPI server & live web UI (default)
-  test       Run the full 27-test unit & integration suite
+  serve      Start the local FastAPI server & live web UI (default)
+  test       Run the discovered unit & integration suite
   benchmark  Run the 200 Golden Evaluation benchmark
-  stress     Run the 12-case CheckList adversarial stress suite
+  stress     Run the behavioral and adversarial safety suite
 
 Examples:
-  python main.py                       # Starts production server on http://127.0.0.1:8000
+  python main.py                       # Starts local server on http://127.0.0.1:8000
   python main.py serve --port 8080     # Starts server on custom port
+  python main.py serve --generation-mode local  # Uses pinned local Qwen, no API key
   python main.py test                  # Runs the discovered unit/integration tests
   python main.py benchmark             # Runs golden evaluation benchmark
 """
@@ -107,20 +117,25 @@ Examples:
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind for server (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind for server (default: 8000)")
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload for development")
-    parser.add_argument("--generation-mode", choices=["offline", "local"], default="offline")
+    parser.add_argument("--generation-mode", choices=["offline", "local"], default=None)
     parser.add_argument("--judge-local", action="store_true", help="Run the pinned local-model reply judge")
     parser.add_argument("--include-zero-shot-local", action="store_true", help="Add the local Qwen zero-shot baseline")
 
     args = parser.parse_args()
 
     if args.command == "serve":
-        run_serve(host=args.host, port=args.port, reload=args.reload)
+        run_serve(
+            host=args.host,
+            port=args.port,
+            reload=args.reload,
+            generation_mode=args.generation_mode,
+        )
     elif args.command == "test":
         run_test()
     elif args.command == "stress":
         run_stress()
     elif args.command == "benchmark":
-        run_benchmark(args.generation_mode, args.judge_local, args.include_zero_shot_local)
+        run_benchmark(args.generation_mode or "offline", args.judge_local, args.include_zero_shot_local)
 
 
 if __name__ == "__main__":

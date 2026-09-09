@@ -6,7 +6,7 @@
 [![Stress Suite: 100% Pass](https://img.shields.io/badge/stress%20suite-100%25%20pass-brightgreen.svg)]()
 [![Reproducibility: <2 mins](https://img.shields.io/badge/reproducibility-%3C2%20mins-green.svg)]()
 
-Production-grade AI Support Agent built on 32,000+ real customer interactions from the Kaggle Twitter Customer Support corpus (`@AmazonHelp`).
+Production-grade real-time AI Support Agent built on 32,000+ customer interactions from the Kaggle Twitter Customer Support corpus (`@AmazonHelp`).
 
 The system performs:
 1. **Multi-class Intent Classification** across 6 customer service domains (**88.0% Accuracy, 0.875 Macro-F1** on uncontaminated out-of-sample data).
@@ -20,9 +20,9 @@ The system performs:
 
 ---
 
-## Quickstart: Single-File Universal Entrypoint (`main.py`)
+## Quickstart: Universal Production Entrypoint (`main.py`)
 
-The entire project is operated through a **single entrypoint file**: [`main.py`](main.py).
+The entire project runs through the single entrypoint [`main.py`](main.py).
 
 ### 1. Setup Environment
 ```bash
@@ -40,7 +40,7 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 2. Start the Entire Project (Default)
+### 2. Start the Real-Time Production System (Default)
 ```bash
 python main.py
 ```
@@ -50,22 +50,16 @@ This single command spins up the production FastAPI microservice and serves the 
 * **Prometheus Metrics**: [http://127.0.0.1:8000/metrics](http://127.0.0.1:8000/metrics)
 * **Health & Readiness Probe**: [http://127.0.0.1:8000/api/v1/health](http://127.0.0.1:8000/api/v1/health)
 
-### 3. Other Capabilities via `main.py`
+### 3. Verification & Evaluation via `main.py`
 ```bash
-# Run the 200 Golden Evaluation benchmark comparison
-python main.py benchmark
+# Run all 27 unit & integration tests
+python main.py test
 
 # Run the 12-case CheckList behavioral and adversarial stress suite
 python main.py stress
 
-# Run all 27 unit & integration tests
-python main.py test
-
-# Launch the interactive terminal CLI shell
-python main.py demo
-
-# Run all verification stages (tests -> stress -> benchmark) and then start the server
-python main.py all
+# Run the 200 Golden Evaluation benchmark comparison
+python main.py benchmark
 ```
 
 ---
@@ -189,10 +183,10 @@ amazonhelp_latency_ms_avg 51.34
 
 ---
 
-## Repository Structure
+## Clean Production Repository Structure
 
 ```text
-├── main.py                        # SINGLE UNIVERSAL ENTRYPOINT
+├── main.py                        # PRODUCTION SINGLE ENTRYPOINT
 ├── data/
 │   ├── raw/                       # Original Kaggle Customer Support dataset
 │   ├── processed/                 # Extracted @AmazonHelp customer-agent turn pairs
@@ -212,11 +206,8 @@ amazonhelp_latency_ms_avg 51.34
 │   ├── guardrails.py              # Zero-PII leak & URL whitelist policy guard
 │   └── session.py                 # Multi-Turn Customer Session & Friction Tracker
 ├── scripts/
-│   ├── serve_dashboard.py         # Standalone server runner for UI & API
 │   ├── reproduce_headline.py      # Golden benchmark reproduction runner
-│   ├── run_stress_test.py         # 12-case CheckList adversarial stress suite
-│   ├── run_demo.py                # Interactive CLI demo runner
-│   └── evaluate_agent.py          # LLM Judge and ablation harness
+│   └── run_stress_test.py         # 12-case CheckList adversarial stress suite
 ├── tests/
 │   ├── test_api.py                # FastAPI integration tests (8 tests)
 │   ├── test_ood.py                # Energy OOD unit tests (3 tests)

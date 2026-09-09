@@ -1,14 +1,12 @@
 """
-Single Universal Entrypoint for the @AmazonHelp AI Support Agent System.
+Universal Production Entrypoint for @AmazonHelp AI Customer Support System.
 
-Usage:
-    python main.py                     # Start the Live Dashboard & REST API (default)
-    python main.py serve               # Start the Live Dashboard & REST API
+Running:
+    python main.py                     # Start the Real-Time Production Server & UI (default)
+    python main.py serve               # Start the Real-Time Production Server & UI
+    python main.py test                # Run complete unit & integration test suite (27 tests)
     python main.py benchmark           # Run the 200 Golden Evaluation benchmark
     python main.py stress              # Run the 12-case CheckList adversarial stress suite
-    python main.py test                # Run complete unit & integration test suite (27 tests)
-    python main.py demo                # Interactive CLI terminal shell
-    python main.py all                 # Run tests, stress suite, benchmark, then start server
 """
 
 import sys
@@ -75,30 +73,22 @@ def run_benchmark():
         sys.exit(ret)
 
 
-def run_demo():
-    """Launch the terminal interactive demo shell."""
-    script = os.path.join(REPO_ROOT, "scripts", "run_demo.py")
-    subprocess.call([sys.executable, script])
-
-
 def main():
     parser = argparse.ArgumentParser(
-        description="@AmazonHelp AI Support Agent - Unified Runner",
+        description="@AmazonHelp AI Support Agent - Production Entrypoint",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:
-  serve      Start the FastAPI server & live web UI (default)
+  serve      Start the production FastAPI server & live web UI (default)
+  test       Run the full 27-test unit & integration suite
   benchmark  Run the 200 Golden Evaluation benchmark
   stress     Run the 12-case CheckList adversarial stress suite
-  test       Run the full 27-test unit & integration suite
-  demo       Run the interactive CLI terminal shell
-  all        Run tests, stress suite, benchmark, and then start server
 
 Examples:
-  python main.py                       # Launches dashboard on http://127.0.0.1:8000
-  python main.py serve --port 8080     # Launches dashboard on custom port
-  python main.py benchmark             # Runs golden evaluation
-  python main.py test                  # Runs test suite
+  python main.py                       # Starts production server on http://127.0.0.1:8000
+  python main.py serve --port 8080     # Starts server on custom port
+  python main.py test                  # Runs 27 tests
+  python main.py benchmark             # Runs golden evaluation benchmark
 """
     )
 
@@ -106,7 +96,7 @@ Examples:
         "command",
         nargs="?",
         default="serve",
-        choices=["serve", "benchmark", "stress", "test", "demo", "all"],
+        choices=["serve", "benchmark", "stress", "test"],
         help="Command to execute (default: serve)"
     )
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind for server (default: 127.0.0.1)")
@@ -123,17 +113,6 @@ Examples:
         run_stress()
     elif args.command == "benchmark":
         run_benchmark()
-    elif args.command == "demo":
-        run_demo()
-    elif args.command == "all":
-        print("\n[STAGE 1/4] Running full unit and integration test suite...")
-        run_test()
-        print("\n[STAGE 2/4] Running 12-case behavioral & adversarial stress suite...")
-        run_stress()
-        print("\n[STAGE 3/4] Running golden evaluation benchmark...")
-        run_benchmark()
-        print("\n[STAGE 4/4] Starting live production web dashboard and API...")
-        run_serve(host=args.host, port=args.port, reload=args.reload)
 
 
 if __name__ == "__main__":

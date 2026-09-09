@@ -1,11 +1,7 @@
-"""
-Evaluation Harness for @AmazonHelp Support AI Pipeline.
-Implements:
-1. Intent Classification metrics (Accuracy, Macro-F1, Per-class Precision/Recall)
-2. Escalation Triage metrics (Accuracy, Macro-F1, Auto-handle / Escalate F1, Stated Reason Alignment)
-3. Reply Quality metrics (ROUGE-L, BLEU-4 with Chen-Cherry smoothing, Length Compliance)
-4. Expected Calibration Error (ECE) with equal-width or quantile binning
-5. Decision Theory Cost-Utility Threshold Optimization with Multi-Tier Loss Matrices
+"""Classification, escalation, calibration, bootstrap, and safety evaluation helpers.
+
+Legacy overlap metrics remain available for diagnostics but are deliberately excluded
+from the reply-quality headline evidence.
 """
 
 import re
@@ -63,20 +59,8 @@ class SupportPipelineEvaluator:
         p_esc, r_esc, f1_esc, _ = precision_recall_fscore_support(y_true_esc, y_pred_esc, pos_label=True, average='binary', zero_division=0)
         p_auto, r_auto, f1_auto, _ = precision_recall_fscore_support(y_true_esc, y_pred_esc, pos_label=False, average='binary', zero_division=0)
 
-        # Domain root reason alignment (filtering out generic filler tokens)
-        stopwords = {
-            "or", "and", "the", "for", "to", "in", "by", "of", "a", "an",
-            "self", "serve", "routine", "general", "inquiry", "issue", "portal", "support"
-        }
-        reason_matches = 0
-        for tr, pr in zip(true_reasons, pred_reasons):
-            tr_tokens = set(re.findall(r"[a-zA-Z0-9]+", tr.lower())) - stopwords
-            pr_tokens = set(re.findall(r"[a-zA-Z0-9]+", pr.lower())) - stopwords
-            overlap = tr_tokens.intersection(pr_tokens)
-            if len(overlap) >= 1 or tr == pr:
-                reason_matches += 1
-                
-        reason_alignment_rate = round(reason_matches / max(len(true_reasons), 1), 4)
+        reason_matches = sum(str(tr) == str(pr) for tr, pr in zip(true_reasons, pred_reasons))
+        reason_exact_match = round(reason_matches / max(len(true_reasons), 1), 4)
 
         return {
             "accuracy": round(float(acc), 4),
@@ -87,8 +71,72 @@ class SupportPipelineEvaluator:
             "auto_handle_f1": round(float(f1_auto), 4),
             "auto_handle_precision": round(float(p_auto), 4),
             "auto_handle_recall": round(float(r_auto), 4),
-            "reason_alignment_rate": reason_alignment_rate
+            "reason_exact_match": reason_exact_match
         }
+
+    def bootstrap_classification_intervals(
+        self,
+        y_true: List[Any],
+        y_pred: List[Any],
+        metric: str,
+        iterations: int = 2000,
+        seed: int = 42,
+    ) -> Dict[str, float]:
+        """Non-parametric paired bootstrap CI for headline classification metrics."""
+        if len(y_true) != len(y_pred) or not y_true:
+            raise ValueError("Bootstrap inputs must be non-empty and aligned")
+        rng = np.random.default_rng(seed)
+        truth = np.asarray(y_true)
+        pred = np.asarray(y_pred)
+        values = []
+        for _ in range(iterations):
+            idx = rng.integers(0, len(truth), size=len(truth))
+            if metric == "accuracy":
+                value = accuracy_score(truth[idx], pred[idx])
+            elif metric == "macro_f1":
+                value = precision_recall_fscore_support(
+                    truth[idx], pred[idx], average="macro", zero_division=0
+                )[2]
+            elif metric == "escalate_recall":
+                value = precision_recall_fscore_support(
+                    truth[idx].astype(bool), pred[idx].astype(bool),
+                    pos_label=True, average="binary", zero_division=0
+                )[1]
+            elif metric == "escalate_precision":
+                value = precision_recall_fscore_support(
+                    truth[idx].astype(bool), pred[idx].astype(bool),
+                    pos_label=True, average="binary", zero_division=0
+                )[0]
+            else:
+                raise ValueError(f"Unsupported bootstrap metric: {metric}")
+            values.append(float(value))
+        low, high = np.quantile(values, [0.025, 0.975])
+        return {"lower": round(float(low), 4), "upper": round(float(high), 4), "iterations": iterations}
+
+    def coverage_accuracy_curve(
+        self,
+        y_true: List[str],
+        y_pred: List[str],
+        confidences: List[float],
+        thresholds: Optional[List[float]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Report the accuracy/coverage tradeoff without claiming conformal guarantees."""
+        thresholds = thresholds or [round(v, 2) for v in np.arange(0.0, 0.96, 0.05)]
+        truth = np.asarray(y_true)
+        pred = np.asarray(y_pred)
+        conf = np.asarray(confidences, dtype=float)
+        rows = []
+        for threshold in thresholds:
+            retained = conf >= threshold
+            coverage = float(np.mean(retained))
+            accuracy = float(np.mean(truth[retained] == pred[retained])) if retained.any() else None
+            rows.append({
+                "confidence_threshold": threshold,
+                "coverage": round(coverage, 4),
+                "retained_accuracy": round(accuracy, 4) if accuracy is not None else None,
+                "abstain_count": int(np.sum(~retained)),
+            })
+        return rows
 
     def _compute_bleu(self, reference: str, candidate: str, max_n: int = 4) -> float:
         """Computes sentence-level BLEU score with Chen-Cherry Laplace smoothing."""

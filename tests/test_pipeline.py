@@ -1,157 +1,182 @@
-"""
-Unit tests for @AmazonHelp Support AI Pipeline Components.
-Tests:
-- Data preprocessor
-- Intent Classifier inference & confidence
-- Multi-factor Escalation Engine rules
-- Conformal Prediction set generation & coverage bounds
-- Hybrid BM25 + TF-IDF RRF Retriever
-- Production Policy Guardrails & Sanitization
-- Multi-turn Conversational Session Tracking
-- Grounded Reply Generator Twitter character constraints
-- LLM Judge scoring rubrics
-"""
-
 import unittest
-import sys
-import os
+from tempfile import TemporaryDirectory
+from pathlib import Path
+from unittest.mock import patch
+
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-
-from src.classifier import ProductionIntentClassifier, preprocess_tweet
-from src.escalator import ProductionEscalator
+from src.dual_head import TemperatureScaler, select_recall_threshold
+from src.escalator import SafetyGatedEscalator
 from src.generator import ProductionGroundedGenerator
-from src.llm_judge import ReplyQualityJudge
-from src.conformal import ConformalPredictor
-from src.retriever import HistoricalResolutionRetriever
 from src.guardrails import ProductionPolicyGuard
-from src.session import CustomerSessionState
+from src.llm_judge import ReplyQualityJudge
+from src.retriever import HistoricalResolutionRetriever
+from src.supervision import build_reply_supervision, infer_resolution_act, strip_agent_pii
+
+
+class FakeDenseEncoder:
+    vocabulary = ("package", "tracking", "broken", "return", "kindle", "account")
+
+    def encode(self, texts, batch_size=64):
+        rows = []
+        for text in texts:
+            lower = text.lower()
+            vector = np.array([lower.count(word) for word in self.vocabulary], dtype=np.float32)
+            norm = np.linalg.norm(vector)
+            rows.append(vector / norm if norm else vector)
+        return np.asarray(rows)
+
+
+class FakeLocalModel:
+    model_name = "fake-local"
+    revision = "test"
+
+    def __init__(self, output):
+        self.output = output
+
+    def generate(self, messages, max_new_tokens=128):
+        return self.output
+
 
 class TestPipelineComponents(unittest.TestCase):
+    def test_reply_supervision_does_not_use_customer_keyword(self):
+        frame = pd.DataFrame([{
+            "inbound_id": "1",
+            "customer_text": "My package is broken and hacked",
+            "reply_text": "What does the latest tracking status show?",
+        }])
+        labeled = build_reply_supervision(frame)
+        self.assertEqual(labeled.iloc[0]["intent_label"], "ORDER_TRACKING_AND_DELAY")
+        self.assertFalse(bool(labeled.iloc[0]["escalate_label"]))
 
-    @classmethod
-    def setUpClass(cls):
-        # Quick fit with minimal representative sample
-        cls.clf = ProductionIntentClassifier(confidence_threshold=0.32)
-        sample_texts = [
-            "Where is my package delivery? Tracking is stuck.",
-            "I need a refund for my damaged returned item.",
-            "Item arrived shattered and broken into pieces.",
-            "My account was hacked and password changed.",
-            "My kindle paperwhite won't turn on or charge.",
-            "Thank you Amazon for the great customer service!"
-        ]
-        sample_intents = [
-            "ORDER_TRACKING_AND_DELAY",
-            "REFUND_AND_RETURN",
-            "DAMAGED_OR_WRONG_ITEM",
-            "ACCOUNT_AND_SECURITY",
-            "PRODUCT_AND_TECHNICAL",
-            "FEEDBACK_AND_GENERAL"
-        ]
-        cls.clf.fit(sample_texts, sample_intents)
-        cls.esc = ProductionEscalator(confidence_threshold=0.32)
-        cls.gen = ProductionGroundedGenerator()
-        cls.judge = ReplyQualityJudge()
-        cls.guard = ProductionPolicyGuard()
+    def test_reviewed_labels_reject_invalid_values(self):
+        frame = pd.DataFrame([{
+            "inbound_id": "1",
+            "customer_text": "Help",
+            "reply_text": "What does the latest tracking status show?",
+        }])
+        with self.assertRaises(ValueError):
+            build_reply_supervision(frame, pd.DataFrame([{
+                "inbound_id": "1",
+                "reviewed_intent": "NOT_A_REAL_INTENT",
+                "reviewed_escalate": "yes",
+            }]))
+        with self.assertRaises(ValueError):
+            build_reply_supervision(frame, pd.DataFrame([{
+                "inbound_id": "1",
+                "reviewed_intent": "ORDER_TRACKING_AND_DELAY",
+                "reviewed_escalate": "treu",
+            }]))
 
-    def test_preprocess_tweet(self):
-        raw = "@AmazonHelp http://t.co/xyz Can you help with order &amp; tracking?"
-        cleaned = preprocess_tweet(raw)
-        self.assertNotIn("@amazonhelp", cleaned)
-        self.assertNotIn("http://", cleaned)
-        self.assertNotIn("&amp;", cleaned)
-        self.assertIn("tracking", cleaned)
-
-    def test_classifier_output(self):
-        res = self.clf.predict_with_confidence("Where is my package delivery?")
-        self.assertIn(res["intent"], [
-            "ORDER_TRACKING_AND_DELAY", "FEEDBACK_AND_GENERAL", "REFUND_AND_RETURN",
-            "DAMAGED_OR_WRONG_ITEM", "ACCOUNT_AND_SECURITY", "PRODUCT_AND_TECHNICAL"
+    def test_reviewed_labels_reject_duplicate_ids(self):
+        frame = pd.DataFrame([{
+            "inbound_id": "1", "customer_text": "Help", "reply_text": "Contact us"
+        }])
+        reviewed = pd.DataFrame([
+            {"inbound_id": "1", "reviewed_intent": "FEEDBACK_AND_GENERAL", "reviewed_escalate": True},
+            {"inbound_id": "1", "reviewed_intent": "FEEDBACK_AND_GENERAL", "reviewed_escalate": False},
         ])
-        self.assertGreaterEqual(res["confidence"], 0.0)
-        self.assertLessEqual(res["confidence"], 1.0)
-        self.assertIn("prob_vector", res)
+        with self.assertRaises(ValueError):
+            build_reply_supervision(frame, reviewed)
 
-    def test_escalation_security_threat(self):
-        # Must escalate compromised accounts
-        dec = self.esc.evaluate("My account was hacked and someone ordered an iPhone!")
-        self.assertTrue(dec.should_escalate)
-        self.assertEqual(dec.stated_reason, "ACCOUNT_SECURITY_OR_LOCKOUT")
-        self.assertGreater(dec.risk_score, 0.9)
+    def test_resolution_act_and_pii_stripping(self):
+        self.assertEqual(infer_resolution_act("Please DM us so we can help. ^AB"), "DM_WITH_ORDER_ID")
+        cleaned = strip_agent_pii("@person Email test@example.com and order 123-1234567-1234567. ^AB")
+        self.assertNotIn("test@example.com", cleaned)
+        self.assertNotIn("123-1234567-1234567", cleaned)
+        self.assertNotIn("@person", cleaned)
 
-    def test_escalation_delivery_dispute(self):
-        # Must escalate false delivery scan
-        dec = self.esc.evaluate("Tracking says delivered but package is missing and nowhere outside.")
-        self.assertTrue(dec.should_escalate)
-        self.assertEqual(dec.stated_reason, "DELIVERY_DISPUTE_MARKED_DELIVERED_BUT_MISSING")
+    def test_temperature_scaling(self):
+        logits = np.array([[3.0, 0.2], [2.0, 0.1], [0.2, 2.5], [0.1, 3.0]])
+        scaler = TemperatureScaler().fit_multiclass(logits, [0, 0, 1, 1])
+        self.assertTrue(scaler.is_fitted_)
+        self.assertGreater(scaler.temperature_, 0.0)
 
-    def test_escalation_auto_handle(self):
-        # Routine tracking should be auto-handled
-        dec = self.esc.evaluate("When will my order ship out?", intent="ORDER_TRACKING_AND_DELAY", confidence=0.85)
-        self.assertFalse(dec.should_escalate)
-        self.assertEqual(dec.stated_reason, "ROUTINE_TRACKING_IN_TRANSIT")
+    def test_recall_threshold_hits_target(self):
+        threshold = select_recall_threshold([True, True, False, False], [0.9, 0.7, 0.6, 0.1], 1.0)
+        predicted = np.array([0.9, 0.7, 0.6, 0.1]) >= threshold
+        self.assertEqual(int(predicted[:2].sum()), 2)
 
-    def test_generator_character_limit(self):
-        # All replies must be under 280 characters for Twitter
-        reply = self.gen.generate(
-            "How do I return this item?",
-            "REFUND_AND_RETURN",
-            [],
-            {"escalate": False, "stated_reason": "ROUTINE_RETURN_POLICY_OR_PORTAL"}
+    def test_hard_safety_gate_cannot_be_vetoed(self):
+        escalator = SafetyGatedEscalator(learned_threshold=0.8)
+        decision = escalator.evaluate(
+            "My account was hacked", "ACCOUNT_AND_SECURITY", learned_risk_score=0.01
         )
+        self.assertTrue(decision.should_escalate)
+        self.assertIn("HARD_GATE", decision.triggers[0])
+
+    def test_closed_reason_codes(self):
+        escalator = SafetyGatedEscalator(learned_threshold=0.5)
+        decision = escalator.evaluate(
+            "The delivery failed", "ORDER_TRACKING_AND_DELAY", learned_risk_score=0.9
+        )
+        self.assertEqual(decision.stated_reason, "DELIVERY_DISPUTE_MARKED_DELIVERED_BUT_MISSING")
+
+    def test_minilm_rrf_path_uses_dense_encoder(self):
+        frame = pd.DataFrame([
+            {"customer_text": "package tracking", "reply_text": "What does tracking show?", "intent": "ORDER_TRACKING_AND_DELAY"},
+            {"customer_text": "kindle broken", "reply_text": "Restart the device", "intent": "PRODUCT_AND_TECHNICAL"},
+        ])
+        retriever = HistoricalResolutionRetriever(dense_encoder=FakeDenseEncoder()).build_index(frame)
+        result = retriever.retrieve_similar("track package", top_k=1)[0]
+        self.assertEqual(result["dense_model"], "MiniLM")
+        self.assertEqual(result["intent"], "ORDER_TRACKING_AND_DELAY")
+
+    def test_dense_index_reload_rehydrates_query_encoder(self):
+        frame = pd.DataFrame([
+            {"customer_text": "package tracking", "reply_text": "What does tracking show?", "intent": "ORDER_TRACKING_AND_DELAY"},
+            {"customer_text": "kindle broken", "reply_text": "Restart the device", "intent": "PRODUCT_AND_TECHNICAL"},
+        ])
+        original = HistoricalResolutionRetriever(dense_encoder=FakeDenseEncoder()).build_index(frame)
+        with TemporaryDirectory() as directory:
+            index_path = Path(directory) / "retriever.pkl"
+            original.save_index(str(index_path))
+            with patch("src.dual_head.MiniLMEncoder", return_value=FakeDenseEncoder()):
+                restored = HistoricalResolutionRetriever().load_index(str(index_path))
+            result = restored.retrieve_similar("track package", top_k=1)[0]
+        self.assertEqual(result["dense_model"], "MiniLM")
+        self.assertEqual(result["intent"], "ORDER_TRACKING_AND_DELAY")
+
+    def test_offline_generation_is_act_conditioned(self):
+        generator = ProductionGroundedGenerator(mode="offline")
+        exemplars = [{"resolution_act": "ASK_CARRIER", "reply_text": "Which carrier?"}]
+        reply = generator.generate("Delivery issue", "ORDER_TRACKING_AND_DELAY", exemplars, {"should_escalate": False})
+        self.assertIn("carrier", reply.lower())
         self.assertLessEqual(len(reply), 280)
-        self.assertIn("amazon.com/returns", reply)
 
-    def test_conformal_predictor(self):
-        cp = ConformalPredictor(alpha=0.10)
-        classes = ["A", "B"]
-        dummy_probs = np.array([[0.9, 0.1], [0.8, 0.2], [0.1, 0.9], [0.85, 0.15]])
-        y_true = ["A", "A", "B", "A"]
-        cp.calibrate(dummy_probs, y_true, classes)
-        self.assertTrue(cp.is_calibrated)
-        
-        # Test confident prediction
-        res_conf = cp.predict_set(np.array([0.95, 0.05]))
-        self.assertFalse(res_conf["should_abstain"])
-        self.assertEqual(res_conf["set_size"], 1)
-
-    def test_hybrid_retriever(self):
-        df = pd.DataFrame([
-            {"customer_text": "Where is my package tracking?", "reply_text": "Check amazon.com/orders", "intent": "ORDER_TRACKING_AND_DELAY"},
-            {"customer_text": "Item arrived broken and shattered", "reply_text": "Please return at amazon.com/returns", "intent": "DAMAGED_OR_WRONG_ITEM"}
-        ])
-        retriever = HistoricalResolutionRetriever(top_k=1).build_index(df)
-        results = retriever.retrieve_similar("Where is my package?")
-        self.assertGreater(len(results), 0)
-        self.assertIn("rrf_score", results[0])
-
-    def test_policy_guardrail(self):
-        # Must neutralize unapproved promises and strip external links
-        unsafe_reply = "We have issued a full refund of $50! Visit http://malicious-site.com/claim"
-        sanitized = self.guard.verify_and_sanitize(unsafe_reply, customer_text="refund please", should_escalate=True)
-        self.assertNotIn("http://malicious-site.com", sanitized.sanitized_reply)
-        self.assertNotIn("issued a full refund", sanitized.sanitized_reply)
-
-    def test_multi_turn_session(self):
-        session = CustomerSessionState(thread_id="cust_123")
-        session.add_turn("Where is my item?", "ORDER_TRACKING_AND_DELAY", False, "ROUTINE_TRACKING_IN_TRANSIT", "Check amazon.com/orders")
-        
-        # Subsequent angry turn with friction words
-        friction = session.evaluate_multi_turn_friction("I already told you that, still no help for 4 days!")
-        self.assertTrue(friction["override_escalate"])
-        self.assertGreaterEqual(friction["friction_score"], 0.60)
-
-    def test_llm_judge_scoring(self):
-        score = self.judge.score_reply(
-            "Package is late",
-            "I'm sorry for the delay! Track anytime at amazon.com/orders.",
-            "ORDER_TRACKING_AND_DELAY",
-            False
+    def test_local_rewrite_rejects_verbatim_replay(self):
+        historical = "What does the current tracking status show?"
+        generator = ProductionGroundedGenerator(mode="local", local_model=FakeLocalModel(historical))
+        reply = generator.generate(
+            "Delivery issue", "ORDER_TRACKING_AND_DELAY",
+            [{"resolution_act": "ASK_TRACKING_STATUS", "reply_text": historical}],
+            {"should_escalate": False},
         )
-        self.assertGreaterEqual(score["overall_score"], 1.0)
+        self.assertNotEqual(reply, historical)
+        self.assertIn("original delivery date", reply)
+
+    def test_guardrail_blocks_pii_echo_and_unapproved_url(self):
+        guard = ProductionPolicyGuard()
+        result = guard.verify_and_sanitize(
+            "Email test@example.com at https://evil.example/a",
+            "My email is test@example.com",
+            True,
+        )
+        self.assertNotIn("test@example.com", result.sanitized_reply)
+        self.assertNotIn("evil.example", result.sanitized_reply)
+
+    def test_same_reply_agreement_statistics(self):
+        result = ReplyQualityJudge.compute_human_agreement([1, 2, 4, 5], [1, 3, 4, 5])
+        self.assertIn("spearman_rho", result)
+        self.assertIn("quadratic_weighted_kappa", result)
+        self.assertTrue(result["same_reply_required"])
+
+    def test_local_judge_requires_structured_model_output(self):
+        fake = FakeLocalModel('{"groundedness":4,"empathy":3,"actionability":4,"safety":5,"rationale":"ok"}')
+        score = ReplyQualityJudge(fake).score_reply("late", "check orders", "ORDER_TRACKING_AND_DELAY", False)
+        self.assertEqual(score["overall_score"], 4.0)
+        self.assertEqual(score["judge_backend"], "fake-local")
 
 
 if __name__ == "__main__":

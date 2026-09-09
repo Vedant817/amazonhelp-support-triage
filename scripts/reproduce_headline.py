@@ -1,344 +1,345 @@
-"""
-Reproduction Script: Benchmark Proposed Production Agent against Trivial and Simple Baselines.
-Evaluates on the 200 Hand-Labelled Golden Evaluation Set.
-Guarantees:
-- Strict zero-contamination test/train isolation (golden evaluation IDs completely excluded from training & retrieval corpus)
-- Calibrated Split Conformal Prediction with exact finite-sample quantile order statistics
-- Calibrated logit-space Bayesian priors and softmax
-- Hybrid Okapi BM25 + Dense TF-IDF with Reciprocal Rank Fusion (k=20) over positive candidates
-- Deterministic Pre-Dispatch Guardrails with 17-digit Order ID redaction & Twitter DM deep-linking
-- Serialized results in results/baseline_comparison.csv and results/headline_results.json
+"""Reproduce leak-free metrics for the dual-head support system.
+
+Offline is the default and never reports an LLM score. Pass --generation-mode local
+and --judge-local to run the pinned local Qwen model. Human agreement is calculated
+only from ratings keyed to the exact generated reply IDs.
 """
 
-import sys
-import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from __future__ import annotations
 
-import time
+import argparse
 import json
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List
+
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, List
 
-from src.classifier import (
-    MajorityBaselineClassifier,
-    TfidfBaselineClassifier,
-    ProductionIntentClassifier,
-    INTENT_TAXONOMY
-)
-from src.escalator import (
-    TrivialEscalationBaseline,
-    SimpleKeywordEscalationBaseline,
-    ProductionEscalator
-)
-from src.retriever import HistoricalResolutionRetriever
-from src.generator import (
-    TrivialReplyBaseline,
-    RetrievalReplyBaseline,
-    ProductionGroundedGenerator
-)
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from src.classifier import INTENT_TAXONOMY, MajorityBaselineClassifier, TfidfBaselineClassifier
+from src.escalator import SafetyGatedEscalator, SimpleKeywordEscalationBaseline, TrivialEscalationBaseline
 from src.evaluator import SupportPipelineEvaluator
-from src.llm_judge import ReplyQualityJudge
+from src.generator import ProductionGroundedGenerator, RetrievalReplayBaseline, TrivialReplyBaseline
 from src.guardrails import ProductionPolicyGuard
-from src.conformal import ConformalPredictor
+from src.llm_judge import ReplyQualityJudge
+from src.local_llm import LocalInstructionModel
+from src.model_factory import build_learned_pipeline
+from src.zero_shot import ZeroShotLocalBaseline
 
-def run_evaluation():
-    print("=" * 95)
-    print("          @AmazonHelp Production AI Agent: Headline Reproduction Benchmark (200 Golden Cases)")
-    print("=" * 95)
 
-    # 1. Load Golden Evaluation Set
-    golden_csv = "data/golden/golden_eval_set.csv"
-    if not os.path.exists(golden_csv):
-        print(f"Error: {golden_csv} not found!")
-        return
+PROPOSED = "Proposed: MiniLM dual-head + safety gates + retrieve/rewrite"
 
-    gold_df = pd.read_csv(golden_csv)
-    with open("data/golden/golden_eval_set.jsonl", "r", encoding="utf-8") as f:
-        gold_records = [json.loads(line) for line in f]
 
-    print(f"\n[1/6] Loaded {len(gold_df)} hand-curated Golden Evaluation examples.")
+def _pii_echo(customer: str, reply: str) -> bool:
+    patterns = [
+        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+        r"\b\d{3}-\d{7}-\d{7}\b",
+        r"\b\d{3}[-.\s]\d{3}[-.\s]\d{4}\b",
+    ]
+    return any(any(value in reply for value in re.findall(pattern, customer)) for pattern in patterns)
 
-    # 2. Load Processed Training Corpus and ENFORCE STRICT TEST/TRAIN ISOLATION
-    train_csv = "data/processed/amazonhelp_english_pairs.csv"
-    if not os.path.exists(train_csv):
-        print(f"Error: {train_csv} not found!")
-        return
 
-    print(f"\n[2/6] Loading historical corpus & isolating test set to eliminate leakage...")
-    train_df = pd.read_csv(train_csv)
-    
-    # Isolate golden evaluation IDs completely
-    gold_ids = set(gold_df["tweet_id"].astype(str))
-    clean_train_df = train_df[~train_df["inbound_id"].astype(str).isin(gold_ids)].reset_index(drop=True)
-    print(f"      Total corpus: {len(train_df)} | Isolated non-test corpus: {len(clean_train_df)}")
+def _new_system() -> Dict[str, Any]:
+    return {"intent_preds": [], "esc_preds": [], "esc_reasons": [], "replies": [], "acts": [], "exemplars": [], "seconds": 0.0, "invalid_outputs": 0}
 
-    train_sample = clean_train_df.sample(n=min(15000, len(clean_train_df)), random_state=42).reset_index(drop=True)
 
-    # 3. Fit Classifiers with Weak Supervision on Cleaned Data
-    print(f"\n[3/6] Fitting Classifiers and Vector Indices on {len(train_sample)} interactions...")
-    X_all = train_sample["customer_text"].tolist()
-    silver_labels = []
-    for text in X_all:
-        t_low = str(text).lower()
-        if any(w in t_low for w in ["damaged", "broken", "wrong item", "defective", "missing item", "empty box", "shattered", "cracked", "scratched", "missing part"]):
-            silver_labels.append("DAMAGED_OR_WRONG_ITEM")
-        elif any(w in t_low for w in ["login", "password", "otp", "2fa", "hacked", "prime membership", "locked out", "sign in", "cant access account", "verify account"]):
-            silver_labels.append("ACCOUNT_AND_SECURITY")
-        elif any(w in t_low for w in ["kindle", "fire tv", "firestick", "alexa", "echo", "prime video", "streaming", "bluetooth", "paperwhite", "app crash"]):
-            silver_labels.append("PRODUCT_AND_TECHNICAL")
-        elif any(w in t_low for w in ["refund", "return", "returned", "cancel order", "charged twice", "money back", "billing", "card charged", "double charge"]):
-            silver_labels.append("REFUND_AND_RETURN")
-        elif any(w in t_low for w in ["track", "delivery", "carrier", "transit", "where is my", "ups", "usps", "late", "package", "parcel", "arrived", "shipping", "shipped", "shipment", "not arrived", "deliver", "two day shipping"]):
-            silver_labels.append("ORDER_TRACKING_AND_DELAY")
-        else:
-            silver_labels.append("FEEDBACK_AND_GENERAL")
-    train_sample["intent"] = silver_labels
-
-    # Train / Calibration Split for Conformal Prediction
-    cal_size = 2000
-    X_train = X_all[:-cal_size]
-    y_train = silver_labels[:-cal_size]
-    X_cal = X_all[-cal_size:]
-    y_cal = silver_labels[-cal_size:]
-
-    # Initialize Classifiers
-    trivial_clf = MajorityBaselineClassifier().fit(X_all, silver_labels)
-    simple_clf = TfidfBaselineClassifier().fit(X_all, silver_labels)
-    prod_clf = ProductionIntentClassifier(confidence_threshold=0.32).fit(X_train, y_train)
-
-    # Calibrate Conformal Predictor on Calibration Split
-    print(f"\n[4/6] Calibrating Conformal Predictor on {len(X_cal)} holdout interactions (alpha=0.05)...")
-    cal_probs = []
-    for text in X_cal:
-        res = prod_clf.predict_with_confidence(text)
-        cal_probs.append(res["prob_vector"])
-    cal_probs = np.array(cal_probs)
-
-    conformal_predictor = ConformalPredictor(alpha=0.05).calibrate(
-        probs=cal_probs,
-        y_true=y_cal,
-        classes=prod_clf.classes_
+def _evaluate_system(
+    evaluator: SupportPipelineEvaluator,
+    gold: pd.DataFrame,
+    data: Dict[str, Any],
+    bootstrap_iterations: int,
+) -> Dict[str, Any]:
+    intents = evaluator.evaluate_intents(gold["gold_intent"].tolist(), data["intent_preds"], labels=INTENT_TAXONOMY)
+    escalation = evaluator.evaluate_escalation(
+        gold["gold_escalate"].astype(bool).tolist(),
+        data["esc_preds"],
+        gold["gold_escalate_reason"].tolist(),
+        data["esc_reasons"],
     )
+    return {
+        "intent_metrics": intents,
+        "escalation_metrics": escalation,
+        "bootstrap_95_ci": {
+            metric: evaluator.bootstrap_classification_intervals(
+                gold["gold_intent"].tolist() if metric == "macro_f1" else gold["gold_escalate"].astype(bool).tolist(),
+                data["intent_preds"] if metric == "macro_f1" else data["esc_preds"],
+                metric,
+                iterations=bootstrap_iterations,
+            )
+            for metric in ("macro_f1", "escalate_recall", "escalate_precision")
+        },
+        "reply_safety": {
+            "twitter_length_compliance": round(float(np.mean([len(reply) <= 280 for reply in data["replies"]])), 4),
+            "no_pii_echo_rate": round(float(np.mean([
+                not _pii_echo(customer, reply)
+                for customer, reply in zip(gold["customer_text"], data["replies"])
+            ])), 4),
+        },
+        "mean_latency_ms": round(data["seconds"] / len(gold) * 1000.0, 2),
+        "invalid_structured_outputs": int(data.get("invalid_outputs", 0)),
+    }
 
-    # Initialize Escalators
-    trivial_esc = TrivialEscalationBaseline()
-    simple_esc = SimpleKeywordEscalationBaseline()
-    prod_esc = ProductionEscalator(confidence_threshold=0.32)
 
-    # Initialize Retriever (Hybrid BM25 + Dense RRF on uncontaminated corpus)
-    retriever = HistoricalResolutionRetriever(top_k=3, rrf_k=20).build_index(train_sample)
+def _same_reply_agreement(judge_rows: pd.DataFrame, ratings_path: Path) -> Dict[str, Any]:
+    if not ratings_path.exists():
+        return {"status": "not_available", "reason": "same-reply human ratings file not found"}
+    ratings = pd.read_csv(ratings_path)
+    fields = ["groundedness", "empathy", "actionability", "safety"]
+    human_fields = [f"human_{field}" for field in fields]
+    required = {"reply_id", *human_fields}
+    if required - set(ratings.columns):
+        return {"status": "not_available", "reason": "ratings file is missing required columns"}
+    merged = judge_rows.merge(ratings[["reply_id", *human_fields]], on="reply_id", how="inner")
+    merged = merged.dropna(subset=human_fields)
+    if merged.empty:
+        return {"status": "not_available", "reason": "no completed ratings match judged reply IDs"}
+    human = merged[human_fields].mean(axis=1).tolist()
+    judged = merged[[f"judge_{field}" for field in fields]].mean(axis=1).tolist()
+    result = ReplyQualityJudge.compute_human_agreement(human, judged)
+    result["status"] = "measured"
+    return result
 
-    # Initialize Generators
-    trivial_gen = TrivialReplyBaseline()
-    simple_gen = RetrievalReplyBaseline()
-    prod_gen = ProductionGroundedGenerator()
+
+def run(args: argparse.Namespace) -> None:
+    os.chdir(ROOT)
+    gold = pd.read_csv("data/golden/golden_eval_set.csv")
+    artifacts = build_learned_pipeline(
+        "data/processed/amazonhelp_english_pairs.csv",
+        "data/golden/golden_eval_set.csv",
+        reviewed_csv=args.reviewed_labels,
+        intent_cap_per_class=args.intent_cap_per_class,
+        retrieval_size=args.retrieval_size,
+    )
+    model = artifacts.model
+    supervision = artifacts.supervision
+    intent_rows = supervision[supervision["intent_label"].notna()]
+
+    majority = MajorityBaselineClassifier().fit(
+        intent_rows["customer_text"].tolist(), intent_rows["intent_label"].tolist()
+    )
+    tfidf = TfidfBaselineClassifier().fit(
+        intent_rows["customer_text"].tolist(), intent_rows["intent_label"].tolist()
+    )
+    always_escalate = TrivialEscalationBaseline()
+    keyword_escalate = SimpleKeywordEscalationBaseline()
+    learned_escalator = SafetyGatedEscalator(model.escalation_threshold_)
+    trivial_reply = TrivialReplyBaseline()
+    retrieved_reply = RetrievalReplayBaseline()
+    local_runtime = LocalInstructionModel() if args.generation_mode == "local" or args.judge_local or args.include_zero_shot_local else None
+    generator = ProductionGroundedGenerator(mode=args.generation_mode, local_model=local_runtime)
+    zero_shot = ZeroShotLocalBaseline(local_runtime) if args.include_zero_shot_local else None
     guard = ProductionPolicyGuard()
-
-    # Evaluator & Judge
     evaluator = SupportPipelineEvaluator()
-    judge = ReplyQualityJudge()
-
-    # 5. Benchmark Inference
-    print(f"\n[5/6] Running inference across all 3 systems on 200 Golden test cases...")
-    test_texts = gold_df["customer_text"].tolist()
-    y_true_intent = gold_df["gold_intent"].tolist()
-    y_true_esc = gold_df["gold_escalate"].tolist()
-    y_true_reasons = gold_df["gold_escalate_reason"].tolist()
-    references = gold_df["reference_reply"].tolist()
 
     systems = {
-        "Baseline 1: Trivial (Majority+AlwaysEsc+Canned)": {
-            "intent_preds": [], "esc_preds": [], "esc_reasons": [], "replies": [], "time": 0
+        "Baseline 1: majority + always escalate + canned": _new_system(),
+        "Baseline 2: TF-IDF + keyword escalation + retrieve/replay": _new_system(),
+        PROPOSED: _new_system(),
+    }
+    if zero_shot is not None:
+        systems["Baseline 3: zero-shot local Qwen"] = _new_system()
+    confidences: List[float] = []
+    risk_scores: List[float] = []
+
+    for _, row in gold.iterrows():
+        text = row["customer_text"]
+
+        started = time.time()
+        intent = majority.predict([text])[0]
+        decision = always_escalate.evaluate(text)
+        systems["Baseline 1: majority + always escalate + canned"]["intent_preds"].append(intent)
+        systems["Baseline 1: majority + always escalate + canned"]["esc_preds"].append(decision.should_escalate)
+        systems["Baseline 1: majority + always escalate + canned"]["esc_reasons"].append(decision.stated_reason)
+        systems["Baseline 1: majority + always escalate + canned"]["replies"].append(trivial_reply.generate(text, intent, []))
+        systems["Baseline 1: majority + always escalate + canned"]["seconds"] += time.time() - started
+
+        started = time.time()
+        intent = tfidf.predict([text])[0]
+        decision = keyword_escalate.evaluate(text)
+        exemplars = artifacts.retriever.retrieve_similar(text, intent_filter=intent, top_k=1)
+        reply = retrieved_reply.generate(text, intent, exemplars)
+        systems["Baseline 2: TF-IDF + keyword escalation + retrieve/replay"]["intent_preds"].append(intent)
+        systems["Baseline 2: TF-IDF + keyword escalation + retrieve/replay"]["esc_preds"].append(decision.should_escalate)
+        systems["Baseline 2: TF-IDF + keyword escalation + retrieve/replay"]["esc_reasons"].append(decision.stated_reason)
+        systems["Baseline 2: TF-IDF + keyword escalation + retrieve/replay"]["replies"].append(reply)
+        systems["Baseline 2: TF-IDF + keyword escalation + retrieve/replay"]["seconds"] += time.time() - started
+
+        if zero_shot is not None:
+            started = time.time()
+            zero = zero_shot.predict(text)
+            reply = guard.verify_and_sanitize(zero["reply"], text, zero["should_escalate"]).sanitized_reply
+            target = systems["Baseline 3: zero-shot local Qwen"]
+            target["intent_preds"].append(zero["intent"])
+            target["esc_preds"].append(zero["should_escalate"])
+            target["esc_reasons"].append(zero["stated_reason"])
+            target["replies"].append(reply)
+            target["invalid_outputs"] += int(not zero["parse_valid"])
+            target["seconds"] += time.time() - started
+
+        started = time.time()
+        classification = model.predict_with_confidence(text)
+        learned = model.predict_escalation(text, classification["embedding"])
+        decision = learned_escalator.evaluate(
+            text,
+            classification["intent"],
+            learned["risk_score"],
+            classification["is_uncertain"],
+            learned["threshold"],
+        )
+        exemplars = artifacts.retriever.retrieve_similar(
+            text, intent_filter=classification["intent"], top_k=3
+        )
+        act = generator.select_act(exemplars, classification["intent"], decision.should_escalate)
+        raw = generator.generate(text, classification["intent"], exemplars, decision.to_dict())
+        reply = guard.verify_and_sanitize(raw, text, decision.should_escalate).sanitized_reply
+        target = systems[PROPOSED]
+        target["intent_preds"].append(classification["intent"])
+        target["esc_preds"].append(decision.should_escalate)
+        target["esc_reasons"].append(decision.stated_reason)
+        target["replies"].append(reply)
+        target["acts"].append(act)
+        target["exemplars"].append(exemplars)
+        target["seconds"] += time.time() - started
+        confidences.append(classification["confidence"])
+        risk_scores.append(learned["risk_score"])
+
+    full_results = {
+        "run_metadata": {
+            "gold_size": len(gold),
+            "gold_label_audit": "data/golden/LABEL_AUDIT.md",
+            "gold_ids_excluded_from_training_and_retrieval": True,
+            "supervision": "reply-side weak labels plus optional human-reviewed overrides",
+            "human_reviewed_label_count": int((supervision["intent_label_source"] == "human_reviewed").sum()),
+            "intent_train_size": artifacts.intent_train_size,
+            "intent_calibration_size": artifacts.intent_calibration_size,
+            "escalation_train_size": artifacts.escalation_train_size,
+            "escalation_calibration_size": artifacts.escalation_calibration_size,
+            "generation_mode": args.generation_mode,
+            "judge_mode": "local_model" if args.judge_local else "not_run",
+            "zero_shot_local_baseline": "run" if args.include_zero_shot_local else "not_run",
         },
-        "Baseline 2: Simple (TFIDF+KeywordEsc+Retrieved)": {
-            "intent_preds": [], "esc_preds": [], "esc_reasons": [], "replies": [], "time": 0
+        "systems": {
+            name: _evaluate_system(evaluator, gold, data, args.bootstrap_iterations)
+            for name, data in systems.items()
         },
-        "Proposed System: Production Support Agent": {
-            "intent_preds": [], "esc_preds": [], "esc_reasons": [], "replies": [], "time": 0
-        }
+        "temperature_scaling": {
+            "intent_temperature": round(model.intent_temperature.temperature_, 6),
+            "escalation_temperature": round(model.escalation_temperature.temperature_, 6),
+            "calibration_source": "reply-labeled holdout; no gold labels",
+        },
+        "abstention": {
+            "threshold": model.intent_confidence_threshold,
+            "coverage_accuracy_curve": evaluator.coverage_accuracy_curve(
+                gold["gold_intent"].tolist(), systems[PROPOSED]["intent_preds"], confidences
+            ),
+        },
+        "escalation_threshold": {
+            "threshold": round(model.escalation_threshold_, 6),
+            "selection_target_recall": model.target_escalation_recall,
+            "selection_source": "reply-labeled holdout; no gold labels",
+            "gold_cost_curve_diagnostic": evaluator.optimize_cost_threshold(
+                gold["gold_escalate"].astype(bool).tolist(), risk_scores, 1.0, 10.0
+            ),
+        },
     }
 
-    # System 1: Trivial
-    t0 = time.time()
-    for text in test_texts:
-        pred_i = trivial_clf.predict([text])[0]
-        esc_dec = trivial_esc.evaluate(text)
-        reply = trivial_gen.generate(text, pred_i, [])
-        systems["Baseline 1: Trivial (Majority+AlwaysEsc+Canned)"]["intent_preds"].append(pred_i)
-        systems["Baseline 1: Trivial (Majority+AlwaysEsc+Canned)"]["esc_preds"].append(esc_dec.should_escalate)
-        systems["Baseline 1: Trivial (Majority+AlwaysEsc+Canned)"]["esc_reasons"].append(esc_dec.stated_reason)
-        systems["Baseline 1: Trivial (Majority+AlwaysEsc+Canned)"]["replies"].append(reply)
-    systems["Baseline 1: Trivial (Majority+AlwaysEsc+Canned)"]["time"] = time.time() - t0
+    predictions = pd.DataFrame({
+        "reply_id": [f"{item_id}:proposed-v2" for item_id in gold["id"]],
+        "gold_id": gold["id"],
+        "customer_text": gold["customer_text"],
+        "gold_intent": gold["gold_intent"],
+        "predicted_intent": systems[PROPOSED]["intent_preds"],
+        "confidence": confidences,
+        "gold_escalate": gold["gold_escalate"],
+        "predicted_escalate": systems[PROPOSED]["esc_preds"],
+        "gold_reason": gold["gold_escalate_reason"],
+        "predicted_reason": systems[PROPOSED]["esc_reasons"],
+        "resolution_act": systems[PROPOSED]["acts"],
+        "draft_reply": systems[PROPOSED]["replies"],
+    })
 
-    # System 2: Simple
-    t0 = time.time()
-    for text in test_texts:
-        pred_i = simple_clf.predict([text])[0]
-        esc_dec = simple_esc.evaluate(text)
-        exemplars = retriever.retrieve_similar(text, intent_filter=pred_i, top_k=1)
-        reply = simple_gen.generate(text, pred_i, exemplars)
-        systems["Baseline 2: Simple (TFIDF+KeywordEsc+Retrieved)"]["intent_preds"].append(pred_i)
-        systems["Baseline 2: Simple (TFIDF+KeywordEsc+Retrieved)"]["esc_preds"].append(esc_dec.should_escalate)
-        systems["Baseline 2: Simple (TFIDF+KeywordEsc+Retrieved)"]["esc_reasons"].append(esc_dec.stated_reason)
-        systems["Baseline 2: Simple (TFIDF+KeywordEsc+Retrieved)"]["replies"].append(reply)
-    systems["Baseline 2: Simple (TFIDF+KeywordEsc+Retrieved)"]["time"] = time.time() - t0
-
-    # System 3: Production
-    prod_confidences = []
-    prod_risk_scores = []
-    conformal_hits = []
-    conformal_sizes = []
-    t0 = time.time()
-    for text, gold_int in zip(test_texts, y_true_intent):
-        res = prod_clf.predict_with_confidence(text)
-        pred_i = res["intent"]
-        conf = res["confidence"]
-        is_unc = res["is_uncertain"]
-        prob_vec = res["prob_vector"]
-        prod_confidences.append(conf)
-
-        # Conformal coverage check (pure conformal set, no top-1 injection)
-        c_res = conformal_predictor.predict_set(prob_vec)
-        conformal_hits.append(gold_int in c_res["prediction_set"])
-        conformal_sizes.append(c_res["set_size"])
-
-        # Multi-factor escalation
-        esc_dec = prod_esc.evaluate(text, intent=pred_i, confidence=conf, is_uncertain=is_unc)
-        prod_risk_scores.append(esc_dec.risk_score)
-
-        # Hybrid BM25 + TF-IDF RRF retrieval
-        exemplars = retriever.retrieve_similar(text, intent_filter=pred_i, top_k=3)
-        raw_reply = prod_gen.generate(text, pred_i, exemplars, esc_dec.to_dict())
-        guard_res = guard.verify_and_sanitize(raw_reply, customer_text=text, should_escalate=esc_dec.should_escalate)
-        final_reply = guard_res.sanitized_reply
-
-        systems["Proposed System: Production Support Agent"]["intent_preds"].append(pred_i)
-        systems["Proposed System: Production Support Agent"]["esc_preds"].append(esc_dec.should_escalate)
-        systems["Proposed System: Production Support Agent"]["esc_reasons"].append(esc_dec.stated_reason)
-        systems["Proposed System: Production Support Agent"]["replies"].append(final_reply)
-    systems["Proposed System: Production Support Agent"]["time"] = time.time() - t0
-
-    # 6. Evaluate and Compare Metrics
-    print(f"\n[6/6] Calculating automated metrics & LLM-as-judge scores...")
-    summary_rows = []
-    full_results = {}
-
-    for name, s_data in systems.items():
-        intent_metrics = evaluator.evaluate_intents(y_true_intent, s_data["intent_preds"])
-        esc_metrics = evaluator.evaluate_escalation(
-            y_true_esc, s_data["esc_preds"], y_true_reasons, s_data["esc_reasons"]
+    judge_rows = []
+    if args.judge_local:
+        judge = ReplyQualityJudge(local_model=local_runtime)
+        for index, row in predictions.head(args.judge_limit).iterrows():
+            exemplars = systems[PROPOSED]["exemplars"][index]
+            score = judge.score_reply(
+                row["customer_text"], row["draft_reply"], row["predicted_intent"],
+                bool(row["predicted_escalate"]), row["resolution_act"], exemplars,
+            )
+            judge_rows.append({"reply_id": row["reply_id"], **{f"judge_{key}": score[key] for key in ("groundedness", "empathy", "actionability", "safety")}, "rationale": score["rationale"]})
+        judge_frame = pd.DataFrame(judge_rows)
+        judge_frame.to_csv("results/local_judge_scores.csv", index=False)
+        full_results["local_llm_judge"] = {
+            "status": "measured",
+            "sample_size": len(judge_frame),
+            "mean_overall": round(float(judge_frame[[f"judge_{x}" for x in ("groundedness", "empathy", "actionability", "safety")]].mean(axis=1).mean()), 3),
+            "model": local_runtime.model_name,
+            "revision": local_runtime.revision,
+        }
+        full_results["human_judge_agreement"] = _same_reply_agreement(
+            judge_frame, Path(args.human_ratings)
         )
-        reply_metrics = evaluator.evaluate_replies(references, s_data["replies"])
+    else:
+        full_results["local_llm_judge"] = {"status": "not_run"}
+        full_results["human_judge_agreement"] = {
+            "status": "not_available", "reason": "local judge was not run"
+        }
 
-        judge_scores = []
-        for text, reply, intent, esc in zip(test_texts, s_data["replies"], s_data["intent_preds"], s_data["esc_preds"]):
-            scores = judge.score_reply(text, reply, intent, esc)
-            judge_scores.append(scores["overall_score"])
-        
-        avg_judge_score = round(float(np.mean(judge_scores)), 2)
+    rating_template = predictions.head(args.judge_limit)[
+        ["reply_id", "customer_text", "draft_reply", "resolution_act"]
+    ].copy()
+    for field in ("groundedness", "empathy", "actionability", "safety"):
+        rating_template[f"human_{field}"] = ""
+    rating_template["human_notes"] = ""
 
-        summary_rows.append({
+    failures = predictions[
+        (predictions["gold_intent"] != predictions["predicted_intent"])
+        | (predictions["gold_escalate"].astype(bool) != predictions["predicted_escalate"].astype(bool))
+    ].head(10)
+    Path("results").mkdir(exist_ok=True)
+    predictions.to_csv("results/golden_predictions.csv", index=False)
+    rating_template.to_csv("results/human_rating_template.csv", index=False)
+    failures.to_csv("results/failure_examples.csv", index=False)
+    with open("results/headline_results.json", "w", encoding="utf-8") as handle:
+        json.dump(full_results, handle, indent=2)
+
+    rows = []
+    for name, result in full_results["systems"].items():
+        rows.append({
             "System": name,
-            "Intent Acc": f"{intent_metrics['accuracy']*100:.1f}%",
-            "Intent Macro-F1": f"{intent_metrics['macro_f1']:.3f}",
-            "Escalation Acc": f"{esc_metrics['accuracy']*100:.1f}%",
-            "Escalation F1": f"{esc_metrics['escalate_f1']:.3f}",
-            "Reason Alignment": f"{esc_metrics['reason_alignment_rate']*100:.1f}%",
-            "ROUGE-L": f"{reply_metrics['rougeL_f1']:.3f}",
-            "BLEU-4": f"{reply_metrics['bleu4']:.3f}",
-            "Twitter Length %": f"{reply_metrics['twitter_length_compliance_rate']*100:.1f}%",
-            "LLM Judge (1-5)": f"{avg_judge_score:.2f}",
-            "Latency/Tweet": f"{s_data['time']/len(test_texts)*1000:.1f}ms"
+            "Intent Macro-F1": result["intent_metrics"]["macro_f1"],
+            "Escalate Recall": result["escalation_metrics"]["escalate_recall"],
+            "Escalate Precision": result["escalation_metrics"]["escalate_precision"],
+            "Reason Exact": result["escalation_metrics"]["reason_exact_match"],
+            "Length Pass": result["reply_safety"]["twitter_length_compliance"],
+            "No PII Echo": result["reply_safety"]["no_pii_echo_rate"],
         })
+    summary = pd.DataFrame(rows)
+    summary.to_csv("results/baseline_comparison.csv", index=False)
+    print(summary.to_string(index=False))
+    print("Wrote results/headline_results.json and row-level evidence.")
 
-        full_results[name] = {
-            "intent_metrics": intent_metrics,
-            "escalation_metrics": esc_metrics,
-            "reply_metrics": reply_metrics,
-            "avg_judge_score": avg_judge_score,
-            "total_latency_sec": round(s_data["time"], 3)
-        }
 
-    # Calibration & Cost-Utility Decision Theory Optimization
-    ece_prod = evaluator.compute_ece(
-        y_true=y_true_intent,
-        y_pred=systems["Proposed System: Production Support Agent"]["intent_preds"],
-        confidences=prod_confidences,
-        n_bins=10,
-        strategy="quantile"
-    )
-    cost_opt = evaluator.optimize_cost_threshold(
-        y_true_esc=y_true_esc,
-        risk_scores=prod_risk_scores,
-        cost_escalate=1.0,
-        cost_error_leak=10.0
-    )
-    full_results["calibration_metrics"] = ece_prod
-    full_results["decision_theory_cost_optimization"] = cost_opt
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--generation-mode", choices=["offline", "local"], default="offline")
+    parser.add_argument("--judge-local", action="store_true")
+    parser.add_argument("--include-zero-shot-local", action="store_true")
+    parser.add_argument("--judge-limit", type=int, default=50)
+    parser.add_argument("--human-ratings", default="data/evaluation/human_same_reply_ratings.csv")
+    parser.add_argument("--reviewed-labels", default="data/training/labels_for_human_review.csv")
+    parser.add_argument("--intent-cap-per-class", type=int, default=1200)
+    parser.add_argument("--retrieval-size", type=int, default=8000)
+    parser.add_argument("--bootstrap-iterations", type=int, default=2000)
+    return parser.parse_args()
 
-    # Conformal Coverage Metrics
-    conformal_coverage = float(np.mean(conformal_hits))
-    avg_set_size = float(np.mean(conformal_sizes))
-    conformal_metrics = {
-        "target_coverage": 0.95,
-        "empirical_coverage": round(conformal_coverage, 4),
-        "average_prediction_set_size": round(avg_set_size, 3),
-        "conformal_quantile_q_hat": round(conformal_predictor.q_hat, 4)
-    }
-    full_results["conformal_metrics"] = conformal_metrics
-
-    # Human-Judge Agreement Validation on Golden Set
-    human_overall = []
-    for r in gold_records:
-        h_score = (r["human_groundedness_score"] + r["human_empathy_score"] + r["human_actionability_score"] + r["human_safety_score"]) / 4.0
-        human_overall.append(h_score)
-
-    judge_scores_prod = [
-        judge.score_reply(t, rep, i, e)["overall_score"]
-        for t, rep, i, e in zip(
-            test_texts,
-            systems["Proposed System: Production Support Agent"]["replies"],
-            systems["Proposed System: Production Support Agent"]["intent_preds"],
-            systems["Proposed System: Production Support Agent"]["esc_preds"]
-        )
-    ]
-    agreement_metrics = judge.compute_human_agreement(human_overall, judge_scores_prod)
-    full_results["human_judge_agreement"] = agreement_metrics
-
-    # Save to disk
-    os.makedirs("results", exist_ok=True)
-    with open("results/headline_results.json", "w", encoding="utf-8") as f:
-        json.dump(full_results, f, indent=2)
-
-    summary_df = pd.DataFrame(summary_rows)
-    summary_df.to_csv("results/baseline_comparison.csv", index=False)
-
-    print("\n" + "=" * 115)
-    print("                      OFFICIAL HEADLINE BENCHMARK COMPARISON TABLE")
-    print("=" * 115)
-    print(summary_df.to_string(index=False))
-    print("=" * 115)
-
-    print(f"\n[Uncertainty Calibration & Decision Theory Optimization]")
-    print(f"  Expected Calibration Error (ECE):   {ece_prod['ece']:.4f} (Max Error: {ece_prod['mce']:.4f})")
-    print(f"  Optimal Escalation Risk Threshold:  T* = {cost_opt['optimal_threshold']} (Cost Ratio: 10:1)")
-    print(f"  Minimum Business Loss:              {cost_opt['minimum_loss']} units")
-
-    print(f"\n[Conformal Prediction Finite-Sample Guarantees (1 - alpha = 95%)]")
-    print(f"  Empirical Golden Set Coverage:      {conformal_metrics['empirical_coverage']*100:.1f}% (Target: 95.0%)")
-    print(f"  Average Prediction Set Size:        {conformal_metrics['average_prediction_set_size']:.2f} intents")
-    print(f"  Non-conformity Quantile (q_hat):    {conformal_metrics['conformal_quantile_q_hat']}")
-
-    print(f"\n[Human-Judge Agreement Validation]")
-    print(f"  Pearson Correlation (r):       {agreement_metrics.get('pearson_r', 0.0):.3f}")
-    print(f"  Cohen's Weighted Kappa:        {agreement_metrics.get('cohen_kappa_weighted', 0.0):.3f}")
-    print(f"  Mean Absolute Error (MAE):     {agreement_metrics.get('mae', 0.0):.3f}")
-    print(f"  Adjacent Agreement (±1 point): {agreement_metrics.get('adjacent_agreement_pct', 0.0):.1f}%")
-
-    print(f"\nBenchmark artifacts successfully saved to:")
-    print(f"  - results/baseline_comparison.csv")
-    print(f"  - results/headline_results.json")
 
 if __name__ == "__main__":
-    run_evaluation()
+    run(parse_args())

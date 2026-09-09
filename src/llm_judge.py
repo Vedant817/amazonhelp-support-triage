@@ -1,169 +1,100 @@
-"""
-LLM-as-a-Judge Rubric and Human Agreement Evaluation Suite for @AmazonHelp.
-Evaluates agent replies across 4 core dimensions:
-1. Groundedness & Accuracy (1-5)
-2. Brand Voice & Empathy (1-5)
-3. Actionability & Next Steps (1-5)
-4. Safety & Escalation Compliance (1-5)
+"""Local model judge and same-reply human agreement metrics.
 
-Includes automated statistical agreement calculator against human-labelled ratings:
-- Pearson Correlation (r)
-- Spearman Correlation (rho)
-- Cohen's Kappa (quadratic/linear weighted)
-- Adjacent Agreement (+-1 point %)
+There is intentionally no keyword-based fallback. If local model inference is not
+requested or cannot run, judge evidence is unavailable and must not be reported.
 """
 
-import math
+from __future__ import annotations
+
+import json
 import re
-from typing import Dict, List, Any, Tuple, Optional
+from typing import Any, Dict, Optional, Sequence
+
 import numpy as np
+from scipy.stats import spearmanr
+from sklearn.metrics import cohen_kappa_score
+
+from src.local_llm import LocalInstructionModel
+
+
+RUBRIC_FIELDS = ("groundedness", "empathy", "actionability", "safety")
+
 
 class ReplyQualityJudge:
-    """
-    Rubric-based Judge for Customer Support Replies.
-    Can operate in:
-    1. Deterministic Rule & Semantic Grounding Mode (offline, zero-cost, 100% reproducible)
-    2. LLM Prompt API Mode (when API keys are supplied)
-    """
-    def __init__(self, use_api: bool = False):
-        self.use_api = use_api
+    """G-Eval-style rubric scored by a revision-pinned local instruction model."""
+
+    def __init__(self, local_model: Optional[LocalInstructionModel] = None):
+        self.local_model = local_model or LocalInstructionModel()
 
     def score_reply(
         self,
         customer_tweet: str,
         generated_reply: str,
         intent: str,
-        should_escalate: bool
+        should_escalate: bool,
+        resolution_act: str = "UNKNOWN",
+        exemplars: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """
-        Scores a single customer-reply pair across the 4 rubric dimensions.
-        """
-        c_lower = customer_tweet.lower()
-        r_lower = generated_reply.lower()
+        evidence = "\n".join(
+            f"- {str(ex.get('reply_text', ''))[:220]}" for ex in list(exemplars or [])[:2]
+        ) or "- none"
+        rubric = f"""Score this support reply from 1 to 5 on each dimension.
+Customer: {customer_tweet}
+Predicted intent: {intent}
+Escalate: {should_escalate}
+Required act: {resolution_act}
+Historical reply evidence:
+{evidence}
+Candidate reply: {generated_reply}
 
-        # Dimension 1: Groundedness & Accuracy (1-5)
-        # 5: Accurate policy links / DM CTA for issue type
-        # 3: Generic help without explicit wrong statements
-        # 1: Fabricated facts or hallucinations
-        groundedness = 3
-        if "amazon.com" in r_lower or "amzn.to" in r_lower or "your orders" in r_lower:
-            groundedness += 1
-        if should_escalate and ("dm" in r_lower or "direct message" in r_lower):
-            groundedness += 1
-        elif not should_escalate and ("returns" in r_lower or "orders" in r_lower or "devicesupport" in r_lower):
-            groundedness += 1
-        groundedness = min(5, max(1, groundedness))
+Groundedness: supported by the customer, act, and evidence; no invented outcome or timing.
+Empathy: professional and proportionate, without performative promises.
+Actionability: gives a clear safe next step that performs the required act.
+Safety: no PII echo/request, only approved Amazon/DM URLs, escalation respected.
 
-        # Dimension 2: Brand Voice & Empathy (1-5)
-        # 5: Apologetic, friendly, professional tone matching Amazon customer service
-        # 3: Dry/mechanical
-        # 1: Hostile or robotic
-        empathy = 3
-        if any(w in r_lower for w in ["sorry", "apologize", "regret", "welcome", "glad to help", "frustrating"]):
-            empathy += 1
-        if any(w in r_lower for w in ["truly", "right away", "immediately", "make this right", "wonderful"]):
-            empathy += 1
-        if len(r_lower.split()) < 5:
-            empathy -= 1
-        empathy = min(5, max(1, empathy))
-
-        # Dimension 3: Actionability & Next Steps (1-5)
-        # 5: Clear actionable instructions (e.g. check orders, send order number in DM)
-        # 3: General suggestion
-        # 1: No next step
-        actionability = 3
-        if any(w in r_lower for w in ["send us a dm", "select", "visit", "reach out", "try restarting"]):
-            actionability += 1
-        if any(w in r_lower for w in ["order number", "prepaid return label", "software update", "17-digit"]):
-            actionability += 1
-        actionability = min(5, max(1, actionability))
-
-        # Dimension 4: Safety & Privacy Compliance (1-5)
-        # 5: Strictly protects PII, moves sensitive issues to DM
-        # 1: Asks for passwords or exposes data publicly
-        safety = 5
-        if any(w in r_lower for w in ["password", "credit card number", "cvv", "social security"]):
-            safety = 1
-        elif should_escalate and not ("dm" in r_lower or "private" in r_lower or "help" in r_lower):
-            safety = 3 # missed directing customer to private channel for high-risk issue
-
-        overall_score = round((groundedness + empathy + actionability + safety) / 4.0, 2)
-
-        return {
-            "groundedness": groundedness,
-            "empathy": empathy,
-            "actionability": actionability,
-            "safety": safety,
-            "overall_score": overall_score
-        }
-
-    def batch_score(
-        self,
-        samples: List[Dict[str, Any]],
-        reply_field: str = "draft_reply"
-    ) -> List[Dict[str, Any]]:
-        """Scores a batch of test samples."""
-        results = []
-        for s in samples:
-            cust = s.get("customer_text", "")
-            reply = s.get(reply_field, "")
-            intent = s.get("intent", s.get("gold_intent", "UNKNOWN"))
-            esc = s.get("escalation", {}).get("escalate", s.get("gold_escalate", False))
-            
-            scores = self.score_reply(cust, reply, intent, esc)
-            results.append(scores)
-        return results
+Return only JSON with integer keys groundedness, empathy, actionability, safety and a short rationale."""
+        raw = self.local_model.generate(
+            [
+                {"role": "system", "content": "You are a strict independent evaluator. Do not reward stock phrases."},
+                {"role": "user", "content": rubric},
+            ],
+            max_new_tokens=150,
+        )
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not match:
+            raise ValueError(f"Local judge did not return JSON: {raw[:160]}")
+        payload = json.loads(match.group(0))
+        scores = {}
+        for field in RUBRIC_FIELDS:
+            value = int(payload[field])
+            if value < 1 or value > 5:
+                raise ValueError(f"Judge score {field}={value} is outside 1..5")
+            scores[field] = value
+        scores["overall_score"] = round(float(np.mean(list(scores.values()))), 2)
+        scores["rationale"] = str(payload.get("rationale", ""))[:500]
+        scores["judge_backend"] = self.local_model.model_name
+        scores["judge_revision"] = self.local_model.revision
+        return scores
 
     @staticmethod
     def compute_human_agreement(
-        human_scores: List[float],
-        judge_scores: List[float]
+        human_scores: Sequence[float], judge_scores: Sequence[float]
     ) -> Dict[str, Any]:
-        """
-        Computes statistical agreement metrics between human ground truth and LLM judge:
-        - Pearson correlation (r)
-        - Spearman rank correlation (rho)
-        - Exact agreement percentage
-        - Adjacent agreement percentage (within +-1 point)
-        - Mean absolute error (MAE)
-        - Cohen's quadratic weighted Kappa
-        """
-        h = np.array(human_scores, dtype=float)
-        j = np.array(judge_scores, dtype=float)
-        n = len(h)
-
-        if n == 0:
-            return {}
-
-        # Pearson correlation
-        std_h, std_j = np.std(h), np.std(j)
-        if std_h > 0 and std_j > 0:
-            pearson_r = float(np.corrcoef(h, j)[0, 1])
-        else:
-            pearson_r = 1.0
-
-        # Mean Absolute Error
-        mae = float(np.mean(np.abs(h - j)))
-
-        # Exact and Adjacent agreement
-        exact_match = float(np.mean(np.round(h) == np.round(j)))
-        adjacent_match = float(np.mean(np.abs(np.round(h) - np.round(j)) <= 1))
-
-        # Quadratic Weighted Kappa approximation
-        diff_sq = np.sum((h - j) ** 2)
-        h_mean = np.mean(h)
-        j_mean = np.mean(j)
-        expected_diff_sq = np.sum((h - h_mean) ** 2) + np.sum((j - j_mean) ** 2)
-        if expected_diff_sq > 0:
-            kappa = 1.0 - (diff_sq / expected_diff_sq)
-        else:
-            kappa = 1.0
-
+        """Agreement for human and judge scores attached to the exact same reply IDs."""
+        h = np.asarray(human_scores, dtype=float)
+        j = np.asarray(judge_scores, dtype=float)
+        if len(h) == 0 or len(h) != len(j):
+            raise ValueError("Human and judge score arrays must be non-empty and aligned")
+        rho = float(spearmanr(h, j).statistic) if np.std(h) and np.std(j) else 0.0
+        h_rounded = np.clip(np.rint(h), 1, 5).astype(int)
+        j_rounded = np.clip(np.rint(j), 1, 5).astype(int)
+        kappa = float(cohen_kappa_score(h_rounded, j_rounded, weights="quadratic"))
         return {
-            "pearson_r": round(pearson_r, 4),
-            "cohen_kappa_weighted": round(float(kappa), 4),
-            "mae": round(mae, 4),
-            "exact_agreement_pct": round(exact_match * 100.0, 2),
-            "adjacent_agreement_pct": round(adjacent_match * 100.0, 2),
-            "sample_size": n
+            "spearman_rho": round(rho, 4),
+            "quadratic_weighted_kappa": round(kappa, 4),
+            "mae": round(float(np.mean(np.abs(h - j))), 4),
+            "exact_agreement_pct": round(float(np.mean(h_rounded == j_rounded) * 100.0), 2),
+            "adjacent_agreement_pct": round(float(np.mean(np.abs(h_rounded - j_rounded) <= 1) * 100.0), 2),
+            "sample_size": int(len(h)),
+            "same_reply_required": True,
         }

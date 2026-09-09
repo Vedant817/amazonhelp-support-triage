@@ -130,6 +130,31 @@ def select_recall_threshold(
     return max(valid, key=lambda item: (item[1], item[0]))[0]
 
 
+def select_precision_threshold(
+    labels: Sequence[bool],
+    probabilities: Sequence[float],
+    target_precision: float = 0.80,
+) -> float:
+    """Choose the lowest threshold meeting a precision floor, then maximize recall."""
+    labels_arr = np.asarray(labels, dtype=bool)
+    probs_arr = np.asarray(probabilities, dtype=float)
+    candidates = np.unique(np.concatenate((probs_arr, [1.0])))
+    valid = []
+    for threshold in candidates:
+        predicted = probs_arr >= threshold
+        tp = int(np.sum(predicted & labels_arr))
+        fp = int(np.sum(predicted & ~labels_arr))
+        if tp == 0:
+            continue
+        precision = tp / (tp + fp)
+        recall = tp / max(int(labels_arr.sum()), 1)
+        if precision >= target_precision:
+            valid.append((float(threshold), recall, precision))
+    if not valid:
+        return 1.0
+    return max(valid, key=lambda item: (item[1], -item[0]))[0]
+
+
 class DualHeadSupportModel:
     """Shared MiniLM embeddings with separate intent and escalation logistic heads."""
 
@@ -138,10 +163,12 @@ class DualHeadSupportModel:
         encoder: Optional[MiniLMEncoder] = None,
         intent_confidence_threshold: float = 0.45,
         target_escalation_recall: float = 0.85,
+        target_high_risk_precision: float = 0.80,
     ) -> None:
         self.encoder = encoder or MiniLMEncoder()
         self.intent_confidence_threshold = intent_confidence_threshold
         self.target_escalation_recall = target_escalation_recall
+        self.target_high_risk_precision = target_high_risk_precision
         self.intent_head = LogisticRegression(
             max_iter=2000,
             class_weight="balanced",
@@ -150,13 +177,13 @@ class DualHeadSupportModel:
         )
         self.escalation_head = LogisticRegression(
             max_iter=2000,
-            class_weight={False: 1.0, True: 3.0},
             random_state=42,
             C=1.0,
         )
         self.intent_temperature = TemperatureScaler()
         self.escalation_temperature = TemperatureScaler()
         self.escalation_threshold_ = 0.5
+        self.high_precision_escalation_threshold_ = 1.0
         self.classes_: List[str] = []
 
     def fit(
@@ -193,6 +220,11 @@ class DualHeadSupportModel:
             cal_escalation_probs,
             self.target_escalation_recall,
         )
+        self.high_precision_escalation_threshold_ = select_precision_threshold(
+            cal_escalation_labels,
+            cal_escalation_probs,
+            self.target_high_risk_precision,
+        )
         return self
 
     def predict_with_confidence(self, text: str) -> Dict[str, Any]:
@@ -205,6 +237,7 @@ class DualHeadSupportModel:
             "intent": self.classes_[best_idx],
             "confidence": confidence,
             "is_uncertain": confidence < self.intent_confidence_threshold,
+            "intent_resolution": "full_message",
             "all_probabilities": {label: float(probs[idx]) for idx, label in enumerate(self.classes_)},
             "prob_vector": probs,
             "logits": logits,

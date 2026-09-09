@@ -106,7 +106,7 @@ def infer_reply_escalation(reply_text: str) -> Optional[bool]:
     """Infer whether the historical agent transferred the case to a private/human channel."""
     text = str(reply_text or "").lower()
     if re.search(
-        r"\b(dm|direct message|private message|message us privately|phone or chat|contact us|give us a (call|ring)|specialist|security team)\b",
+        r"\b(dm|direct message|private message|message us privately|phone or chat|call or chat|call us|give us a (call|ring)|contact (our )?customer service( team)?|specialist|security team)\b",
         text,
     ):
         return True

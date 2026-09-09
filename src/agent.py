@@ -33,15 +33,18 @@ class AmazonSupportAgent:
         started = time.time()
         classification = self.model.predict_with_confidence(customer_tweet)
         learned = self.model.predict_escalation(customer_tweet, classification["embedding"])
+        exemplars = self.retriever.retrieve_similar(
+            customer_tweet, intent_filter=classification["intent"], top_k=3
+        )
+        evidence_act = self.generator.select_act(exemplars, classification["intent"], False)
         decision = self.escalator.evaluate(
             customer_tweet,
             classification["intent"],
             learned["risk_score"],
             is_uncertain=classification["is_uncertain"],
             learned_threshold=learned["threshold"],
-        )
-        exemplars = self.retriever.retrieve_similar(
-            customer_tweet, intent_filter=classification["intent"], top_k=3
+            high_precision_threshold=self.model.high_precision_escalation_threshold_,
+            resolution_act=evidence_act,
         )
         act = self.generator.select_act(exemplars, classification["intent"], decision.should_escalate)
         raw_reply = self.generator.generate(

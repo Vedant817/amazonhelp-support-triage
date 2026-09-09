@@ -185,15 +185,18 @@ def run(args: argparse.Namespace) -> None:
         started = time.time()
         classification = model.predict_with_confidence(text)
         learned = model.predict_escalation(text, classification["embedding"])
+        exemplars = artifacts.retriever.retrieve_similar(
+            text, intent_filter=classification["intent"], top_k=3
+        )
+        evidence_act = generator.select_act(exemplars, classification["intent"], False)
         decision = learned_escalator.evaluate(
             text,
             classification["intent"],
             learned["risk_score"],
             classification["is_uncertain"],
             learned["threshold"],
-        )
-        exemplars = artifacts.retriever.retrieve_similar(
-            text, intent_filter=classification["intent"], top_k=3
+            model.high_precision_escalation_threshold_,
+            evidence_act,
         )
         act = generator.select_act(exemplars, classification["intent"], decision.should_escalate)
         raw = generator.generate(text, classification["intent"], exemplars, decision.to_dict())
@@ -241,7 +244,9 @@ def run(args: argparse.Namespace) -> None:
         },
         "escalation_threshold": {
             "threshold": round(model.escalation_threshold_, 6),
+            "high_precision_threshold": round(model.high_precision_escalation_threshold_, 6),
             "selection_target_recall": model.target_escalation_recall,
+            "high_risk_selection_target_precision": model.target_high_risk_precision,
             "selection_source": "reply-labeled holdout; no gold labels",
             "gold_cost_curve_diagnostic": evaluator.optimize_cost_threshold(
                 gold["gold_escalate"].astype(bool).tolist(), risk_scores, 1.0, 10.0

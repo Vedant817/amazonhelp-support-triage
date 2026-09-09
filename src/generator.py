@@ -61,10 +61,6 @@ class ProductionGroundedGenerator:
     def select_act(self, exemplars: List[Dict[str, Any]], intent: str, should_escalate: bool) -> str:
         if should_escalate:
             return "DM_WITH_ORDER_ID"
-        acts = [ex.get("resolution_act") or infer_resolution_act(ex.get("reply_text", "")) for ex in exemplars]
-        acts = [act for act in acts if act != "GENERAL_SUPPORT"]
-        if acts:
-            return max(set(acts), key=acts.count)
         defaults = {
             "ORDER_TRACKING_AND_DELAY": "LINK_ORDERS",
             "REFUND_AND_RETURN": "LINK_RETURNS",
@@ -72,9 +68,29 @@ class ProductionGroundedGenerator:
             "PRODUCT_AND_TECHNICAL": "TROUBLESHOOT_DEVICE",
             "ACCOUNT_AND_SECURITY": "DM_WITH_ORDER_ID",
         }
+        allowed = {
+            "ORDER_TRACKING_AND_DELAY": {"ASK_TRACKING_STATUS", "ASK_CARRIER", "LINK_ORDERS", "APOLOGIZE_WAIT"},
+            "REFUND_AND_RETURN": {"LINK_RETURNS"},
+            "DAMAGED_OR_WRONG_ITEM": {"LINK_RETURNS"},
+            "PRODUCT_AND_TECHNICAL": {"TROUBLESHOOT_DEVICE"},
+            "ACCOUNT_AND_SECURITY": {"DM_WITH_ORDER_ID"},
+            "FEEDBACK_AND_GENERAL": {"GENERAL_SUPPORT"},
+        }
+        eligible = allowed.get(intent, {"GENERAL_SUPPORT"})
+        scores: Dict[str, float] = {}
+        first_rank: Dict[str, int] = {}
+        for rank, exemplar in enumerate(exemplars):
+            act = exemplar.get("resolution_act") or infer_resolution_act(exemplar.get("reply_text", ""))
+            if act not in eligible:
+                continue
+            score = float(exemplar.get("rrf_score", 0.0)) or (1.0 / (rank + 1))
+            scores[act] = scores.get(act, 0.0) + score
+            first_rank.setdefault(act, rank)
+        if scores:
+            return max(scores, key=lambda act: (scores[act], -first_rank[act], act))
         return defaults.get(intent, "GENERAL_SUPPORT")
 
-    def _offline_rewrite(self, customer_query: str, intent: str, act: str) -> str:
+    def _offline_rewrite(self, customer_query: str, intent: str, act: str, reason: str = "") -> str:
         templates = {
             "ASK_TRACKING_STATUS": "I'm sorry about the delay. What does the latest tracking status show, and what was the original delivery date? Please don't post order details publicly.",
             "ASK_CARRIER": "I'm sorry this delivery has been frustrating. Which carrier handled it, and what does the latest tracking update show? Please don't share order details publicly.",
@@ -85,6 +101,15 @@ class ProductionGroundedGenerator:
             "APOLOGIZE_WAIT": "I'm sorry for the wait. Please check the latest status under Your Orders at amazon.com/orders, and let us know if the promised delivery window has passed.",
             "GENERAL_SUPPORT": "Thanks for reaching out. Please tell us a little more about what happened, without posting account or order details publicly, so we can point you to the right next step.",
         }
+        escalation_templates = {
+            "ACCOUNT_SECURITY_OR_LOCKOUT": f"I'm sorry this happened. For account security, don't post any details here. Send us a private DM so a specialist can review it safely: {self.dm_link}",
+            "DELIVERY_DISPUTE_MARKED_DELIVERED_BUT_MISSING": f"I'm sorry the delivery can't be located. Please send the order details privately so the delivery can be investigated: {self.dm_link}",
+            "FINANCIAL_DISPUTE_OR_OVERDUE_REFUND": f"I'm sorry about the billing issue. Please send the order details privately so the charge or refund can be reviewed safely: {self.dm_link}",
+            "SEVERE_DAMAGE_OR_MISSING_CONTENTS": f"I'm sorry the order arrived in that condition. Please send the order details and photos privately so the issue can be reviewed: {self.dm_link}",
+            "HIGH_HOSTILITY_OR_LEGAL_RISK": f"I'm sorry this remains unresolved. Please send the relevant order details privately so a specialist can review the case: {self.dm_link}",
+        }
+        if act == "DM_WITH_ORDER_ID" and reason in escalation_templates:
+            return escalation_templates[reason]
         return templates[act]
 
     def _local_rewrite(
@@ -93,6 +118,7 @@ class ProductionGroundedGenerator:
         intent: str,
         act: str,
         exemplars: List[Dict[str, Any]],
+        reason: str = "",
     ) -> str:
         if self.local_model is None:
             self.local_model = LocalInstructionModel()
@@ -104,6 +130,7 @@ class ProductionGroundedGenerator:
 Customer: {customer_query}
 Intent: {intent}
 Required resolution act: {act}
+Escalation reason: {reason or 'none'}
 Historical voice examples (style only):
 {examples}
 
@@ -122,7 +149,7 @@ ask for private details only through DM. Output only the reply."""
         for exemplar in exemplars[:2]:
             historical = re.sub(r"\s+", " ", strip_agent_pii(exemplar.get("reply_text", "")).lower()).strip()
             if historical and SequenceMatcher(None, normalized, historical).ratio() >= 0.90:
-                return self._offline_rewrite(customer_query, intent, act)
+                return self._offline_rewrite(customer_query, intent, act, reason)
         return generated
 
     def generate(
@@ -137,8 +164,9 @@ ask for private details only through DM. Output only the reply."""
         Generates a grounded, empathetic, policy-compliant reply under 280 characters.
         """
         should_escalate = escalate_decision.get("should_escalate", False) if escalate_decision else False
+        reason = escalate_decision.get("stated_reason", "") if escalate_decision else ""
         act = self.select_act(exemplars, intent, should_escalate)
 
         if self.mode == "local":
-            return self._local_rewrite(customer_query, intent, act, exemplars)
-        return self._offline_rewrite(customer_query, intent, act)
+            return self._local_rewrite(customer_query, intent, act, exemplars, reason)
+        return self._offline_rewrite(customer_query, intent, act, reason)

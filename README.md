@@ -9,20 +9,20 @@
 Production-grade AI Support Agent built on 32,000+ real customer interactions from the Kaggle Twitter Customer Support corpus (`@AmazonHelp`).
 
 The system performs:
-1. **Multi-class Intent Classification** across 6 customer service domains (**88.0% Accuracy, 0.876 Macro-F1** on uncontaminated out-of-sample data).
-2. **Conformal Uncertainty Quantification** (Split Conformal Prediction with **90.5% empirical coverage** and sharp average set size of **1.04**).
+1. **Multi-class Intent Classification** across 6 customer service domains (**88.0% Accuracy, 0.875 Macro-F1** on uncontaminated out-of-sample data).
+2. **Conformal Uncertainty Quantification** (Split Conformal Prediction with **89.5% empirical coverage** and sharp average set size of **1.05**).
 3. **Conformal Risk Control (CRC)** (Angelopoulos et al., 2022) guaranteeing bounded human escalation False Negative Rate ($\mathbb{E}[L(\hat{\lambda})] \le \alpha$).
 4. **Energy-Based Out-of-Distribution (OOD) Detection** (Liu et al., NeurIPS 2020) identifying cross-domain spam and non-retail inquiries.
-5. **Deterministic Risk-Scored Escalation Triage** with explicit, auditable stated reasons (**77.5% Accuracy, 0.749 F1, 67.5% Reason Alignment**).
+5. **Deterministic Risk-Scored Escalation Triage** with explicit, auditable stated reasons.
 6. **Corrective Retrieval-Augmented Generation (CRAG)** (Yan et al., 2024) evaluating exemplar relevance and falling back to verified Amazon policy endpoints.
 7. **Production FastAPI REST Microservice** with Prometheus metrics (`/metrics`), health probe (`/api/v1/health`), conformal sets (`/api/v1/conformal`), and triage (`/api/v1/triage`).
 8. **Interactive Web Dashboard UI** for live operational testing, intent inspection, and telemetry tracking.
 
 ---
 
-## Quickstart: Run in < 2 Minutes
+## Quickstart: Single-File Universal Entrypoint (`main.py`)
 
-This entire system runs offline on standard CPU with zero external cloud or proprietary API dependencies.
+The entire project is operated through a **single entrypoint file**: [`main.py`](main.py).
 
 ### 1. Setup Environment
 ```bash
@@ -40,31 +40,32 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### 2. Launch Interactive Web Dashboard & REST Microservice
+### 2. Start the Entire Project (Default)
 ```bash
-python scripts/serve_dashboard.py --port 8000
+python main.py
 ```
-Open your browser to:
-* **Interactive UI Dashboard**: [http://127.0.0.1:8000/](http://127.0.0.1:8000/)
+This single command spins up the production FastAPI microservice and serves the live interactive web dashboard:
+* **Interactive Web Dashboard**: [http://127.0.0.1:8000/](http://127.0.0.1:8000/)
 * **OpenAPI Documentation**: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
 * **Prometheus Metrics**: [http://127.0.0.1:8000/metrics](http://127.0.0.1:8000/metrics)
-* **Readiness & Liveness Probe**: [http://127.0.0.1:8000/api/v1/health](http://127.0.0.1:8000/api/v1/health)
+* **Health & Readiness Probe**: [http://127.0.0.1:8000/api/v1/health](http://127.0.0.1:8000/api/v1/health)
 
-### 3. Run Headline Reproduction Benchmark
+### 3. Other Capabilities via `main.py`
 ```bash
-python scripts/reproduce_headline.py
-```
-*Evaluates Baseline 1 (Trivial), Baseline 2 (Simple TF-IDF), and the Production Agent on the 200 Golden Evaluation Set with strictly isolated train-test splits.*
+# Run the 200 Golden Evaluation benchmark comparison
+python main.py benchmark
 
-### 4. Run Behavioral & Adversarial Stress Suite (100% Pass)
-```bash
-python scripts/run_stress_test.py
-```
-*Executes CheckList adversarial probes (PII injection, prompt injections, heavy slang/typos, sarcasm, negated cancellation/returns).*
+# Run the 12-case CheckList behavioral and adversarial stress suite
+python main.py stress
 
-### 5. Run Complete Unit & Integration Test Suite (27/27 Passing)
-```bash
-python -m unittest discover tests
+# Run all 27 unit & integration tests
+python main.py test
+
+# Launch the interactive terminal CLI shell
+python main.py demo
+
+# Run all verification stages (tests -> stress -> benchmark) and then start the server
+python main.py all
 ```
 
 ---
@@ -75,12 +76,12 @@ Benchmarked with verified zero test-train leakage on the 200 hand-curated `@Amaz
 
 | System | Intent Acc | Intent Macro-F1 | Escalation Acc | Escalation F1 | Reason Alignment | ROUGE-L | BLEU-4 | Twitter Length % | LLM Judge (1-5) | Latency / Tweet |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\
-| **Baseline 1: Trivial** *(Majority + Always Escalate + Canned)* | 12.5% | 0.037 | 53.0% | 0.693* | 0.0% | 0.138 | 0.001 | 100.0% | 3.00 | **0.0 ms** |
-| **Baseline 2: Simple** *(TF-IDF + Keyword Escalate + Retrieved Replay)* | 72.0% | 0.701 | 54.0% | 0.425 | 0.0% | **0.784** | **0.736** | 100.0% | 3.49 | 42.1 ms |
-| **Proposed System: Production Agent** *(Calibrated + Multi-Risk + Guardrails)* | **88.0%** | **0.876** | **77.5%** | **0.749** | **67.5%** | 0.133 | 0.006 | **100.0%** | **4.10** | 53.4 ms |
+| **Baseline 1: Trivial** *(Majority + Always Escalate + Canned)* | 12.5% | 0.037 | 53.0% | 0.693* | 8.0% | 0.107 | 0.010 | 100.0% | 3.00 | **0.0 ms** |
+| **Baseline 2: Simple** *(TF-IDF + Keyword Escalate + Retrieved Replay)* | 66.0% | 0.641 | 54.0% | 0.425 | 4.5% | **0.154** | **0.038** | 100.0% | 3.49 | 86.9 ms |
+| **Proposed System: Production Agent** *(Calibrated + Multi-Risk + Guardrails)* | **88.0%** | **0.875** | **63.0%** | **0.486** | **47.5%** | 0.119 | 0.019 | **100.0%** | **4.09** | 97.8 ms |
 
 *\* Baseline 1 achieves 0.693 Escalation F1 purely because it escalates 100% of samples (0% auto-handle specificity).*  
-*Read [REPORT.md](REPORT.md) for why Baseline 2's high ROUGE/BLEU is dangerously misleading (verbatim customer-specific replay).*
+*Read [REPORT.md](REPORT.md) for why verbatim historical replay is dangerous in customer support without sanitization.*
 
 ---
 
@@ -191,6 +192,7 @@ amazonhelp_latency_ms_avg 51.34
 ## Repository Structure
 
 ```text
+├── main.py                        # SINGLE UNIVERSAL ENTRYPOINT
 ├── data/
 │   ├── raw/                       # Original Kaggle Customer Support dataset
 │   ├── processed/                 # Extracted @AmazonHelp customer-agent turn pairs

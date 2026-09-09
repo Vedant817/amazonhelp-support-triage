@@ -1,8 +1,8 @@
 """
 Intent Classification Engine for @AmazonHelp.
 Implements:
-1. Baseline Zero-Shot / Heuristic Rules
-2. Baseline Regularized Logistic Regression with TF-IDF
+1. MajorityBaselineClassifier / BaselineHeuristicClassifier
+2. TfidfBaselineClassifier / BaselineLogisticClassifier
 3. Proposed Production Multi-Task System with Sublinear TF-IDF,
    Logit-space Bayesian Priors (log-odds updates), Temperature Softmax,
    and Conformal Uncertainty Quantification.
@@ -40,6 +40,32 @@ def softmax(logits: np.ndarray, temperature: float = 1.0) -> np.ndarray:
     scaled = logits / max(temperature, 1e-6)
     exp_z = np.exp(scaled - np.max(scaled))
     return exp_z / np.sum(exp_z)
+
+class MajorityBaselineClassifier:
+    """Predicts majority class unconditionally."""
+    def __init__(self):
+        self.majority_class_ = "FEEDBACK_AND_GENERAL"
+
+    def fit(self, X: List[str], y: List[str]):
+        counts = {}
+        for label in y:
+            counts[label] = counts.get(label, 0) + 1
+        if counts:
+            self.majority_class_ = max(counts, key=counts.get)
+        return self
+
+    def predict(self, X: List[str]) -> List[str]:
+        return [self.majority_class_ for _ in X]
+
+    def predict_with_confidence(self, text: str) -> Dict[str, Any]:
+        return {
+            "intent": self.majority_class_,
+            "confidence": 1.0,
+            "is_uncertain": False,
+            "all_probabilities": {self.majority_class_: 1.0},
+            "prob_vector": np.array([1.0])
+        }
+
 
 class BaselineHeuristicClassifier:
     """Baseline 1: Rule-based keyword matching."""
@@ -91,6 +117,9 @@ class BaselineLogisticClassifier:
             "all_probabilities": {cls: float(probs[i]) for i, cls in enumerate(self.classes_)},
             "prob_vector": probs
         }
+
+# Alias for backwards compatibility
+TfidfBaselineClassifier = BaselineLogisticClassifier
 
 
 class ProductionIntentClassifier:

@@ -1,4 +1,4 @@
 System,Intent Acc,Intent Macro-F1,Escalation Acc,Escalation F1,Reason Alignment,ROUGE-L,BLEU-4,Twitter Length %,LLM Judge (1-5),Latency/Tweet
 Baseline 1: Trivial (Majority+AlwaysEsc+Canned),12.5%,0.037,53.0%,0.693,8.0%,0.107,0.010,100.0%,3.00,0.0ms
-Baseline 2: Simple (TFIDF+KeywordEsc+Retrieved),72.0%,0.712,54.0%,0.425,4.5%,0.150,0.037,100.0%,3.49,42.1ms
-Proposed System: Production Support Agent,88.0%,0.876,77.5%,0.749,67.5%,0.117,0.016,100.0%,4.10,53.4ms
+Baseline 2: Simple (TFIDF+KeywordEsc+Retrieved),66.0%,0.641,54.0%,0.425,4.5%,0.154,0.038,100.0%,3.49,86.9ms
+Proposed System: Production Support Agent,88.0%,0.875,63.0%,0.486,47.5%,0.119,0.019,100.0%,4.09,97.8ms

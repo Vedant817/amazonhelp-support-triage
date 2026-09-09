@@ -29,6 +29,17 @@ class EscalationDecision:
         }
 
 
+class TrivialEscalationBaseline:
+    """Always escalates unconditionally with default risk."""
+    def evaluate(self, text: str, **kwargs) -> EscalationDecision:
+        return EscalationDecision(
+            should_escalate=True,
+            stated_reason="UNCONDITIONAL_POLICY_ESCALATION",
+            risk_score=1.0,
+            triggers=["TRIVIAL_BASELINE_ALWAYS_ESCALATE"]
+        )
+
+
 class SimpleKeywordEscalationBaseline:
     """Simple escalation on basic critical terms."""
     def __init__(self):
@@ -74,17 +85,11 @@ class ProductionEscalator:
             (r"(marked|says?|states?|shows?)\s+(it\s+was\s+)?(as\s+)?delivered.*(never\s+(got|arrived|received)|not\s+(here|received|delivered)|didn\'?t\s+(get|receive)|missing|nowhere|nothing|stolen|no\s+package|haven\'?t\s+got|without\s+actual)", "DELIVERY_DISPUTE_MARKED_DELIVERED_BUT_MISSING"),
             (r"(item|package|order|delivery|tix)\s+(not\s+delivered|never\s+arrived|missing|hasn\'?t\s+arrived).*tracking\s+(shows?|says?|marked)", "DELIVERY_DISPUTE_MARKED_DELIVERED_BUT_MISSING"),
             (r"(never\s+arrived|never\s+came|didn\'?t\s+arrive)", "DELIVERY_DISPUTE_MARKED_DELIVERED_BUT_MISSING"),
-            (r"(says?|shows?|states?|package\s+was)\s+(it\s+was\s+)?delivered\s+but\b", "DELIVERY_DISPUTE_MARKED_DELIVERED_BUT_MISSING"),
-            (r"(says?|shows?)\s+delivered\s+when\s+they\'?re\s+not", "DELIVERY_DISPUTE_MARKED_DELIVERED_BUT_MISSING"),
-            (r"handed\s+to\s+(me|resident).*didn\'?t", "DELIVERY_DISPUTE_MARKED_DELIVERED_BUT_MISSING"),
-            (r"(package|order|parcel|item).*(stolen|porch pirate|pilfered|thief)", "THEFT_OR_STOLEN_PACKAGE_REPORT"),
-            (r"(lost\s+in\s+transit|lost\s+.*in\s+the\s+post)", "DELIVERY_DISPUTE_MARKED_DELIVERED_BUT_MISSING"),
-            (r"(\d+\s+days?\s+(later|late|past)|still\s+(nothing|waiting|haven\'?t\s+received|no\s+sign)|over\s+a\s+week\s+for\s+delivery)", "CARRIER_TRANSIT_FAILURE_OR_DELAY"),
-            (r"(now\s+takes\s+\d+\s+days|\d+\s+days\s+and\s+counting)", "CARRIER_TRANSIT_FAILURE_OR_DELAY"),
-            (r"(delivry\s+missin|handd\s+to\s+resident)", "DELIVERY_DISPUTE_MARKED_DELIVERED_BUT_MISSING"),
-            (r"(3rd|third|multiple)\s+pkg.*shipping", "CARRIER_TRANSIT_FAILURE_OR_DELAY"),
-            (r"(stop\s+using.*shipping|get\s+their\s+act\s+together)", "CARRIER_TRANSIT_FAILURE_OR_DELAY"),
-            (r"(not\s+possible\s+to\s+get\s+in\s+touch|carrier.*not\s+responding)", "CARRIER_TRANSIT_FAILURE_OR_DELAY"),
+            (r"(porch\s+pirat|stolen\s+from|package\s+(was\s+)?stolen|stolen\s+off)", "THEFT_OR_PORCH_PIRACY_ESCALATION"),
+            (r"(handed\s+to\s+resident|delivered\s+to\s+resident).*no\s+one\s+(was\s+)?home", "FALSE_DELIVERY_CONFIRMATION_DISPUTE"),
+            (r"(courier|carrier|dsp|driver)\s+(lied|fake|forged|didn\'?t\s+knock)", "FALSE_DELIVERY_CONFIRMATION_DISPUTE"),
+            (r"(wrong\s+address|delivered\s+to\s+wrong|neighbour|neighbor)", "MISDELIVERED_LOCATION_EXCEPTION"),
+            (r"(stuck\s+in\s+transit|no\s+update.*(days|week)|tracking\s+hasn\'?t\s+updated)", "EXTENDED_TRANSIT_STALL"),
             (r"(driver|courier)\s+(threw|damaged|stole|forged|lied|refused|rude)", "CARRIER_MISCONDUCT_OR_TRANSIT_FAILURE"),
             (r"(thrown\s+over|hurled\s+over|tossed\s+over|dumped\s+over)", "CARRIER_MISCONDUCT_OR_TRANSIT_FAILURE")
         ]
@@ -125,8 +130,7 @@ class ProductionEscalator:
             (r"(hacked|unauthorized access|someone.*logged into|account.*taken over|stolen account)", "ACCOUNT_SECURITY_OR_LOCKOUT"),
             (r"(otp|verification code|password reset).*(not working|loop|locked out|can\'?t\s+sign\s+in)", "ACCOUNT_SECURITY_OR_LOCKOUT"),
             (r"(locked\s+(me\s+)?out|account\s+locked|can\'?t\s+access\s+(my\s+)?(account|acct|prime))", "ACCOUNT_SECURITY_OR_LOCKOUT"),
-            (r"(couldn\'?t\s+access|cannot\s+access|can\'?t\s+sign\s+in|cannot\s+sign\s+in|cannot\s+log\s*in|can\'?t\s+log\s*in)", "ACCOUNT_SECURITY_OR_LOCKOUT"),
-            (r"(reset.*password.*multiple\s+times|still\s+cannot\s+log\s*in)", "ACCOUNT_SECURITY_OR_LOCKOUT"),
+            (r"(suspended\s+account|account\s+on\s+hold|closed\s+my\s+account)", "ACCOUNT_SECURITY_OR_LOCKOUT"),
             (r"(changed\s+my\s+account\s+email|unauthorized\s+email)", "ACCOUNT_SECURITY_OR_LOCKOUT"),
             (r"(scam|phishing|fake email|fraudulent order)", "ACCOUNT_SECURITY_OR_LOCKOUT")
         ]
@@ -186,7 +190,7 @@ class ProductionEscalator:
                 should_escalate=True,
                 stated_reason="PII_SENSITIVE_DATA_LEAK_IN_PUBLIC",
                 risk_score=0.95,
-                triggers=["CVV_EXPOSED"]
+                triggers=["CVV_SECURITY_CODE_EXPOSED"]
             )
 
         # 3. Legal / Regulatory / Ombudsman Threats (Severity 1)
@@ -246,11 +250,11 @@ class ProductionEscalator:
             return EscalationDecision(
                 should_escalate=True,
                 stated_reason="LOW_CLASSIFIER_CONFIDENCE_AMBIGUOUS_QUERY",
-                risk_score=0.65,
-                triggers=[f"CONFIDENCE_{confidence:.3f}"]
+                risk_score=0.75,
+                triggers=["CONFIDENCE_MARGIN_BREACH"]
             )
 
-        # 9. Default Self-Serve Resolutions
+        # 9. Low-Risk Routine Self-Serve Resolution
         if intent == "ORDER_TRACKING_AND_DELAY":
             return EscalationDecision(
                 should_escalate=False,
@@ -261,14 +265,14 @@ class ProductionEscalator:
         elif intent == "REFUND_AND_RETURN":
             return EscalationDecision(
                 should_escalate=False,
-                stated_reason="ROUTINE_RETURN_POLICY_OR_PORTAL",
+                stated_reason="ROUTINE_RETURNS_SELF_SERVE",
                 risk_score=0.20,
                 triggers=["SELF_SERVE_RETURN"]
             )
         elif intent == "PRODUCT_AND_TECHNICAL":
             return EscalationDecision(
                 should_escalate=False,
-                stated_reason="DEVICE_TROUBLESHOOTING_SELF_SERVE",
+                stated_reason="ROUTINE_DEVICE_TROUBLESHOOTING",
                 risk_score=0.25,
                 triggers=["SELF_SERVE_TECH"]
             )

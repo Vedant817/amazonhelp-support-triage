@@ -11,13 +11,29 @@ Implements:
 import re
 from typing import List, Dict, Any, Optional
 
+class TrivialReplyBaseline:
+    """Emits standard canned message."""
+    def generate(self, customer_query: str = "", intent: str = "", exemplars: Optional[List[Dict[str, Any]]] = None, **kwargs) -> str:
+        return "Thank you for contacting Amazon Support. We are reviewing your issue and will assist you shortly."
+
+
+class RetrievalReplayBaseline:
+    """Emits top retrieved historical exemplar reply directly."""
+    def generate(self, customer_query: str = "", intent: str = "", exemplars: Optional[List[Dict[str, Any]]] = None, **kwargs) -> str:
+        if exemplars and len(exemplars) > 0 and "reply_text" in exemplars[0]:
+            return exemplars[0]["reply_text"]
+        return "Please send us a direct message with your details so we can assist."
+
+# Alias
+RetrievalReplyBaseline = RetrievalReplayBaseline
+
+
 class BaselineRetrievalOnlyGenerator:
     """Baseline 1: Returns the top retrieved agent historical reply verbatim."""
     def generate(self, exemplars: List[Dict[str, Any]], customer_handle: str = "@customer") -> str:
         if not exemplars:
             return f"{customer_handle} Please reach out to Amazon Customer Support for assistance: amazon.com/help"
         top_reply = exemplars[0]["reply_text"]
-        # Basic cleanup of agent handle sign-offs (e.g., ^AB)
         cleaned = re.sub(r"\^[A-Z]{2,3}", "", top_reply).strip()
         return cleaned
 
@@ -83,65 +99,58 @@ class ProductionGroundedGenerator:
         """
         should_escalate = escalate_decision.get("should_escalate", False) if escalate_decision else False
         stated_reason = escalate_decision.get("stated_reason", "") if escalate_decision else ""
-        signals = self._extract_resolution_signals(exemplars)
 
         # -------------------------------------------------------------
-        # Branch 1: Human Escalation Pathways
+        # Branch 1: Human Escalation Pathways (Private & Risk-Handled)
         # -------------------------------------------------------------
         if should_escalate:
-            if "ACCOUNT_SECURITY" in stated_reason or "PII" in stated_reason:
+            # Case A: Public PII Leak -> Strict Warning & DM Deflection
+            if "PII" in stated_reason:
                 return (
-                    f"Your account security is our top priority. Please never share credentials in public. "
+                    "Your account security is our top priority. Please never share credentials in public. "
                     f"Send us a secure DM: {self.dm_link} with your registered email so our security team can assist."
                 )
 
-            elif "MARKETPLACE_3P" in stated_reason:
+            # Case B: Account Security, Takeover, Lockout
+            elif "ACCOUNT" in stated_reason or intent == "ACCOUNT_AND_SECURITY":
                 return (
-                    f"For third-party Marketplace items, sellers have 48 hours to reply under Amazon policy. "
-                    f"If they haven't resolved it, send us a DM: {self.dm_link} with your 17-digit order ID for A-to-z Guarantee protection."
+                    "We take account security very seriously. To protect your details and verify ownership safely, "
+                    f"please send us a DM: {self.dm_link} so our specialists can investigate immediately."
                 )
 
-            elif "THEFT" in stated_reason or "STOLEN" in stated_reason:
+            # Case C: Porch Piracy, Theft, or Delivered-but-Missing Disputes
+            elif "DELIVERY_DISPUTE" in stated_reason or "THEFT" in stated_reason or "FALSE_DELIVERY" in stated_reason:
                 return (
-                    f"I'm very sorry to hear your package was stolen. Please send us a direct message: {self.dm_link} "
-                    f"with your 17-digit order ID so our courier claims team can open an immediate investigation and reissue."
-                )
-
-            elif "DELIVERY_DISPUTE" in stated_reason:
-                return (
-                    f"I'm so sorry your order is missing after being marked delivered. We want to investigate immediately. "
+                    "I'm so sorry your order is missing after being marked delivered. We want to investigate immediately. "
                     f"Please DM us: {self.dm_link} with your 17-digit order number so we can help."
                 )
 
-            elif "CARRIER" in stated_reason:
-                carrier_note = f" with {signals['carrier_mentioned']}" if signals.get("carrier_mentioned") else ""
+            # Case D: 3rd-Party Marketplace Seller Disputes (A-to-Z Claim)
+            elif "MARKETPLACE" in stated_reason:
                 return (
-                    f"I apologize for the transit delay{carrier_note}! We want to check this for you directly. "
-                    f"Please send us a DM: {self.dm_link} with your order number and tracking code so we can help."
+                    "I understand you're having an issue with a third-party seller. If they haven't resolved this, "
+                    f"our A-to-z Guarantee may protect you. Please message us privately: {self.dm_link} with the order ID!"
                 )
 
-            elif "SEVERE_DAMAGE" in stated_reason or intent == "DAMAGED_OR_WRONG_ITEM":
+            # Case E: Severe Physical Damage, Smashed, Empty Box
+            elif "DAMAGE" in stated_reason or intent == "DAMAGED_OR_WRONG_ITEM":
                 return (
-                    f"I'm so sorry your item arrived damaged! We want to make this right immediately. "
-                    f"Please DM us: {self.dm_link} with your 17-digit order ID and a photo of the packaging so we can issue a replacement."
+                    "I'm truly sorry to hear your package arrived in this condition! Please send us a direct message: "
+                    f"{self.dm_link} with photos and your order details so we can arrange an immediate replacement."
                 )
 
-            elif "FINANCIAL_DISPUTE" in stated_reason:
+            # Case F: Double Charge / Refund Overdue
+            elif "FINANCIAL" in stated_reason:
                 return (
-                    f"We take unexpected charges and overdue refunds very seriously. Please send us a DM: {self.dm_link} "
-                    f"with the transaction date and associated email so a specialist can audit this for you immediately."
+                    "I sincerely apologize for the billing discrepancy! We want to check this charge directly for you. "
+                    f"Please send us a DM: {self.dm_link} with your order number and date of charge."
                 )
 
-            elif "LEGAL" in stated_reason or "CHURN" in stated_reason:
-                return (
-                    f"We take your experience very seriously and want to resolve this without delay. "
-                    f"Please send us a DM: {self.dm_link} with your order number so a Senior Specialist can review your case."
-                )
-
+            # Case G: Ambiguity / Model Uncertainty / Legal / Churn
             else:
                 return (
-                    f"I apologize for the frustration! We'd like to have a human specialist investigate this directly. "
-                    f"Please send us a DM: {self.dm_link} with your order details so we can help."
+                    "I apologize for the transit delay! We want to check this for you directly. "
+                    f"Please send us a DM: {self.dm_link} with your order number and tracking code so we can help."
                 )
 
         # -------------------------------------------------------------
@@ -149,8 +158,8 @@ class ProductionGroundedGenerator:
         # -------------------------------------------------------------
         if intent == "ORDER_TRACKING_AND_DELAY":
             return (
-                "I'm sorry for the delay with your delivery! You can check real-time courier updates and transit status "
-                "anytime under Your Orders: amazon.com/orders. If it hasn't arrived within 48 hours of the expected date, let us know!"
+                "I'm sorry for the delay with your delivery! You can check real-time courier updates and transit "
+                "status anytime under Your Orders: amazon.com/orders. If it hasn't arrived within 48 hours of the expected date, let us know!"
             )
 
         elif intent == "REFUND_AND_RETURN":
@@ -161,8 +170,8 @@ class ProductionGroundedGenerator:
 
         elif intent == "DAMAGED_OR_WRONG_ITEM":
             return (
-                "I'm very sorry your item arrived defective or incorrect! You can request an instant replacement or return "
-                "label under Your Orders at amazon.com/returns. Let us know if you need any additional help!"
+                "I'm very sorry your item arrived defective or incorrect! You can request an instant replacement "
+                "or return label under Your Orders at amazon.com/returns. Let us know if you need any additional help!"
             )
 
         elif intent == "PRODUCT_AND_TECHNICAL":
@@ -178,7 +187,7 @@ class ProductionGroundedGenerator:
             )
 
         else:
-            # FEEDBACK_AND_GENERAL
+            # Positive Feedback Handling
             pos_words = ["thank", "great", "awesome", "kudos", "love"]
             if any(w in customer_query.lower() for w in pos_words):
                 return (

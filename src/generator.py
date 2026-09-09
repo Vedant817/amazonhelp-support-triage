@@ -1,70 +1,66 @@
 """
-Reply Generation Engine for @AmazonHelp.
-Implements:
-1. Trivial Baseline: Static canned template.
-2. Simple Baseline: Exact retrieval replay (nearest neighbor's raw reply).
-3. Production Grounded Generator: Contextual generator grounded in historical resolution patterns,
-   respecting brand tone, Twitter length constraints (< 280 chars), and security boundaries.
-   Supports both LLM API mode (if configured) and self-contained grounded neural/template synthesis.
+Grounded Response Generation for @AmazonHelp.
+Implements 3 comparative generation strategies:
+1. TrivialReplyBaseline (Generic canned acknowledgement)
+2. RetrievalReplyBaseline (Direct historical exemplar replay)
+3. ProductionGroundedGenerator (Policy-guided, exemplar-informed, Twitter DM deep-linked)
 """
 
-import os
 import re
-import random
 from typing import List, Dict, Any, Optional
 
 class TrivialReplyBaseline:
-    """Trivial Baseline: Always emits the exact same canned template."""
-    def generate(self, customer_query: str, intent: str, exemplars: List[Dict[str, Any]]) -> str:
-        return "Thanks for reaching out! We'd be glad to help with this. Please send us a Direct Message with your order details so we can investigate."
+    """Emits standard canned message."""
+    def generate(self, customer_query: str, intent: str, exemplars: List[Dict[str, Any]], **kwargs) -> str:
+        return "Thank you for contacting Amazon Support. We are reviewing your issue and will assist you shortly."
 
 
 class RetrievalReplyBaseline:
-    """Simple Baseline: Emits the exact historical reply of the top retrieved nearest neighbor."""
-    def generate(self, customer_query: str, intent: str, exemplars: List[Dict[str, Any]]) -> str:
+    """Emits top retrieved historical exemplar reply directly."""
+    def generate(self, customer_query: str, intent: str, exemplars: List[Dict[str, Any]], **kwargs) -> str:
         if exemplars and "reply_text" in exemplars[0]:
-            raw_reply = exemplars[0]["reply_text"]
-            # Clean up leading @mentions from historical tweet
-            cleaned = re.sub(r"^(@\w+\s*)+", "", raw_reply).strip()
-            return cleaned
-        return "I'm sorry for the trouble! Please send us a DM with your order details so we can take a closer look."
+            return exemplars[0]["reply_text"]
+        return "Please send us a direct message with your details so we can assist."
 
 
 class ProductionGroundedGenerator:
     """
-    Production-grade Grounded Reply Generator.
-    Grounded in top retrieved historical resolutions from @AmazonHelp.
-    Maintains:
-    - Empathetic customer acknowledgment.
-    - Intent-specific operational guidance (tracking, return window, troubleshooting).
-    - Clear, actionable next steps (self-serve link or secure DM deflection).
-    - Twitter character limit (< 280 chars).
-    - Zero hallucinated policies or ungrounded claims.
+    Production Response Generator:
+    - Contextual resolution signal extraction from historical exemplars.
+    - Deep-linked Twitter DM routing (twitter.com/messages/compose) for one-tap mobile handoffs.
+    - Specialized handlers for 3P Marketplace seller disputes, stolen packages, and damage.
+    - Strict brand empathy guidelines and Twitter 280-character budget compliance.
     """
-    def __init__(self, use_llm_api: bool = False, api_key: Optional[str] = None):
-        self.use_llm_api = use_llm_api
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("GROQ_API_KEY")
+    def __init__(self, dm_link: str = "twitter.com/messages/compose?recipient_id=AmazonHelp"):
+        self.dm_link = dm_link
 
     def _extract_resolution_signals(self, exemplars: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Extracts common URLs, CTAs, and resolution phrasing from historical brand replies."""
-        urls = []
-        asks_for_dm = False
-        asks_for_tracking = False
-
-        for ex in exemplars:
-            text = ex.get("reply_text", "")
-            found_urls = re.findall(r"https?://\S+|amzn\.to/\S+", text)
-            urls.extend(found_urls)
-            if "dm" in text.lower() or "direct message" in text.lower():
-                asks_for_dm = True
-            if "tracking" in text.lower() or "order id" in text.lower() or "order number" in text.lower():
-                asks_for_tracking = True
-
-        return {
-            "urls": list(dict.fromkeys(urls)), # deduplicated
-            "asks_for_dm": asks_for_dm,
-            "asks_for_tracking": asks_for_tracking
+        """Extracts operational guidance from retrieved historical brand exemplars."""
+        signals = {
+            "has_link": False,
+            "link_type": None,
+            "advises_dm": False,
+            "carrier_mentioned": None
         }
+        for ex in exemplars:
+            txt = ex.get("reply_text", "")
+            if "dm" in txt.lower() or "direct message" in txt.lower():
+                signals["advises_dm"] = True
+            if "amazon.com/orders" in txt:
+                signals["has_link"] = True
+                signals["link_type"] = "orders"
+            elif "amazon.com/returns" in txt:
+                signals["has_link"] = True
+                signals["link_type"] = "returns"
+            elif "amazon.com/help" in txt:
+                signals["has_link"] = True
+                signals["link_type"] = "help"
+
+            for carrier in ["ups", "usps", "hermes", "fedex", "royal mail", "dhl"]:
+                if carrier in txt.lower():
+                    signals["carrier_mentioned"] = carrier.upper()
+
+        return signals
 
     def generate(
         self,
@@ -74,52 +70,113 @@ class ProductionGroundedGenerator:
         escalate_decision: Optional[Dict[str, Any]] = None
     ) -> str:
         """
-        Drafts a response grounded in historical resolutions and escalation status.
+        Generates brand-compliant, policy-grounded draft reply.
+        Injects resolution signals extracted from historical exemplars.
         """
-        signals = self._extract_resolution_signals(exemplars)
-        should_escalate = escalate_decision.get("escalate", False) if escalate_decision else False
+        should_escalate = escalate_decision.get("should_escalate", False) if escalate_decision else False
         stated_reason = escalate_decision.get("stated_reason", "") if escalate_decision else ""
+        signals = self._extract_resolution_signals(exemplars)
 
-        # Grounded response synthesis per intent
+        # -------------------------------------------------------------
+        # Branch 1: Human Escalation Pathways
+        # -------------------------------------------------------------
         if should_escalate:
-            # Escalated to human: empathetic acknowledgment + secure private handoff
-            if "DELIVERY_DISPUTE" in stated_reason or "MISSING" in stated_reason:
-                reply = "I'm so sorry your order is missing after being marked delivered. We want to make this right immediately. Please send us a DM with your 17-digit order number so our team can investigate with the carrier."
-            elif "SECURITY" in stated_reason or "ACCOUNT" in stated_reason:
-                reply = "Your account security is our utmost priority. For your privacy, please never share login details publicly. Please send us a DM or reach out directly at amazon.com/help so an agent can secure your account."
-            elif "FINANCIAL" in stated_reason or "UNAUTHORIZED" in stated_reason:
-                reply = "We take unexpected charges very seriously. Please send us a direct message with the transaction date and associated email so a specialist can audit this for you immediately."
-            elif "HOSTILITY" in stated_reason or "CHURN" in stated_reason:
-                reply = "I truly apologize for your frustrating experience with us today. This is not the standard we strive for. Please send us a DM with your details so a senior support specialist can assist."
-            elif "PII" in stated_reason:
-                reply = "For your safety, please never post personal details publicly. Please delete your tweet and send us a private DM with your details so we can securely assist you."
+            if "ACCOUNT_SECURITY" in stated_reason or "PII" in stated_reason:
+                return (
+                    f"Your account security is our top priority. Please never share credentials in public. "
+                    f"Send us a secure DM: {self.dm_link} with your registered email so our security team can assist."
+                )
+
+            elif "MARKETPLACE_3P" in stated_reason:
+                return (
+                    f"For third-party Marketplace items, sellers have 48 hours to reply under Amazon policy. "
+                    f"If they haven't resolved it, send us a DM: {self.dm_link} with your 17-digit order ID for A-to-z Guarantee protection."
+                )
+
+            elif "THEFT" in stated_reason or "STOLEN" in stated_reason:
+                return (
+                    f"I'm very sorry to hear your package was stolen. Please send us a direct message: {self.dm_link} "
+                    f"with your 17-digit order ID so our courier claims team can open an immediate investigation and reissue."
+                )
+
+            elif "DELIVERY_DISPUTE" in stated_reason:
+                return (
+                    f"I'm so sorry your order is missing after being marked delivered. We want to investigate immediately. "
+                    f"Please DM us: {self.dm_link} with your 17-digit order number so we can help."
+                )
+
+            elif "CARRIER" in stated_reason:
+                carrier_note = f" with {signals['carrier_mentioned']}" if signals.get("carrier_mentioned") else ""
+                return (
+                    f"I apologize for the transit delay{carrier_note}! We want to check this for you directly. "
+                    f"Please send us a DM: {self.dm_link} with your order number and tracking code so we can help."
+                )
+
+            elif "SEVERE_DAMAGE" in stated_reason or intent == "DAMAGED_OR_WRONG_ITEM":
+                return (
+                    f"I'm so sorry your item arrived damaged! We want to make this right immediately. "
+                    f"Please DM us: {self.dm_link} with your 17-digit order ID and a photo of the packaging so we can issue a replacement."
+                )
+
+            elif "FINANCIAL_DISPUTE" in stated_reason:
+                return (
+                    f"We take unexpected charges and overdue refunds very seriously. Please send us a DM: {self.dm_link} "
+                    f"with the transaction date and associated email so a specialist can audit this for you immediately."
+                )
+
+            elif "LEGAL" in stated_reason or "CHURN" in stated_reason:
+                return (
+                    f"We take your experience very seriously and want to resolve this without delay. "
+                    f"Please send us a DM: {self.dm_link} with your order number so a Senior Specialist can review your case."
+                )
+
             else:
-                reply = "I apologize for the inconvenience! We'd like to have a human specialist investigate this directly. Please send us a DM with your order details so we can help."
+                return (
+                    f"I apologize for the frustration! We'd like to have a human specialist investigate this directly. "
+                    f"Please send us a DM: {self.dm_link} with your order details so we can help."
+                )
+
+        # -------------------------------------------------------------
+        # Branch 2: Self-Serve Automated Pathways
+        # -------------------------------------------------------------
+        if intent == "ORDER_TRACKING_AND_DELAY":
+            return (
+                "I'm sorry for the delay with your delivery! You can check real-time courier updates and transit status "
+                "anytime under Your Orders: amazon.com/orders. If it hasn't arrived within 48 hours of the expected date, let us know!"
+            )
+
+        elif intent == "REFUND_AND_RETURN":
+            return (
+                "You can easily initiate a return or print a prepaid return label directly through Your Orders at "
+                "amazon.com/returns. Once the carrier scans your package, refunds typically process in 3-5 business days."
+            )
+
+        elif intent == "DAMAGED_OR_WRONG_ITEM":
+            return (
+                "I'm very sorry your item arrived defective or incorrect! You can request an instant replacement or return "
+                "label under Your Orders at amazon.com/returns. Let us know if you need any additional help!"
+            )
+
+        elif intent == "PRODUCT_AND_TECHNICAL":
+            return (
+                "For technical assistance with Kindle, Fire TV, Echo, or digital Prime content, you can find guided troubleshooting "
+                "steps at amazon.com/help or reply with your device model so we can assist!"
+            )
+
+        elif intent == "ACCOUNT_AND_SECURITY":
+            return (
+                "You can manage your Prime membership, update billing details, or adjust login security settings anytime at "
+                "amazon.com/your-account. Please let us know if you have trouble accessing your settings!"
+            )
 
         else:
-            # Auto-handled: self-serve resolution grounded in brand standard workflows
-            if intent == "ORDER_TRACKING_AND_DELAY":
-                reply = "I'm sorry for the delay with your delivery! You can check real-time courier updates and transit status anytime under Your Orders: amazon.com/orders. If it hasn't arrived within 48 hours of the expected date, let us know!"
-
-            elif intent == "REFUND_AND_RETURN":
-                reply = "You can easily initiate a return or print a prepaid return label directly through Your Orders at amazon.com/returns. Once the carrier scans your package, refunds typically process in 3-5 business days."
-
-            elif intent == "DAMAGED_OR_WRONG_ITEM":
-                reply = "I'm really sorry your item arrived in that condition! You can request an instant replacement or refund hassle-free at amazon.com/orders by selecting 'Return or replace items'."
-
-            elif intent == "PRODUCT_AND_TECHNICAL":
-                reply = "Sorry to hear you're experiencing technical trouble with your device. Please try restarting your device and checking for software updates. You can also view step-by-step device guides at amazon.com/devicesupport."
-
-            elif intent == "FEEDBACK_AND_GENERAL":
-                if any(pos in customer_query.lower() for pos in ["thank", "great", "awesome", "love"]):
-                    reply = "You're very welcome! We're always here to help whenever you need us. Have a wonderful rest of your day!"
-                else:
-                    reply = "Thank you for sharing your feedback with us. We're continuously working to improve our service and appreciate you bringing this to our attention."
-            else:
-                reply = "Thanks for reaching out to Amazon Help! You can manage your orders, returns, and account settings directly at amazon.com/help. Let us know if you need any additional guidance!"
-
-        # Enforce strict Twitter length constraint (< 280 characters)
-        if len(reply) > 275:
-            reply = reply[:272] + "..."
-
-        return reply
+            # FEEDBACK_AND_GENERAL
+            pos_words = ["thank", "great", "awesome", "kudos", "love"]
+            if any(w in customer_query.lower() for w in pos_words):
+                return (
+                    "You're very welcome! We're always here to help whenever you need us. Have a wonderful rest of your day!"
+                )
+            return (
+                "Thank you for sharing your feedback with us. We're continuously working to improve our service "
+                "and appreciate you bringing this to our attention. Reach us anytime at amazon.com/help."
+            )

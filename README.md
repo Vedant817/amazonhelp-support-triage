@@ -1,220 +1,128 @@
-# AI Customer Support Agent for @AmazonHelp
+# @AmazonHelp support-agent assignment
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT/)
-[![Test Suite: 27/27 Passing](https://img.shields.io/badge/tests-27%2F27%20passing-brightgreen.svg)]()
-[![Stress Suite: 100% Pass](https://img.shields.io/badge/stress%20suite-100%25%20pass-brightgreen.svg)]()
-[![Reproducibility: <2 mins](https://img.shields.io/badge/reproducibility-%3C2%20mins-green.svg)]()
+This repository implements a local, evidence-first support pipeline over historical
+`@AmazonHelp` conversations. It does not call a hosted model API.
 
-Production-grade real-time AI Support Agent built on 32,000+ customer interactions from the Kaggle Twitter Customer Support corpus (`@AmazonHelp`).
+The current system is:
 
-The system performs:
-1. **Multi-class Intent Classification** across 6 customer service domains (**88.0% Accuracy, 0.875 Macro-F1** on uncontaminated out-of-sample data).
-2. **Conformal Uncertainty Quantification** (Split Conformal Prediction with **89.5% empirical coverage** and sharp average set size of **1.05**).
-3. **Conformal Risk Control (CRC)** (Angelopoulos et al., 2022) guaranteeing bounded human escalation False Negative Rate ($\mathbb{E}[L(\hat{\lambda})] \le \alpha$).
-4. **Energy-Based Out-of-Distribution (OOD) Detection** (Liu et al., NeurIPS 2020) identifying cross-domain spam and non-retail inquiries.
-5. **Deterministic Risk-Scored Escalation Triage** with explicit, auditable stated reasons.
-6. **Corrective Retrieval-Augmented Generation (CRAG)** (Yan et al., 2024) evaluating exemplar relevance and falling back to verified Amazon policy endpoints.
-7. **Production FastAPI REST Microservice** with Prometheus metrics (`/metrics`), health probe (`/api/v1/health`), conformal sets (`/api/v1/conformal`), and triage (`/api/v1/triage`).
-8. **Interactive Web Dashboard UI** for live operational testing, intent inspection, and telemetry tracking.
+1. non-vetoable safety gates for public PII, account takeover, and legal threats;
+2. one revision-pinned MiniLM encoder with separate intent and escalation logistic heads;
+3. temperature scaling on reply-labeled holdouts;
+4. confidence abstention and a recall-targeted escalation threshold;
+5. BM25 + MiniLM retrieval fused with reciprocal-rank fusion;
+6. a resolution act extracted from historical replies;
+7. either local Qwen rewriting or deterministic act-conditioned offline rewriting;
+8. URL, PII, false-promise, and 280-character guardrails.
 
----
+## Verified status
 
-## Quickstart: Universal Production Entrypoint (`main.py`)
+`results/headline_results.json` is the only headline source. The saved artifact was
+produced with `python main.py benchmark --include-zero-shot-local`; the plain benchmark
+command omits that optional CPU-heavy baseline. On the audited 200-case gold set:
 
-The entire project runs through the single entrypoint [`main.py`](main.py).
+| System | Intent macro-F1 | Escalate recall | Escalate precision | Reason exact match |
+|---|---:|---:|---:|---:|
+| Majority + always escalate | 0.061 | 1.000 | 0.550 | 0.000 |
+| TF-IDF + keyword escalation + retrieve/replay | 0.673 | 0.309 | 0.630 | 0.000 |
+| Zero-shot local Qwen | 0.355 | 0.018 | 1.000 | 0.210 |
+| MiniLM dual-head + gates + retrieve/rewrite | **0.731** | **0.873** | 0.558 | **0.455** |
 
-### 1. Setup Environment
-```bash
-git clone https://github.com/your-username/hiver-assignment.git
-cd hiver-assignment
+The proposed system's bootstrap 95% intervals are:
 
-# Create and activate virtual environment
+- intent macro-F1: 0.665–0.790;
+- escalation recall: 0.806–0.932;
+- escalation precision: 0.485–0.634.
+
+These results are materially safer than the keyword baseline on escalation recall, but
+they do **not** meet the intended intent-quality or escalation-precision targets. There
+are currently zero independently human-reviewed training labels. The prepared 400-row
+review sheet is `data/training/labels_for_human_review.csv`; blank review fields are not
+treated as labels.
+
+The full zero-shot local baseline produced 14 invalid structured outputs and averaged
+4.95 seconds per case in this CPU-only environment. No LLM-judge score or judge–human agreement is claimed in the default run. Those fields
+are explicitly `not_run` / `not_available` unless the local judge runs and matching
+human scores exist for the same reply IDs.
+
+## Install and run
+
+```powershell
 python -m venv .venv
-# On Windows:
-.venv\Scripts\activate
-# On Linux/macOS:
-# source .venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe main.py test
+.\.venv\Scripts\python.exe main.py benchmark
+.\.venv\Scripts\python.exe main.py serve
 ```
 
-### 2. Start the Real-Time Production System (Default)
-```bash
-python main.py
-```
-This single command spins up the production FastAPI microservice and serves the live interactive web dashboard:
-* **Interactive Web Dashboard**: [http://127.0.0.1:8000/](http://127.0.0.1:8000/)
-* **OpenAPI Documentation**: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
-* **Prometheus Metrics**: [http://127.0.0.1:8000/metrics](http://127.0.0.1:8000/metrics)
-* **Health & Readiness Probe**: [http://127.0.0.1:8000/api/v1/health](http://127.0.0.1:8000/api/v1/health)
+The first learned run downloads the pinned
+`sentence-transformers/all-MiniLM-L6-v2` revision. Model files use the normal Hugging
+Face cache and are not committed.
 
-### 3. Verification & Evaluation via `main.py`
-```bash
-# Run all 27 unit & integration tests
-python main.py test
+The API defaults to deterministic offline generation so it can be reproduced without
+loading a generative model. To use the pinned local Qwen model:
 
-# Run the 12-case CheckList behavioral and adversarial stress suite
-python main.py stress
-
-# Run the 200 Golden Evaluation benchmark comparison
-python main.py benchmark
+```powershell
+$env:SUPPORT_GENERATION_MODE = "local"
+.\.venv\Scripts\python.exe main.py serve
 ```
 
----
+Run the local generator, zero-shot local baseline, and local judge explicitly:
 
-## Headline Benchmark Results (200 Golden Cases)
-
-Benchmarked with verified zero test-train leakage on the 200 hand-curated `@AmazonHelp` Golden Evaluation Set:
-
-| System | Intent Acc | Intent Macro-F1 | Escalation Acc | Escalation F1 | Reason Alignment | ROUGE-L | BLEU-4 | Twitter Length % | LLM Judge (1-5) | Latency / Tweet |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |\
-| **Baseline 1: Trivial** *(Majority + Always Escalate + Canned)* | 12.5% | 0.037 | 53.0% | 0.693* | 8.0% | 0.107 | 0.010 | 100.0% | 3.00 | **0.0 ms** |
-| **Baseline 2: Simple** *(TF-IDF + Keyword Escalate + Retrieved Replay)* | 66.0% | 0.641 | 54.0% | 0.425 | 4.5% | **0.154** | **0.038** | 100.0% | 3.49 | 86.9 ms |
-| **Proposed System: Production Agent** *(Calibrated + Multi-Risk + Guardrails)* | **88.0%** | **0.875** | **63.0%** | **0.486** | **47.5%** | 0.119 | 0.019 | **100.0%** | **4.09** | 97.8 ms |
-
-*\* Baseline 1 achieves 0.693 Escalation F1 purely because it escalates 100% of samples (0% auto-handle specificity).*  
-*Read [REPORT.md](REPORT.md) for why verbatim historical replay is dangerous in customer support without sanitization.*
-
----
-
-## Production System Architecture
-
-```mermaid
-flowchart TD
-    Inbound["Inbound Customer Tweet"] --> PII_Check{"PII Exposure?\\n(Email, Credit Card, CVV)"}
-    PII_Check -- Yes --> EscalatePII["Immediate Escalate: Deflect to Secure DM\\n(PII_SENSITIVE_DATA_LEAK_IN_PUBLIC)"]
-    
-    PII_Check -- No --> SinglePass["Single-Pass Feature Extraction & Classifier\\n(Sublinear TF-IDF + Calibrated Logistic Logits)"]
-    
-    SinglePass --> IntentLogits["Logits & Probabilities"]
-    IntentLogits --> ConformalSet["Split Conformal Prediction Set\\n(Finite-sample 95% Coverage Bound)"]
-    IntentLogits --> EnergyOOD["Energy-Based OOD Detector\\n(Free Energy E(x; T) = -T · logsumexp(z/T))"]
-    
-    SinglePass --> RiskHierarchy{"Multi-Factor Escalation Engine\\n- Carrier Delivery Disputes\\n- Porch Piracy & Theft\\n- 3P Marketplace Disputes\\n- Conformal Risk Control (CRC)"}
-    
-    EnergyOOD -- Breached Threshold --> EscalateOOD["Escalate: Low Confidence / OOD"]
-    ConformalSet -- Uncertain Set --> EscalateConf["Escalate: Ambiguous Query Set"]
-    RiskHierarchy -- High Risk --> EscalateHuman["Escalate to Human Tier-2\\n(Explicit Stated Reason)"]
-    RiskHierarchy -- Routine --> AutoHandle["Auto-Handled Self-Serve"]
-    
-    SinglePass --> HybridRetriever["Hybrid BM25 + Dense RRF Retriever\\n(Top-3 Historical Resolutions)"]
-    HybridRetriever --> CRAG["Corrective RAG (CRAG) Evaluator\\n- Content-Token Overlap (Stopword-Filtered)\\n- Verified Brand Policy KB Fallback"]
-    
-    EscalateHuman --> GroundedGen["Production Grounded Generator\\n- Twitter 280-char compliance\\n- Secure DM compose link\\n- Verified Amazon URLs"]
-    AutoHandle --> GroundedGen
-    CRAG --> GroundedGen
-    
-    GroundedGen --> Guardrails{"Pre-Dispatch Policy Guardrails\\n- Strict URL Whitelist\\n- Redact Order IDs\\n- Intercept False Promises"}
-    
-    Guardrails --> DispatchedReply["Dispatched Support Reply"]
+```powershell
+.\.venv\Scripts\python.exe main.py benchmark `
+  --generation-mode local `
+  --include-zero-shot-local `
+  --judge-local
 ```
 
----
+This is substantially slower on CPU. The local-model benchmark does not invent a human
+agreement score. First have reviewers complete the generated
+`results/human_rating_template.csv`, save matching ratings at
+`data/evaluation/human_same_reply_ratings.csv`, and rerun.
 
-## Enterprise REST API Specification
+## API
 
-### `POST /api/v1/triage`
-Executes complete triage, OOD check, conformal prediction, escalation risk analysis, and grounded response drafting.
-```bash
-curl -X POST "http://127.0.0.1:8000/api/v1/triage" \
-     -H "Content-Type: application/json" \
-     -d '{"text": "@AmazonHelp where is my package? The tracking says out for delivery today."}'
-```
-**Response JSON:**
-```json
-{
-  "intent": "ORDER_TRACKING_AND_DELAY",
-  "confidence": 0.8412,
-  "conformal_prediction": {
-    "prediction_set": ["ORDER_TRACKING_AND_DELAY"],
-    "set_size": 1,
-    "is_uncertain": false,
-    "confidence": 0.8412
-  },
-  "ood_detection": {
-    "is_ood": false,
-    "energy_score": -2.8512,
-    "energy_threshold": -0.8419,
-    "status": "IN_DISTRIBUTION"
-  },
-  "escalation": {
-    "should_escalate": false,
-    "stated_reason": "ROUTINE_TRACKING_IN_TRANSIT",
-    "risk_score": 0.15,
-    "triggers": ["SELF_SERVE_TRACKING"]
-  },
-  "crag_action": "CORRECT",
-  "draft_reply": "I'm sorry for the delay with your delivery! You can check real-time courier updates and transit status anytime under Your Orders: amazon.com/orders. If it hasn't arrived within 48 hours of the expected date, let us know!",
-  "guardrail_passed": true,
-  "character_count": 227,
-  "latency_ms": 48.21
-}
-```
+- `GET /api/v1/health` reports actual model temperatures, threshold, corpus size, and generation mode.
+- `POST /api/v1/confidence` returns calibrated intent probabilities and the abstention decision.
+- `POST /api/v1/triage` returns intent, learned escalation risk, exact reason code, resolution act, PII-stripped retrieval evidence, guarded draft, and latency.
+- `GET /metrics` exposes operational counters. These are observability, not quality evidence.
 
-### `POST /api/v1/conformal`
-Returns finite-sample valid prediction set for input query:
-```bash
-curl -X POST "http://127.0.0.1:8000/api/v1/conformal" \
-     -H "Content-Type: application/json" \
-     -d '{"text": "I need help with my kindle screen freezing"}'
-```
+## Label and leakage controls
 
-### `GET /metrics`
-Exposes real-time Prometheus metrics:
-```text
-# HELP amazonhelp_requests_total Total triage requests processed
-# TYPE amazonhelp_requests_total counter
-amazonhelp_requests_total 42
+- The gold tweet IDs are removed before supervision and retrieval are built.
+- Intent weak labels are inferred from AmazonHelp's reply, not from the customer's keywords.
+- Whether Amazon moved a conversation to DM/phone/chat supplies the escalation weak label.
+- Ambiguous historical replies remain unlabeled.
+- `scripts/audit_gold_labels.py` applies only four documented policy corrections; see
+  `data/golden/LABEL_AUDIT.md`.
+- Independent reviewers can override weak labels by filling the prepared 400-row sheet.
 
-# HELP amazonhelp_escalations_total Total cases escalated to human agents
-# TYPE amazonhelp_escalations_total counter
-amazonhelp_escalations_total 12
+## Evaluation contract
 
-# HELP amazonhelp_ood_total Total out-of-distribution queries detected
-# TYPE amazonhelp_ood_total counter
-amazonhelp_ood_total 3
+Headline metrics are macro-F1, escalation recall/precision, exact reason-code match,
+bootstrap intervals, and reply safety invariants. The benchmark also writes:
 
-# HELP amazonhelp_latency_ms_avg Average request processing latency in ms
-# TYPE amazonhelp_latency_ms_avg gauge
-amazonhelp_latency_ms_avg 51.34
-```
+- `results/golden_predictions.csv` — row-level evidence;
+- `results/failure_examples.csv` — the first ten actual gold errors;
+- `results/human_rating_template.csv` — same system replies for independent rating;
+- `results/baseline_comparison.csv` — concise comparison table.
 
----
+ROUGE/BLEU are not treated as reply-quality metrics. Conformal risk guarantees, energy
+OOD, CRAG, and a keyword-based “LLM judge” are not part of the scored production path.
 
-## Clean Production Repository Structure
+## Method scope
 
-```text
-├── main.py                        # PRODUCTION SINGLE ENTRYPOINT
-├── data/
-│   ├── raw/                       # Original Kaggle Customer Support dataset
-│   ├── processed/                 # Extracted @AmazonHelp customer-agent turn pairs
-│   └── golden/                    # 200 hand-curated Golden Evaluation Set (leak-free)
-├── src/
-│   ├── api.py                     # Production FastAPI REST microservice
-│   ├── schemas.py                 # Strict Pydantic v2 schemas
-│   ├── dashboard_html.py          # Interactive Tailwind CSS dashboard UI
-│   ├── ood_detector.py            # Energy-Based OOD Detector (Liu et al., 2020)
-│   ├── conformal.py               # Split Conformal Predictor with coverage guarantee
-│   ├── conformal_risk.py          # Conformal Risk Control (CRC) framework
-│   ├── crag_retriever.py          # Corrective RAG (CRAG) with policy KB fallback
-│   ├── classifier.py              # Regularized Sublinear TF-IDF + Bayesian log-odds
-│   ├── escalator.py               # Multi-factor Pre-compiled Escalator & CRC
-│   ├── retriever.py               # Okapi BM25 + Reciprocal Rank Fusion (RRF)
-│   ├── generator.py               # Policy-Grounded & DM-deflecting generator
-│   ├── guardrails.py              # Zero-PII leak & URL whitelist policy guard
-│   └── session.py                 # Multi-Turn Customer Session & Friction Tracker
-├── scripts/
-│   ├── reproduce_headline.py      # Golden benchmark reproduction runner
-│   └── run_stress_test.py         # 12-case CheckList adversarial stress suite
-├── tests/
-│   ├── test_api.py                # FastAPI integration tests (8 tests)
-│   ├── test_ood.py                # Energy OOD unit tests (3 tests)
-│   ├── test_crc.py                # Conformal Risk Control unit tests (2 tests)
-│   ├── test_crag.py               # Corrective RAG unit tests (3 tests)
-│   └── test_pipeline.py           # Core pipeline component tests (11 tests)
-├── results/                       # Persisted benchmark and stress test outputs
-├── REPORT.md                      # Comprehensive Engineering & ML Research Report
-└── requirements.txt               # Dependencies
-```
+MiniLM maps text into 384-dimensional vectors suitable for semantic similarity
+([model card](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)). This
+implementation currently trains heads over frozen embeddings; it is not claimed as
+SetFit fine-tuning. SetFit remains the planned method after independent labels exist
+([Tunstall et al., 2022](https://arxiv.org/abs/2209.11055)). Temperature scaling follows
+the single-parameter calibration method of
+[Guo et al. (2017)](https://proceedings.mlr.press/v70/guo17a.html).
+
+The retrieve-then-rewrite design is inspired by retrieval-augmented generation, but is
+described by what it actually does rather than claimed as the exact RAG training method
+([Lewis et al., 2020](https://papers.nips.cc/paper/2020/hash/6b493230205f780e1bc26945df7481e5-Abstract.html)).
+The local rubric judge is G-Eval-style, not a reproduction of GPT-4 G-Eval
+([Liu et al., 2023](https://aclanthology.org/2023.emnlp-main.153/)). Its score is not
+evidence until agreement is measured on the same replies.

@@ -5,10 +5,11 @@ This repository implements a local, evidence-first support pipeline over histori
 
 The current system is:
 
-1. non-vetoable safety gates for public PII, account takeover, and legal threats;
+1. non-vetoable policy gates for public PII, takeover, legal threats, delivery disputes,
+   severe damage, financial disputes, and prompt manipulation;
 2. one revision-pinned MiniLM encoder with separate intent and escalation logistic heads;
 3. temperature scaling on reply-labeled holdouts;
-4. confidence abstention and a recall-targeted escalation threshold;
+4. confidence abstention plus recall-targeted and high-precision escalation thresholds;
 5. BM25 + MiniLM retrieval fused with reciprocal-rank fusion;
 6. a resolution act extracted from historical replies;
 7. either local Qwen rewriting or deterministic act-conditioned offline rewriting;
@@ -17,21 +18,20 @@ The current system is:
 ## Verified status
 
 `results/headline_results.json` is the only headline source. The saved artifact was
-produced with `python main.py benchmark --include-zero-shot-local`; the plain benchmark
-command omits that optional CPU-heavy baseline. On the audited 200-case gold set:
+produced with `python main.py benchmark`; the optional CPU-heavy local baseline was not
+run in this artifact. On the audited 200-case gold set:
 
 | System | Intent macro-F1 | Escalate recall | Escalate precision | Reason exact match |
 |---|---:|---:|---:|---:|
 | Majority + always escalate | 0.061 | 1.000 | 0.550 | 0.000 |
 | TF-IDF + keyword escalation + retrieve/replay | 0.673 | 0.309 | 0.630 | 0.000 |
-| Zero-shot local Qwen | 0.355 | 0.018 | 1.000 | 0.210 |
-| MiniLM dual-head + gates + retrieve/rewrite | **0.731** | **0.873** | 0.558 | **0.455** |
+| MiniLM dual-head + gates + retrieve/rewrite | **0.731** | **0.873** | 0.555 | **0.445** |
 
 The proposed system's bootstrap 95% intervals are:
 
 - intent macro-F1: 0.665–0.790;
-- escalation recall: 0.806–0.932;
-- escalation precision: 0.485–0.634.
+- escalation recall: 0.805–0.929;
+- escalation precision: 0.480–0.629.
 
 These results are materially safer than the keyword baseline on escalation recall, but
 they do **not** meet the intended intent-quality or escalation-precision targets. There
@@ -39,8 +39,7 @@ are currently zero independently human-reviewed training labels. The prepared 40
 review sheet is `data/training/labels_for_human_review.csv`; blank review fields are not
 treated as labels.
 
-The full zero-shot local baseline produced 14 invalid structured outputs and averaged
-4.95 seconds per case in this CPU-only environment. No LLM-judge score or judge–human agreement is claimed in the default run. Those fields
+No LLM-judge score or judge–human agreement is claimed in the default run. Those fields
 are explicitly `not_run` / `not_available` unless the local judge runs and matching
 human scores exist for the same reply IDs.
 
@@ -62,9 +61,14 @@ The API defaults to deterministic offline generation so it can be reproduced wit
 loading a generative model. To use the pinned local Qwen model:
 
 ```powershell
-$env:SUPPORT_GENERATION_MODE = "local"
-.\.venv\Scripts\python.exe main.py serve
+.\.venv\Scripts\python.exe main.py serve --generation-mode local
 ```
+
+The dashboard reads its runtime model IDs, revisions, device, corpus size, generation
+backend, and calibration values from `/api/v1/health`. Each triage response includes
+the complete intent distribution and a measured six-stage execution trace covering
+classification, risk scoring, retrieval, routing policy fusion, generation, and
+pre-dispatch guardrails.
 
 Run the local generator, zero-shot local baseline, and local judge explicitly:
 
@@ -106,6 +110,7 @@ bootstrap intervals, and reply safety invariants. The benchmark also writes:
 - `results/failure_examples.csv` — the first ten actual gold errors;
 - `results/human_rating_template.csv` — same system replies for independent rating;
 - `results/baseline_comparison.csv` — concise comparison table.
+- `results/tough_scenario_results.csv` — row-level difficult-case routing evidence.
 
 ROUGE/BLEU are not treated as reply-quality metrics. Conformal risk guarantees, energy
 OOD, CRAG, and a keyword-based “LLM judge” are not part of the scored production path.

@@ -6,7 +6,7 @@ The rebuilt system fixes the largest safety failure but does not yet establish a
 intent model. On the audited 200-case gold set, escalation recall is 0.873 versus 0.309
 for the keyword baseline. Intent macro-F1 is 0.731 versus 0.673, well below the proposed
 0.90 target. These are the values written by
-`python main.py benchmark --include-zero-shot-local`; no other number is treated as
+`python main.py benchmark`; no other number is treated as
 current.
 
 The implementation is therefore a verified local prototype, not a production-ready
@@ -35,12 +35,15 @@ The local `sentence-transformers/all-MiniLM-L6-v2` encoder produces normalized
 - the binary escalation decision.
 
 Each head has a separately fitted scalar temperature on a reply-labeled holdout. The
-escalation threshold is the highest holdout threshold meeting 0.85 positive recall.
+primary escalation threshold is the highest holdout threshold meeting 0.85 positive
+recall; a second threshold identifies only high-precision learned transfers.
 Low intent confidence abstains into escalation. This is a coverage–accuracy tradeoff,
 not a conformal guarantee.
 
-Public PII, account-takeover phrases, and legal threats run through deterministic hard
-gates before the learned score and cannot be vetoed by it.
+Public PII, account takeover, legal threats, delivery disputes, severe damage, financial
+disputes, and prompt manipulation run through deterministic gates and cannot be vetoed.
+Only an explicit routine self-service request backed by an intent-compatible retrieved
+act may override a mid-range score; uncertainty and high-confidence risk still escalate.
 
 ### Retrieve then rewrite
 
@@ -50,7 +53,8 @@ It stores PII-stripped historical replies and one of eight resolution acts:
 `ASK_TRACKING_STATUS`, `ASK_CARRIER`, `DM_WITH_ORDER_ID`, `LINK_ORDERS`,
 `LINK_RETURNS`, `TROUBLESHOOT_DEVICE`, `APOLOGIZE_WAIT`, `GENERAL_SUPPORT`.
 
-The dominant retrieved act controls the next step. In `local` mode, the act and two
+An RRF-weighted, deterministic vote over intent-compatible acts controls the next step.
+In `local` mode, the act and two
 sanitized neighbors condition a pinned Qwen2.5-0.5B-Instruct prompt. In default `offline`
 mode, the same retrieved act selects a deterministic act-specific fallback. Both paths
 then pass through URL, PII, false-promise, and length guardrails.
@@ -65,26 +69,22 @@ plus quadratic weighted kappa.
 
 ## Saved benchmark result
 
-| Metric | Majority / always escalate | TF-IDF / keyword | Zero-shot local Qwen | Proposed |
-|---|---:|---:|---:|---:|
-| Intent accuracy | 0.225 | 0.685 | 0.475 | 0.740 |
-| Intent macro-F1 | 0.061 | 0.673 | 0.355 | 0.731 |
-| Escalation accuracy | 0.550 | 0.520 | 0.460 | 0.550 |
-| Escalate recall | 1.000 | 0.309 | 0.018 | 0.873 |
-| Escalate precision | 0.550 | 0.630 | 1.000 | 0.558 |
-| Exact reason match | 0.000 | 0.000 | 0.210 | 0.455 |
-| Replies ≤280 characters | 1.000 | 1.000 | 1.000 | 1.000 |
-| No direct PII echo | 1.000 | 1.000 | 1.000 | 1.000 |
-
-The zero-shot run produced 14 invalid structured outputs and averaged 4.95 seconds per
-case on CPU. Its precision of 1.0 reflects only two positive predictions and must not be
-read as a useful escalation system.
+| Metric | Majority / always escalate | TF-IDF / keyword | Proposed |
+|---|---:|---:|---:|
+| Intent accuracy | 0.225 | 0.685 | 0.740 |
+| Intent macro-F1 | 0.061 | 0.673 | 0.731 |
+| Escalation accuracy | 0.550 | 0.520 | 0.545 |
+| Escalate recall | 1.000 | 0.309 | 0.873 |
+| Escalate precision | 0.550 | 0.630 | 0.555 |
+| Exact reason match | 0.000 | 0.000 | 0.445 |
+| Replies ≤280 characters | 1.000 | 1.000 | 1.000 |
+| No direct PII echo | 1.000 | 1.000 | 1.000 |
 
 Proposed-model 95% paired bootstrap intervals (2,000 iterations):
 
 - intent macro-F1: 0.665–0.790;
-- escalation recall: 0.806–0.932;
-- escalation precision: 0.485–0.634.
+- escalation recall: 0.805–0.929;
+- escalation precision: 0.480–0.629.
 
 Per-class proposed intent results:
 
@@ -97,9 +97,10 @@ Per-class proposed intent results:
 | Product and technical | 0.733 | 0.880 | 0.800 |
 | Refund and return | 0.806 | 0.714 | 0.758 |
 
-Calibration was fitted on 763 reply-labeled intent examples and 1,042 reply-labeled
-escalation examples. The fitted temperatures are 0.887 for intent and 3.177 for
-escalation. The escalation threshold is 0.5357. Gold labels were not used to choose it.
+Calibration was fitted on 763 reply-labeled intent examples and 870 reply-labeled
+escalation examples. The fitted temperatures are 0.887 for intent and 0.889 for
+escalation. The recall and high-precision thresholds are 0.2439 and 0.7302. Gold labels
+were not used to choose them.
 
 ## What the result proves—and does not
 
@@ -137,7 +138,7 @@ the local judge.
 The saved headline artifact was produced without an API key:
 
 ```powershell
-.\.venv\Scripts\python.exe main.py benchmark --include-zero-shot-local
+.\.venv\Scripts\python.exe main.py benchmark
 ```
 
 The default offline generation path, local API lifecycle, label audit, safety checks,

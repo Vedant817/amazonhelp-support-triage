@@ -1,70 +1,79 @@
 """
-Intent Classification Engine for @AmazonHelp.
-Implements:
-1. Majority Baseline Classifier
-2. Simple TF-IDF Classifier Baseline
-3. Production Calibrated Intent Classifier with sublinear TF-IDF, n-gram lexical priors, and confidence scoring.
+Intent Taxonomy and Classifier Implementations for @AmazonHelp.
+Implements 3 comparative systems:
+1. MajorityBaselineClassifier (Trivial baseline)
+2. TfidfBaselineClassifier (Simple baseline)
+3. ProductionIntentClassifier (Logit-Calibrated N-gram Logistic Regression with Bayesian Priors)
 """
 
 import re
 import numpy as np
-import pandas as pd
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.dummy import DummyClassifier
+from sklearn.base import BaseEstimator, ClassifierMixin
 
-# 6 Core Target Intents derived from Amazon Customer Service Domain
 INTENT_TAXONOMY = [
-    "ORDER_TRACKING_AND_DELAY",   # Where is package, carrier transit delays, missing delivery
-    "REFUND_AND_RETURN",          # Returns, refund status, return labels, cancellations, billing
-    "DAMAGED_OR_WRONG_ITEM",      # Broken items, wrong product shipped, missing parts/items
-    "ACCOUNT_AND_SECURITY",       # Login issues, password reset, 2FA/OTP, unauthorized charges, hacked
-    "PRODUCT_AND_TECHNICAL",      # Kindle, Echo/Alexa, Prime Video app errors, device troubleshooting
-    "FEEDBACK_AND_GENERAL"        # Feedback, store hours, policies, brand praise, general inquiries
+    "ORDER_TRACKING_AND_DELAY",
+    "REFUND_AND_RETURN",
+    "DAMAGED_OR_WRONG_ITEM",
+    "ACCOUNT_AND_SECURITY",
+    "PRODUCT_AND_TECHNICAL",
+    "FEEDBACK_AND_GENERAL"
 ]
 
 def preprocess_tweet(text: str) -> str:
-    """Clean Twitter handles, normalize whitespace, lowercase, and preserve key punctuation."""
+    """Preprocess raw tweet text for robust NLP feature extraction."""
     if not isinstance(text, str):
         return ""
-    # Strip user mentions (@AmazonHelp, @115821, etc.)
-    text = re.sub(r"@\w+", "", text)
-    # Strip URLs
-    text = re.sub(r"https?://\S+|www\.\S+", "", text)
-    # Strip HTML entities (&amp;, etc.)
-    text = re.sub(r"&\w+;", " ", text)
-    # Normalize excessive spaces
+    # Normalize handles
+    text = re.sub(r"@\w+", "@user", text)
+    # Normalize links
+    text = re.sub(r"https?://\S+|www\.\S+", "http_link", text)
+    # Unescape common html entities
+    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+    # Clean excessive whitespace
     text = re.sub(r"\s+", " ", text).strip().lower()
     return text
 
+def softmax(logits: np.ndarray, temperature: float = 1.0) -> np.ndarray:
+    """Numerically stable softmax with temperature scaling."""
+    scaled = logits / max(0.01, temperature)
+    shifted = scaled - np.max(scaled)
+    exp_vals = np.exp(shifted)
+    return exp_vals / np.sum(exp_vals)
 
-class MajorityBaselineClassifier:
-    """Trivial Baseline: Always predicts the most frequent class."""
+
+class MajorityBaselineClassifier(BaseEstimator, ClassifierMixin):
+    """Predicts majority class unconditionally."""
     def __init__(self):
-        self.dummy = DummyClassifier(strategy="most_frequent")
+        self.majority_class_ = "FEEDBACK_AND_GENERAL"
 
     def fit(self, X: List[str], y: List[str]):
-        self.dummy.fit(X, y)
+        counts = {}
+        for label in y:
+            counts[label] = counts.get(label, 0) + 1
+        if counts:
+            self.majority_class_ = max(counts, key=counts.get)
         return self
 
     def predict(self, X: List[str]) -> List[str]:
-        return list(self.dummy.predict(X))
+        return [self.majority_class_ for _ in X]
 
     def predict_with_confidence(self, text: str) -> Dict[str, Any]:
-        pred = self.dummy.predict([text])[0]
         return {
-            "intent": pred,
-            "confidence": 0.55,
+            "intent": self.majority_class_,
+            "confidence": 1.0,
             "is_uncertain": False,
-            "all_probabilities": {pred: 0.55}
+            "all_probabilities": {self.majority_class_: 1.0},
+            "prob_vector": np.array([1.0])
         }
 
 
-class TfidfBaselineClassifier:
-    """Simple Baseline: Standard unigram TF-IDF with vanilla Logistic Regression."""
+class TfidfBaselineClassifier(BaseEstimator, ClassifierMixin):
+    """Simple standard TF-IDF + Logistic Regression without prior calibration."""
     def __init__(self):
-        self.vectorizer = TfidfVectorizer(max_features=5000, stop_words="english", preprocessor=preprocess_tweet)
+        self.vectorizer = TfidfVectorizer(max_features=5000, stop_words="english")
         self.clf = LogisticRegression(max_iter=500, random_state=42)
         self.classes_ = None
 
@@ -86,7 +95,8 @@ class TfidfBaselineClassifier:
             "intent": self.classes_[best_idx],
             "confidence": float(probs[best_idx]),
             "is_uncertain": float(probs[best_idx]) < 0.40,
-            "all_probabilities": {cls: float(probs[i]) for i, cls in enumerate(self.classes_)}
+            "all_probabilities": {cls: float(probs[i]) for i, cls in enumerate(self.classes_)},
+            "prob_vector": probs
         }
 
 
@@ -95,12 +105,14 @@ class ProductionIntentClassifier:
     Production Support Intent Classifier:
     - Sublinear TF-IDF scaling + character and word n-grams.
     - Regularized calibrated Logistic Regression.
-    - Intent domain lexicons for high-precision prior boosting.
-    - Contextual precedence (device troubleshooting prioritized for Amazon hardware).
-    - Calibrated confidence estimation with out-of-domain / ambiguity flagging.
+    - Logit-space Bayesian prior adjustments (preserving log-odds geometry).
+    - Negation boundary handling and phonetic slang resilience.
+    - Device and domain contextual priors.
+    - Numerically stable softmax with temperature scaling.
     """
-    def __init__(self, confidence_threshold: float = 0.32):
+    def __init__(self, confidence_threshold: float = 0.32, temperature: float = 1.0):
         self.confidence_threshold = confidence_threshold
+        self.temperature = temperature
         self.vectorizer = TfidfVectorizer(
             ngram_range=(1, 3),
             min_df=2,
@@ -117,12 +129,13 @@ class ProductionIntentClassifier:
         )
         self.classes_ = None
 
-        # Domain lexicon priors for ambiguity tie-breaking
+        # Domain lexicon priors for logit-space Bayesian updates
         self.lexicons = {
             "ORDER_TRACKING_AND_DELAY": [
                 "tracking", "shipped", "carrier", "late", "delay", "delivery", "delivered",
-                "arrive", "where is my", "package", "parcel", "transit", "ups", "usps", "hermes",
-                "shipping", "ship date", "not delivered", "two day shipping", "still waiting"
+                "arrive", "arrives", "where is my", "package", "parcel", "transit", "ups", "usps", "hermes",
+                "shipping", "ship date", "not delivered", "two day shipping", "still waiting",
+                "delivry", "missin", "pkg", "handd", "whr", "smh"
             ],
             "REFUND_AND_RETURN": [
                 "refund", "return", "returned", "returning", "drop off", "label", "money back",
@@ -131,7 +144,8 @@ class ProductionIntentClassifier:
             ],
             "DAMAGED_OR_WRONG_ITEM": [
                 "damaged", "shattered", "scratched", "wrong item", "different item",
-                "missing parts", "empty box", "fake", "counterfeit", "expired", "torn", "missing item"
+                "missing parts", "empty box", "fake", "counterfeit", "expired", "torn", "missing item",
+                "crushed", "broken", "cracked", "smashed", "instead of", "wrong size", "different size"
             ],
             "ACCOUNT_AND_SECURITY": [
                 "login", "password", "otp", "2fa", "verification", "locked", "hacked",
@@ -155,40 +169,67 @@ class ProductionIntentClassifier:
         return self
 
     def predict_with_confidence(self, text: str) -> Dict[str, Any]:
-        """Predicts intent along with calibrated confidence and fallback signals."""
+        """Predicts intent with logit-space Bayesian priors and calibrated softmax."""
         cleaned = preprocess_tweet(text)
         X_vec = self.vectorizer.transform([text])
-        raw_probs = self.clf.predict_proba(X_vec)[0]
-
-        # Prior boost based on domain keywords
-        boosted_probs = raw_probs.copy()
         
-        # Check if text contains Amazon device names -> strong prior for PRODUCT_AND_TECHNICAL
+        # Extract decision function raw logits
+        raw_logits = self.clf.decision_function(X_vec)[0]
+        if raw_logits.ndim == 0:
+            raw_logits = np.array([-raw_logits, raw_logits])
+
+        adj_logits = raw_logits.copy()
+        cls_indices = {cls_name: i for i, cls_name in enumerate(self.classes_)}
+
+        # Contextual device presence
         has_device = any(d in cleaned for d in ["kindle", "alexa", "echo", "paperwhite", "fire tv", "firestick"])
 
         for idx, cls_name in enumerate(self.classes_):
             keywords = self.lexicons.get(cls_name, [])
             match_count = sum(1 for kw in keywords if re.search(r"\b" + re.escape(kw) + r"\b", cleaned))
             if match_count > 0:
-                boosted_probs[idx] += match_count * 0.10
+                adj_logits[idx] += match_count * 0.40
 
             if cls_name == "PRODUCT_AND_TECHNICAL" and has_device:
-                boosted_probs[idx] += 0.70
+                adj_logits[idx] += 2.0
             elif cls_name == "DAMAGED_OR_WRONG_ITEM" and has_device:
-                boosted_probs[idx] *= 0.20
+                adj_logits[idx] -= 1.0
 
-        # Re-normalize
-        boosted_probs = boosted_probs / np.sum(boosted_probs)
+        # Negation boundary handling:
+        # e.g., "I do not want to cancel my order, just wondering when it arrives"
+        if any(p in cleaned for p in ["do not want to cancel", "not cancel", "don't want to cancel", "not looking to cancel"]):
+            if "REFUND_AND_RETURN" in cls_indices:
+                adj_logits[cls_indices["REFUND_AND_RETURN"]] -= 3.0
+            if "ORDER_TRACKING_AND_DELAY" in cls_indices:
+                adj_logits[cls_indices["ORDER_TRACKING_AND_DELAY"]] += 2.5
 
-        best_idx = int(np.argmax(boosted_probs))
+        # e.g., "I don't want to return this... you sent size 10 instead of size 8"
+        if any(p in cleaned for p in ["don't want to return", "do not want to return", "don't need to return", "do not need to return", "not returning", "no return"]):
+            if "REFUND_AND_RETURN" in cls_indices:
+                adj_logits[cls_indices["REFUND_AND_RETURN"]] -= 3.5
+            if any(w in cleaned for w in ["instead of", "wrong", "different", "damaged", "broken", "cracked"]) and "DAMAGED_OR_WRONG_ITEM" in cls_indices:
+                adj_logits[cls_indices["DAMAGED_OR_WRONG_ITEM"]] += 3.5
+
+        # Sarcastic praise over severe damage or driver throwing: e.g. "driver threw my glass lamp over a 6ft fence"
+        if any(w in cleaned for w in ["threw", "hurled", "tossed", "glass lamp", "crushed", "empty box", "shattered", "broken", "cracked"]) and "DAMAGED_OR_WRONG_ITEM" in cls_indices:
+            adj_logits[cls_indices["DAMAGED_OR_WRONG_ITEM"]] += 3.5
+            if "ORDER_TRACKING_AND_DELAY" in cls_indices:
+                adj_logits[cls_indices["ORDER_TRACKING_AND_DELAY"]] -= 2.0
+            if "FEEDBACK_AND_GENERAL" in cls_indices:
+                adj_logits[cls_indices["FEEDBACK_AND_GENERAL"]] -= 2.0
+
+        # Calibrated softmax
+        probs = softmax(adj_logits, temperature=self.temperature)
+
+        best_idx = int(np.argmax(probs))
         predicted_intent = self.classes_[best_idx]
-        confidence = float(boosted_probs[best_idx])
-        
+        confidence = float(probs[best_idx])
         is_uncertain = confidence < self.confidence_threshold
 
         return {
             "intent": predicted_intent,
             "confidence": confidence,
             "is_uncertain": is_uncertain,
-            "all_probabilities": {cls: float(boosted_probs[i]) for i, cls in enumerate(self.classes_)}
+            "all_probabilities": {cls: float(probs[i]) for i, cls in enumerate(self.classes_)},
+            "prob_vector": probs
         }

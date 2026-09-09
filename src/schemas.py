@@ -1,51 +1,66 @@
-"""
-Pydantic v2 Request & Response Schemas for @AmazonHelp Support API.
-"""
+"""Pydantic request and response schemas for the support pipeline."""
 
-from typing import List, Dict, Any, Optional, Literal
+from typing import Any, Dict, List, Optional
+
 from pydantic import BaseModel, Field
 
+
 class TriageRequest(BaseModel):
-    text: str = Field(..., min_length=1, max_length=1000, description="Incoming customer tweet or message")
-    session_id: Optional[str] = Field(None, description="Optional customer session/thread ID for multi-turn tracking")
+    text: str = Field(..., min_length=1, max_length=1000)
+    session_id: Optional[str] = None
 
-class ConformalRequest(BaseModel):
-    text: str = Field(..., min_length=1, max_length=1000, description="Customer text to generate conformal set for")
 
-class ConformalPredictionResponse(BaseModel):
-    prediction_set: List[str]
-    set_size: int
-    is_uncertain: bool
+class ConfidenceRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=1000)
+
+
+class ConfidenceResponse(BaseModel):
+    intent: str
     confidence: float
-    conformal_quantile: Optional[float] = None
+    threshold: float
+    should_abstain: bool
+    all_probabilities: Dict[str, float]
 
-class OODDetectionResponse(BaseModel):
-    is_ood: bool
-    energy_score: float
-    energy_threshold: Optional[float] = None
-    status: Literal["IN_DISTRIBUTION", "OUT_OF_DISTRIBUTION"]
 
 class EscalationResponse(BaseModel):
     should_escalate: bool
     stated_reason: str
     risk_score: float
+    threshold: float
     triggers: List[str]
+
+
+class RetrievalEvidence(BaseModel):
+    reply_id: str
+    resolution_act: str
+    customer_text: str
+    reply_text: str
+    rrf_score: float
+    dense_score: float
+    bm25_score: float
+
 
 class TriageResponse(BaseModel):
     intent: str
     confidence: float
-    conformal_prediction: ConformalPredictionResponse
-    ood_detection: OODDetectionResponse
+    should_abstain: bool
     escalation: EscalationResponse
-    crag_action: str
+    resolution_act: str
+    retrieval_evidence: List[RetrievalEvidence]
+    generation_mode: str
     draft_reply: str
     guardrail_passed: bool
+    guardrail_violations: List[str]
     character_count: int
     latency_ms: float
+
 
 class HealthResponse(BaseModel):
     status: str
     brand: str
     model_version: str
     corpus_size: int
-    conformal_coverage_guarantee: str
+    intent_temperature: float
+    escalation_temperature: float
+    escalation_threshold: float
+    generation_mode: str

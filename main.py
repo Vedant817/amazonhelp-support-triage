@@ -1,10 +1,10 @@
 """
-Universal Production Entrypoint for @AmazonHelp AI Customer Support System.
+Local entrypoint for the @AmazonHelp support-agent prototype.
 
 Running:
-    python main.py                     # Start the Real-Time Production Server & UI (default)
-    python main.py serve               # Start the Real-Time Production Server & UI
-    python main.py test                # Run complete unit & integration test suite (27 tests)
+    python main.py                     # Start the local server & UI (default)
+    python main.py serve               # Start the local server & UI
+    python main.py test                # Run complete unit & integration test suite
     python main.py benchmark           # Run the 200 Golden Evaluation benchmark
     python main.py stress              # Run the 12-case CheckList adversarial stress suite
 """
@@ -22,10 +22,10 @@ if REPO_ROOT not in sys.path:
 
 
 def run_serve(host: str = "127.0.0.1", port: int = 8000, reload: bool = False):
-    """Start the production FastAPI REST API and live web dashboard."""
+    """Start the local FastAPI REST API and web dashboard."""
     import uvicorn
     print("\n" + "=" * 80)
-    print("      @AmazonHelp AI Support Agent - Production Server")
+    print("      @AmazonHelp AI Support Agent - Local Prototype")
     print("=" * 80)
     print(f"  • Interactive Web Dashboard: http://{host}:{port}/")
     print(f"  • OpenAPI Specification:     http://{host}:{port}/docs")
@@ -61,13 +61,18 @@ def run_stress():
         sys.exit(ret)
 
 
-def run_benchmark():
+def run_benchmark(generation_mode: str = "offline", judge_local: bool = False, include_zero_shot_local: bool = False):
     """Run the uncontaminated 200 Golden Evaluation Set benchmark."""
     print("\n" + "=" * 80)
     print("      Running 200 Golden Set Benchmark Reproduction")
     print("=" * 80 + "\n")
     script = os.path.join(REPO_ROOT, "scripts", "reproduce_headline.py")
-    ret = subprocess.call([sys.executable, script])
+    command = [sys.executable, script, "--generation-mode", generation_mode]
+    if judge_local:
+        command.append("--judge-local")
+    if include_zero_shot_local:
+        command.append("--include-zero-shot-local")
+    ret = subprocess.call(command)
     if ret != 0:
         print("\n[ERROR] Benchmark failed!")
         sys.exit(ret)
@@ -75,7 +80,7 @@ def run_benchmark():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="@AmazonHelp AI Support Agent - Production Entrypoint",
+        description="@AmazonHelp AI Support Agent - Local Prototype Entrypoint",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Commands:
@@ -87,7 +92,7 @@ Commands:
 Examples:
   python main.py                       # Starts production server on http://127.0.0.1:8000
   python main.py serve --port 8080     # Starts server on custom port
-  python main.py test                  # Runs 27 tests
+  python main.py test                  # Runs the discovered unit/integration tests
   python main.py benchmark             # Runs golden evaluation benchmark
 """
     )
@@ -102,6 +107,9 @@ Examples:
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind for server (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8000, help="Port to bind for server (default: 8000)")
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload for development")
+    parser.add_argument("--generation-mode", choices=["offline", "local"], default="offline")
+    parser.add_argument("--judge-local", action="store_true", help="Run the pinned local-model reply judge")
+    parser.add_argument("--include-zero-shot-local", action="store_true", help="Add the local Qwen zero-shot baseline")
 
     args = parser.parse_args()
 
@@ -112,7 +120,7 @@ Examples:
     elif args.command == "stress":
         run_stress()
     elif args.command == "benchmark":
-        run_benchmark()
+        run_benchmark(args.generation_mode, args.judge_local, args.include_zero_shot_local)
 
 
 if __name__ == "__main__":

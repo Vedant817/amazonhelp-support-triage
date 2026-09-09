@@ -27,18 +27,18 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                     <div>
                         <h1 class="text-2xl font-bold tracking-tight text-white flex items-center gap-2">
                             @AmazonHelp AI Support Agent
-                            <span class="text-xs bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2.5 py-0.5 rounded-full font-medium">Production Live</span>
+                            <span class="text-xs bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 px-2.5 py-0.5 rounded-full font-medium">Local Prototype</span>
                         </h1>
-                        <p class="text-sm text-slate-400">Calibrated Multi-Task Triage • Split Conformal Guarantees • Hybrid RRF • Pre-Dispatch Guardrails</p>
+                        <p class="text-sm text-slate-400">Calibrated Dual-Head MiniLM • Confidence Abstention • Hybrid RRF • Pre-Dispatch Guardrails</p>
                     </div>
                 </div>
             </div>
             <div class="mt-4 md:mt-0 flex gap-3 text-xs mono">
                 <div class="bg-slate-800 border border-slate-700 px-3 py-1.5 rounded-lg text-slate-300">
-                    <span class="text-slate-500">Conformal Target:</span> 95.0%
+                    <span class="text-slate-500">Recall Target:</span> 85.0%
                 </div>
                 <div class="bg-slate-800 border border-slate-700 px-3 py-1.5 rounded-lg text-slate-300">
-                    <span class="text-slate-500">SLA Latency:</span> &lt;100ms
+                    <span class="text-slate-500">Mode:</span> Local / Offline
                 </div>
                 <a href="/docs" target="_blank" class="bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded-lg font-medium transition flex items-center gap-1">
                     API Docs &rarr;
@@ -67,7 +67,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
                     <!-- Preset Scenarios -->
                     <div class="pt-4 border-t border-slate-800 space-y-2">
-                        <div class="text-xs font-medium text-slate-400">Quick Adversarial & Benchmark Presets:</div>
+                        <div class="text-xs font-medium text-slate-400">Quick safety and behavior checks:</div>
                         <div class="flex flex-wrap gap-2 text-xs">
                             <button onclick="setPreset(1)" class="bg-slate-800 hover:bg-slate-700 text-slate-300 px-2.5 py-1.5 rounded-lg border border-slate-700/50">Porch Piracy (Theft)</button>
                             <button onclick="setPreset(2)" class="bg-slate-800 hover:bg-slate-700 text-slate-300 px-2.5 py-1.5 rounded-lg border border-slate-700/50">Public PII Leak</button>
@@ -86,9 +86,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                         <span id="latencyBadge" class="mono text-cyan-400 bg-cyan-950/40 border border-cyan-800/40 px-2 py-0.5 rounded">Ready</span>
                     </h3>
                     <div class="space-y-1.5 mono text-slate-400">
-                        <div class="flex justify-between"><span>Inference Engine:</span><span class="text-slate-200">Logit Bayesian N-Gram TF-IDF</span></div>
-                        <div class="flex justify-between"><span>Retriever:</span><span class="text-slate-200">Okapi BM25 + Sublinear RRF (k=20)</span></div>
-                        <div class="flex justify-between"><span>Coverage Form:</span><span class="text-slate-200">Finite-Sample Split Conformal</span></div>
+                        <div class="flex justify-between"><span>Inference Engine:</span><span class="text-slate-200">MiniLM + Two Calibrated Heads</span></div>
+                        <div class="flex justify-between"><span>Retriever:</span><span class="text-slate-200">BM25 + MiniLM RRF (k=20)</span></div>
+                        <div class="flex justify-between"><span>Uncertainty:</span><span class="text-slate-200">Confidence Abstention</span></div>
                         <div class="flex justify-between"><span>Pre-Dispatch Guard:</span><span class="text-slate-200">17-Digit Redact + URL Whitelist</span></div>
                     </div>
                 </div>
@@ -119,11 +119,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
                             <div id="confidenceVal" class="text-base font-bold text-slate-200 mono mt-1">-</div>
                         </div>
                         <div class="bg-slate-950/60 p-3 rounded-xl border border-slate-800/60">
-                            <span class="text-slate-500">Conformal Set Size</span>
-                            <div id="conformalVal" class="text-base font-bold text-slate-200 mono mt-1">-</div>
+                            <span class="text-slate-500">Abstention</span>
+                            <div id="abstentionVal" class="text-base font-bold text-slate-200 mono mt-1">-</div>
                         </div>
                         <div class="bg-slate-950/60 p-3 rounded-xl border border-slate-800/60">
-                            <span class="text-slate-500">OOD Energy Score</span>
+                            <span class="text-slate-500">Retrieved Resolution Act</span>
                             <div id="oodVal" class="text-base font-bold text-slate-200 mono mt-1">-</div>
                         </div>
                     </div>
@@ -209,8 +209,8 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
                 // 4. Metrics
                 document.getElementById('confidenceVal').innerText = (data.confidence * 100).toFixed(1) + "%";
-                document.getElementById('conformalVal').innerText = `${data.conformal_prediction.set_size} (${data.conformal_prediction.prediction_set.join(', ')})`;
-                document.getElementById('oodVal').innerText = `${data.ood_detection.energy_score} (${data.ood_detection.status})`;
+                document.getElementById('abstentionVal').innerText = data.should_abstain ? 'ESCALATE' : 'CONFIDENT';
+                document.getElementById('oodVal').innerText = data.resolution_act;
 
                 // 5. Reply Box
                 const replyBox = document.getElementById('replyBox');

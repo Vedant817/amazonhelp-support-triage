@@ -4,6 +4,8 @@ __pycache__/
 *$py.class
 *.so
 .venv/
+models/
+.cache/
 env/
 venv/
 ENV/

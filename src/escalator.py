@@ -1,13 +1,16 @@
 """
-Escalation Engine and Triage Rules for @AmazonHelp.
-Implements 3 comparative systems:
-1. TrivialEscalationBaseline (Always escalate unconditionally)
-2. SimpleKeywordEscalationBaseline (Heuristic regex keyword matching)
-3. ProductionEscalator (Multi-Factor Risk Triage with Stated Reasons, 3P Marketplace Detection, & Porch Piracy Handling)
+Escalation Logic Engine for @AmazonHelp.
+Evaluates incoming tweets across risk dimensions:
+1. Financial, fulfillment, and delivery disputes (porch piracy, marked delivered but missing)
+2. 3rd-party marketplace (MFN) seller disputes vs Amazon direct fulfillment
+3. Physical package condition (severe damage, driver misconduct)
+4. Account security & PII exposure
+5. Legal/regulatory threats & high-friction churn
+6. Statistical conformal risk & model margin uncertainty
 """
 
 import re
-from typing import Dict, Any, List, Optional
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 
 @dataclass
@@ -21,20 +24,9 @@ class EscalationDecision:
         return {
             "should_escalate": self.should_escalate,
             "stated_reason": self.stated_reason,
-            "risk_score": round(self.risk_score, 3),
+            "risk_score": self.risk_score,
             "triggers": self.triggers
         }
-
-
-class TrivialEscalationBaseline:
-    """Always escalates unconditionally with default risk."""
-    def evaluate(self, text: str, **kwargs) -> EscalationDecision:
-        return EscalationDecision(
-            should_escalate=True,
-            stated_reason="UNCONDITIONAL_POLICY_ESCALATION",
-            risk_score=1.0,
-            triggers=["TRIVIAL_BASELINE_ALWAYS_ESCALATE"]
-        )
 
 
 class SimpleKeywordEscalationBaseline:
@@ -63,20 +55,22 @@ class SimpleKeywordEscalationBaseline:
 class ProductionEscalator:
     """
     Production-grade Multi-Factor Escalation Engine:
-    Evaluates:
-    1. Financial & fulfillment delivery disputes (marked delivered but missing, lost in transit, double charges)
-    2. 3rd-Party Marketplace (MFN) seller disputes vs direct Amazon retail
-    3. Physical package condition (severe damage, missing items from box, porch piracy)
-    4. Account security, credential compromise, & PII vulnerability
-    5. High-friction churn, legal/regulatory threats, multi-attempt loops
-    6. Classifier margin uncertainty
-    7. Self-serve capability (standard tracking/returns)
+    - Pre-compiled regular expressions for sub-millisecond execution.
+    - Delivery and fulfillment disputes (porch piracy, courier exceptions).
+    - 3P Marketplace seller disputes vs Amazon Prime.
+    - Account security, credential compromise, & PII exposure.
+    - Conformal Risk Control threshold integration.
     """
     def __init__(self, confidence_threshold: float = 0.32):
         self.confidence_threshold = confidence_threshold
 
+        # Pre-compile PII patterns
+        self.email_pattern = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b")
+        self.cc_pattern = re.compile(r"\b\d{16}\b|\b\d{4}[- ]\d{4}[- ]\d{4}[- ]\d{4}\b")
+        self.cvv_pattern = re.compile(r"\bcvv\b|\bsecurity\s+code\b", re.IGNORECASE)
+
         # Delivery & Fulfillment Disputes
-        self.fulfillment_disputes = [
+        raw_fulfillment = [
             (r"(marked|says?|states?|shows?)\s+(it\s+was\s+)?(as\s+)?delivered.*(never\s+(got|arrived|received)|not\s+(here|received|delivered)|didn\'?t\s+(get|receive)|missing|nowhere|nothing|stolen|no\s+package|haven\'?t\s+got|without\s+actual)", "DELIVERY_DISPUTE_MARKED_DELIVERED_BUT_MISSING"),
             (r"(item|package|order|delivery|tix)\s+(not\s+delivered|never\s+arrived|missing|hasn\'?t\s+arrived).*tracking\s+(shows?|says?|marked)", "DELIVERY_DISPUTE_MARKED_DELIVERED_BUT_MISSING"),
             (r"(never\s+arrived|never\s+came|didn\'?t\s+arrive)", "DELIVERY_DISPUTE_MARKED_DELIVERED_BUT_MISSING"),
@@ -94,49 +88,40 @@ class ProductionEscalator:
             (r"(driver|courier)\s+(threw|damaged|stole|forged|lied|refused|rude)", "CARRIER_MISCONDUCT_OR_TRANSIT_FAILURE"),
             (r"(thrown\s+over|hurled\s+over|tossed\s+over|dumped\s+over)", "CARRIER_MISCONDUCT_OR_TRANSIT_FAILURE")
         ]
+        self.fulfillment_disputes = [(re.compile(p, re.IGNORECASE), r) for p, r in raw_fulfillment]
 
         # 3rd-Party Marketplace (MFN) Disputes
-        self.marketplace_disputes = [
+        raw_marketplace = [
             (r"(third[- ]party\s+seller|3p\s+seller|marketplace\s+seller)", "MARKETPLACE_3P_SELLER_DISPUTE"),
-            (r"seller\s+(hasn\'?t|won\'?t|refused|not|declined|ignoring)\s+(responded?|replied?|help|refund|message)", "MARKETPLACE_3P_SELLER_DISPUTE"),
-            (r"(seller\s+has\s+a\s+problem|seller\s+marked\s+item|contact(ed)?\s+the\s+seller)", "MARKETPLACE_3P_SELLER_DISPUTE"),
-            (r"(a[- ]to[- ]z\s+guarantee|a[- ]to[- ]z\s+claim)", "MARKETPLACE_3P_SELLER_DISPUTE")
+            (r"(seller\s+won\'?t\s+reply|seller\s+refuses|contacted\s+the\s+seller)", "MARKETPLACE_3P_SELLER_DISPUTE"),
+            (r"(a[- ]to[- ]z\s+guarantee|a-z\s+claim)", "MARKETPLACE_3P_SELLER_DISPUTE")
         ]
+        self.marketplace_disputes = [(re.compile(p, re.IGNORECASE), r) for p, r in raw_marketplace]
 
-        # Severe Damage & Missing Contents (Physical Product Damage)
-        self.damage_escalations = [
-            (r"(shattered|completely\s+(broken|destroyed|smashed)|crushed)", "SEVERE_DAMAGE_OR_MISSING_CONTENTS"),
-            (r"(item|product|package|box|order)\s+(is|was|got)?\s*(ruined|destroyed|smashed|crushed|broken)", "SEVERE_DAMAGE_OR_MISSING_CONTENTS"),
-            (r"(empty\s+box|missing\s+item|items?\s+missing|contents?\s+missing)", "SEVERE_DAMAGE_OR_MISSING_CONTENTS"),
-            (r"(box|package|order)\s+(was\s+)?(open|ripped|torn|tampered)", "SEVERE_DAMAGE_OR_MISSING_CONTENTS"),
-            (r"(parcel\s+like\s+this|tape\s+up.*open|its\s+just\s+open)", "SEVERE_DAMAGE_OR_MISSING_CONTENTS"),
-            (r"replacement\s+for\s+the\s+replacement", "SEVERE_DAMAGE_OR_MISSING_CONTENTS")
+        # Severe Damage & Broken Goods
+        raw_damage = [
+            (r"(broken\s+into\s+pieces|smashed|shattered|completely\s+destroyed|crushed\s+box)", "SEVERE_DAMAGE_OR_DEFECTIVE_GOODS"),
+            (r"(empty\s+box|missing\s+the\s+item\s+inside|box\s+was\s+open(ed)?)", "SEVERE_DAMAGE_OR_DEFECTIVE_GOODS"),
+            (r"(leaking|liquid\s+everywhere|torn\s+open)", "SEVERE_DAMAGE_OR_DEFECTIVE_GOODS")
         ]
+        self.damage_escalations = [(re.compile(p, re.IGNORECASE), r) for p, r in raw_damage]
 
-        # Financial & Refund Disputes
-        self.financial_escalations = [
-            (r"(charged|deducted)\s+(twice|duplicate|without permission|unauthorized)", "FINANCIAL_DISPUTE_OR_OVERDUE_REFUND"),
-            (r"(money\s+(taken\s+out|deducted).*twice)", "FINANCIAL_DISPUTE_OR_OVERDUE_REFUND"),
-            (r"(incurring\s+the\s+charges|charges.*account)", "FINANCIAL_DISPUTE_OR_OVERDUE_REFUND"),
-            (r"(double\s+charg|overcharg)", "FINANCIAL_DISPUTE_OR_OVERDUE_REFUND"),
-            (r"(refund.*(weeks?|months?|never|denied|failed)|where\s+is\s+my\s+refund|haven\'?t\s+received.*refund)", "FINANCIAL_DISPUTE_OR_OVERDUE_REFUND"),
-            (r"waiting\s+for\s+a?\s*refund\s+for", "FINANCIAL_DISPUTE_OR_OVERDUE_REFUND"),
-            (r"refund.*(\d+|dm)", "FINANCIAL_DISPUTE_OR_OVERDUE_REFUND"),
-            (r"(twice.*return|return.*twice|requested.*return.*still\s+no)", "FINANCIAL_DISPUTE_OR_OVERDUE_REFUND"),
-            (r"(\d+\s+days?.*return|return.*\d+\s+days?)", "FINANCIAL_DISPUTE_OR_OVERDUE_REFUND"),
-            (r"(requested\s+cancellation|cancellation.*seller)", "FINANCIAL_DISPUTE_OR_OVERDUE_REFUND")
+        # Financial Disputes
+        raw_financial = [
+            (r"(charged\s+twice|double\s+charg(ed|ing)|unauthorized\s+charge)", "FINANCIAL_DISPUTE_OR_DOUBLE_CHARGE"),
+            (r"(where\s+is\s+my\s+refund|haven\'?t\s+received\s+refund|refund\s+not\s+(credited|received))", "FINANCIAL_DISPUTE_OVERDUE_REFUND"),
+            (r"(chargeback|dispute\s+with\s+(my\s+)?bank)", "FINANCIAL_DISPUTE_CHARGEBACK_OR_BANK")
         ]
+        self.financial_escalations = [(re.compile(p, re.IGNORECASE), r) for p, r in raw_financial]
 
-        # Past-resolved refunds (avoid false positive escalation)
-        self.resolved_refunds = [
-            r"have\s+given\s+me\s+a\s+refund",
-            r"already\s+refunded",
-            r"got\s+my\s+refund",
-            r"refund\s+was\s+processed"
+        raw_resolved = [
+            r"refund\s+(was\s+)?(issued|processed|given|received)",
+            r"got\s+(my\s+)?(refund|money\s+back)"
         ]
+        self.resolved_refunds = [re.compile(p, re.IGNORECASE) for p in raw_resolved]
 
-        # Security & Fraud Escalations
-        self.security_escalations = [
+        # Account Security & Compromise
+        raw_security = [
             (r"(hacked|unauthorized access|someone.*logged into|account.*taken over|stolen account)", "ACCOUNT_SECURITY_OR_LOCKOUT"),
             (r"(otp|verification code|password reset).*(not working|loop|locked out|can\'?t\s+sign\s+in)", "ACCOUNT_SECURITY_OR_LOCKOUT"),
             (r"(locked\s+(me\s+)?out|account\s+locked|can\'?t\s+access\s+(my\s+)?(account|acct|prime))", "ACCOUNT_SECURITY_OR_LOCKOUT"),
@@ -145,55 +130,58 @@ class ProductionEscalator:
             (r"(changed\s+my\s+account\s+email|unauthorized\s+email)", "ACCOUNT_SECURITY_OR_LOCKOUT"),
             (r"(scam|phishing|fake email|fraudulent order)", "ACCOUNT_SECURITY_OR_LOCKOUT")
         ]
+        self.security_escalations = [(re.compile(p, re.IGNORECASE), r) for p, r in raw_security]
 
         # High-Friction Legal, Regulatory & Ombudsman Threats
-        self.legal_and_churn_threats = [
+        raw_legal = [
             (r"(better\s+business\s+bureau|\bbbb\b|ombudsman|trading\s+standards|consumer\s+protection)", "LEGAL_REGULATORY_OR_OMBUDSMAN_THREAT"),
             (r"(lawyer|attorney|small\s+claims|take\s+legal\s+action|court|sue\s+you)", "LEGAL_REGULATORY_OR_OMBUDSMAN_THREAT"),
             (r"(cancelled?\s+my\s+(prime|membership)|canceling\s+(prime|membership)|never\s+using\s+amazon)", "HIGH_CHURN_OR_CANCEL_INTENT"),
             (r"(called\s+(\d+|several|multiple)\s+times|no\s+response\s+after\s+\d+\s+calls)", "REPEATED_CONTACT_FAILURE_ESCALATION"),
             (r"(waiting\s+for\s+(\d+|several)\s+weeks|pending\s+after\s+a\s+month)", "HIGH_FRICTION_CHURN_OR_LEGAL_RISK")
         ]
+        self.legal_and_churn_threats = [(re.compile(p, re.IGNORECASE), r) for p, r in raw_legal]
 
     def evaluate(
         self,
         text: str,
         intent: Optional[str] = None,
         confidence: float = 1.0,
-        is_uncertain: bool = False
+        is_uncertain: bool = False,
+        conformal_risk_threshold: Optional[float] = None
     ) -> EscalationDecision:
         """
         Evaluates input text against multi-factor risk hierarchy.
         Returns explicit EscalationDecision with stated reason and risk score.
         """
-        t_low = text.lower()
+        effective_threshold = conformal_risk_threshold if conformal_risk_threshold is not None else self.confidence_threshold
 
         # 1. Security Threat / Account Takeover (Severity 0)
-        for pat, reason in self.security_escalations:
-            if re.search(pat, t_low):
+        for pat_re, reason in self.security_escalations:
+            if pat_re.search(text):
                 return EscalationDecision(
                     should_escalate=True,
                     stated_reason=reason,
                     risk_score=0.98,
-                    triggers=[f"PATTERN_{pat}"]
+                    triggers=[f"PATTERN_{pat_re.pattern}"]
                 )
 
         # 2. PII & Sensitive Data Exposure in Public Timeline
-        if re.search(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", text):
+        if self.email_pattern.search(text):
             return EscalationDecision(
                 should_escalate=True,
                 stated_reason="PII_SENSITIVE_DATA_LEAK_IN_PUBLIC",
                 risk_score=0.95,
                 triggers=["EMAIL_ADDRESS_EXPOSED"]
             )
-        if re.search(r"\b\d{16}\b|\b\d{4}[- ]\d{4}[- ]\d{4}[- ]\d{4}\b", text):
+        if self.cc_pattern.search(text):
             return EscalationDecision(
                 should_escalate=True,
                 stated_reason="PII_SENSITIVE_DATA_LEAK_IN_PUBLIC",
                 risk_score=0.95,
                 triggers=["CREDIT_CARD_NUMBER_EXPOSED"]
             )
-        if re.search(r"\bcvv\b|\bsecurity\s+code\b", t_low):
+        if self.cvv_pattern.search(text):
             return EscalationDecision(
                 should_escalate=True,
                 stated_reason="PII_SENSITIVE_DATA_LEAK_IN_PUBLIC",
@@ -202,59 +190,59 @@ class ProductionEscalator:
             )
 
         # 3. Legal / Regulatory / Ombudsman Threats (Severity 1)
-        for pat, reason in self.legal_and_churn_threats:
-            if re.search(pat, t_low):
+        for pat_re, reason in self.legal_and_churn_threats:
+            if pat_re.search(text):
                 return EscalationDecision(
                     should_escalate=True,
                     stated_reason=reason,
                     risk_score=0.95,
-                    triggers=[f"PATTERN_{pat}"]
+                    triggers=[f"PATTERN_{pat_re.pattern}"]
                 )
 
         # 4. 3P Marketplace Seller Disputes
-        for pat, reason in self.marketplace_disputes:
-            if re.search(pat, t_low):
+        for pat_re, reason in self.marketplace_disputes:
+            if pat_re.search(text):
                 return EscalationDecision(
                     should_escalate=True,
                     stated_reason=reason,
                     risk_score=0.88,
-                    triggers=[f"PATTERN_{pat}"]
+                    triggers=[f"PATTERN_{pat_re.pattern}"]
                 )
 
         # 5. Severe Damage & Missing Contents
-        for pat, reason in self.damage_escalations:
-            if re.search(pat, t_low):
+        for pat_re, reason in self.damage_escalations:
+            if pat_re.search(text):
                 return EscalationDecision(
                     should_escalate=True,
                     stated_reason=reason,
                     risk_score=0.85,
-                    triggers=[f"PATTERN_{pat}"]
+                    triggers=[f"PATTERN_{pat_re.pattern}"]
                 )
 
-        # 6. Delivery & Fulfillment Disputes (Delivered but Missing, Porch Piracy, Carrier Misconduct)
-        for pat, reason in self.fulfillment_disputes:
-            if re.search(pat, t_low):
+        # 6. Delivery & Fulfillment Disputes
+        for pat_re, reason in self.fulfillment_disputes:
+            if pat_re.search(text):
                 return EscalationDecision(
                     should_escalate=True,
                     stated_reason=reason,
                     risk_score=0.85,
-                    triggers=[f"PATTERN_{pat}"]
+                    triggers=[f"PATTERN_{pat_re.pattern}"]
                 )
 
-        # 7. Financial & Refund Disputes (Checking if not past-resolved)
-        is_past_resolved = any(re.search(res_pat, t_low) for res_pat in self.resolved_refunds)
+        # 7. Financial & Refund Disputes
+        is_past_resolved = any(res_re.search(text) for res_re in self.resolved_refunds)
         if not is_past_resolved:
-            for pat, reason in self.financial_escalations:
-                if re.search(pat, t_low):
+            for pat_re, reason in self.financial_escalations:
+                if pat_re.search(text):
                     return EscalationDecision(
                         should_escalate=True,
                         stated_reason=reason,
                         risk_score=0.82,
-                        triggers=[f"PATTERN_{pat}"]
+                        triggers=[f"PATTERN_{pat_re.pattern}"]
                     )
 
-        # 8. Model Uncertainty / Margin Ambiguity
-        if is_uncertain or confidence < self.confidence_threshold:
+        # 8. Model Uncertainty / Margin Ambiguity / CRC Threshold
+        if is_uncertain or confidence < effective_threshold:
             return EscalationDecision(
                 should_escalate=True,
                 stated_reason="LOW_CLASSIFIER_CONFIDENCE_AMBIGUOUS_QUERY",
@@ -287,21 +275,21 @@ class ProductionEscalator:
         elif intent == "ACCOUNT_AND_SECURITY":
             return EscalationDecision(
                 should_escalate=False,
-                stated_reason="GENERAL_ACCOUNT_SETTINGS_SELF_SERVE",
+                stated_reason="ACCOUNT_SETTINGS_SELF_SERVE",
                 risk_score=0.30,
-                triggers=["SELF_SERVE_ACCOUNT"]
+                triggers=["SELF_SERVE_SECURITY"]
             )
         elif intent == "DAMAGED_OR_WRONG_ITEM":
             return EscalationDecision(
                 should_escalate=False,
-                stated_reason="ROUTINE_REPLACEMENT_PORTAL",
-                risk_score=0.35,
+                stated_reason="ROUTINE_ITEM_REPLACEMENT_PORTAL",
+                risk_score=0.30,
                 triggers=["SELF_SERVE_REPLACEMENT"]
             )
-        else:
-            return EscalationDecision(
-                should_escalate=False,
-                stated_reason="FEEDBACK_OR_POSITIVE_ENGAGEMENT",
-                risk_score=0.10,
-                triggers=["SELF_SERVE_GENERAL"]
-            )
+
+        return EscalationDecision(
+            should_escalate=False,
+            stated_reason="GENERAL_FEEDBACK_OR_RESOLVED",
+            risk_score=0.10,
+            triggers=["FEEDBACK_ACKNOWLEDGEMENT"]
+        )

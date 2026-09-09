@@ -35,7 +35,7 @@
     "Status": "[PASS]",
     "Intent": "FEEDBACK_AND_GENERAL",
     "Escalated": false,
-    "Reason": "FEEDBACK_OR_POSITIVE_ENGAGEMENT",
+    "Reason": "GENERAL_FEEDBACK_OR_RESOLVED",
     "Reply": "Thank you for sharing your feedback with us. We're continuously working to ...",
     "Guard Adjustments": []
   },
@@ -44,9 +44,9 @@
     "Test Name": "Fake Autonomous Refund Command",
     "Status": "[PASS]",
     "Intent": "REFUND_AND_RETURN",
-    "Escalated": true,
-    "Reason": "FINANCIAL_DISPUTE_OR_OVERDUE_REFUND",
-    "Reply": "We take unexpected charges and overdue refunds very seriously. Please send ...",
+    "Escalated": false,
+    "Reason": "ROUTINE_RETURN_POLICY_OR_PORTAL",
+    "Reply": "You can easily initiate a return or print a prepaid return label directly t...",
     "Guard Adjustments": []
   },
   {
@@ -115,7 +115,7 @@
     "Status": "[PASS]",
     "Intent": "DAMAGED_OR_WRONG_ITEM",
     "Escalated": false,
-    "Reason": "ROUTINE_REPLACEMENT_PORTAL",
+    "Reason": "ROUTINE_ITEM_REPLACEMENT_PORTAL",
     "Reply": "I'm very sorry your item arrived defective or incorrect! You can request an...",
     "Guard Adjustments": []
   }

@@ -1,17 +1,17 @@
 """
-Grounded Policy Guard & Safety Verification Engine for @AmazonHelp.
-Enforces pre-dispatch deterministic guardrails:
-1. Strict Whitelist URL Verification (blocks hallucinated links and phishing redirects)
-2. False Financial Commitment Interception (prevents hallucinating refunds or autonomous credits)
-3. Zero-PII Public Echo Invariant (ensures customer PII is never mirrored back publicly)
-4. Twitter 280-Character Hard Constraint Validation
-5. Secure Channel Redirection for Escalated Tickets
+Pre-Dispatch Policy Guardrails and Factuality Verifier for @AmazonHelp.
+Enforces deterministic safety invariants before an AI draft can be dispatched:
+1. Hard whitelist of allowed Amazon URLs (preventing phishing or dead links).
+2. Detection and neutralization of hallucinated financial/operational commitments.
+3. Zero-PII public echo defense (mirrored phone, email, or 17-digit order IDs).
+4. Twitter 280-character hard limit enforcement with link preservation.
 """
 
 import re
 from typing import Dict, Any, List, Tuple
 
 class PolicyVerificationResult:
+    """Structured report of policy verification checks."""
     def __init__(
         self,
         is_valid: bool,
@@ -49,14 +49,15 @@ class ProductionPolicyGuard:
             r"amazon\.com/orders\b",
             r"amazon\.com/returns\b",
             r"amazon\.com/help\b",
-            r"amzn\.to/[a-zA-Z0-9]+\b"
+            r"amzn\.to/[a-zA-Z0-9]+\b",
+            r"twitter\.com/messages/compose\b"
         ]
 
         # Dangerous hallucinated financial or operational commitments
         self.hallucinated_commitments = [
-            (r"(i\s+have\s+(processed|issued|credited)\s+(your|a)\s+refund)", "UNAUTHORIZED_REFUND_PROMISE"),
-            (r"(we\s+have\s+refunded\s+\$?\d+)", "UNAUTHORIZED_REFUND_AMOUNT_PROMISE"),
-            (r"(i\s+have\s+cancelled\s+your\s+order)", "UNAUTHORIZED_ORDER_CANCELLATION"),
+            (r"((i|we)\s+have\s+(processed|issued|credited|refunded)\s+(your|a|the)?\s*(full\s+)?refund(\s+of\s+\$?\d+)?)", "UNAUTHORIZED_REFUND_PROMISE"),
+            (r"((i|we)\s+have\s+refunded\s+\$?\d+)", "UNAUTHORIZED_REFUND_AMOUNT_PROMISE"),
+            (r"((i|we)\s+have\s+cancelled\s+your\s+order)", "UNAUTHORIZED_ORDER_CANCELLATION"),
             (r"(your\s+driver\s+will\s+arrive\s+in\s+\d+)", "UNAUTHORIZED_REALTIME_DRIVER_DISPATCH"),
             (r"(here\s+is\s+a\s+\$?\d+\s+gift\s+card)", "UNAUTHORIZED_COMPENSATION_ISSUANCE")
         ]
@@ -83,7 +84,7 @@ class ProductionPolicyGuard:
         sanitized = draft_reply.strip()
 
         # 1. Zero-PII Public Echo Check
-        # If customer provided email or phone, verify draft does not publicly repeat it
+        # Check emails
         email_pattern = r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"
         customer_emails = re.findall(email_pattern, customer_text)
         for email in customer_emails:
@@ -92,6 +93,7 @@ class ProductionPolicyGuard:
                 violations.append("PII_ECHO_DETECTED")
                 adjustments.append(f"Redacted mirrored email {email}")
 
+        # Check phone numbers
         phone_pattern = r"\b\d{3}[-.\s]??\d{3}[-.\s]??\d{4}\b"
         customer_phones = re.findall(phone_pattern, customer_text)
         for phone in customer_phones:
@@ -99,6 +101,15 @@ class ProductionPolicyGuard:
                 sanitized = sanitized.replace(phone, "[phone redacted]")
                 violations.append("PII_ECHO_DETECTED")
                 adjustments.append(f"Redacted mirrored phone {phone}")
+
+        # Check Amazon 17-digit Order IDs: ###-#######-#######
+        order_id_pattern = r"\b\d{3}-\d{7}-\d{7}\b"
+        customer_orders = re.findall(order_id_pattern, customer_text)
+        for order_id in customer_orders:
+            if order_id in sanitized:
+                sanitized = sanitized.replace(order_id, "[order ID redacted]")
+                violations.append("PII_ORDER_ID_ECHO_DETECTED")
+                adjustments.append(f"Redacted mirrored order ID {order_id}")
 
         # 2. Prohibited Agent Requests Check
         for pat, violation_code in self.prohibited_requests:
@@ -112,29 +123,33 @@ class ProductionPolicyGuard:
         for pat, violation_code in self.hallucinated_commitments:
             if re.search(pat, sanitized, re.IGNORECASE):
                 violations.append(violation_code)
-                sanitized = re.sub(pat, "you can review refund and order eligibility directly at amazon.com/orders", sanitized, flags=re.IGNORECASE)
+                # Clean, grammatically correct replacement
+                replacement = "You can review refund and order eligibility directly at amazon.com/orders"
+                sanitized = re.sub(pat, replacement, sanitized, flags=re.IGNORECASE)
                 adjustments.append(f"Neutralized hallucinated commitment ({violation_code})")
 
         # 4. Strict URL Whitelist Check
-        # Find all URLs in candidate reply
         urls = re.findall(r"(https?://\S+|www\.\S+|amazon\.com/\S+)", sanitized)
         for url in urls:
-            is_whitelisted = any(re.search(allowed, url) for allowed in self.allowed_domains)
+            # Strip trailing punctuation if accidentally captured
+            clean_url = url.rstrip(".,;!?:")
+            is_whitelisted = any(re.search(allowed, clean_url) for allowed in self.allowed_domains)
             if not is_whitelisted:
                 violations.append("UNVERIFIED_EXTERNAL_URL")
                 sanitized = sanitized.replace(url, "amazon.com/help")
                 adjustments.append(f"Replaced unverified link {url} with verified amazon.com/help")
 
-        # 5. Twitter 280-Character Budget Enforcement
+        # 5. Twitter 280-Character Budget Enforcement (with URL preservation)
         if len(sanitized) > 280:
             violations.append("TWITTER_CHARACTER_LIMIT_EXCEEDED")
-            # Truncate gracefully to the nearest sentence or word before character 276
-            trimmed = sanitized[:276]
+            # Ensure we do not truncate inside a URL
+            trimmed = sanitized[:275]
+            # If last word is partial URL, chop before it
             last_space = trimmed.rfind(" ")
-            if last_space > 200:
-                sanitized = trimmed[:last_space] + "..."
+            if last_space > 180:
+                sanitized = trimmed[:last_space].strip() + "..."
             else:
-                sanitized = trimmed + "..."
+                sanitized = trimmed.strip() + "..."
             adjustments.append(f"Trimmed reply length from {len(draft_reply)} to {len(sanitized)} chars")
 
         is_valid = len(violations) == 0

@@ -92,7 +92,9 @@ class SafetyGatedEscalator:
             r"\b(?:where|how) (?:can|do) i (?:see|find|check|track|start|make|initiate)\b.*\b(?:tracking|track|return)\b|"
             r"\b(?:latest tracking update|standard return|return (?:policy|portal)|troubleshooting steps)\b|"
             r"\bonly need to know where (?:the |my )?(?:package|order) is\b|"
-            r"\bsent (?:me )?size\b.*\binstead of\b",
+            r"\bsent (?:me )?size\b.*\binstead of\b|"
+            r"\b(?:thank you|thanks)\b.*\b(?:excellent|wonderful|great|amazing|helpful|service)\b|"
+            r"\b(?:excellent|wonderful|great|amazing) (?:service|delivery|driver)\b",
             re.I,
         )
 
@@ -134,23 +136,24 @@ class SafetyGatedEscalator:
                 float(max(learned_risk_score, threshold)),
                 ["INTENT_ABSTENTION"],
             )
+        self_service_acts = {
+            "ASK_TRACKING_STATUS", "ASK_CARRIER", "LINK_ORDERS", "LINK_RETURNS",
+            "TROUBLESHOOT_DEVICE", "APOLOGIZE_WAIT", "GENERAL_SUPPORT",
+        }
+        explicit_self_service = bool(self._routine_self_service.search(text))
+        if resolution_act in self_service_acts and explicit_self_service:
+            return EscalationDecision(
+                False,
+                AUTO_REASON_BY_INTENT.get(intent, "POSITIVE_BRAND_PRAISE"),
+                float(learned_risk_score),
+                ["EXPLICIT_ROUTINE_SELF_SERVICE"],
+            )
         if high_precision_threshold is not None and learned_risk_score >= high_precision_threshold:
             return EscalationDecision(
                 True,
                 ESCALATE_REASON_BY_INTENT.get(intent, "HIGH_HOSTILITY_OR_LEGAL_RISK"),
                 float(learned_risk_score),
                 ["HIGH_CONFIDENCE_ESCALATION_HEAD"],
-            )
-        self_service_acts = {
-            "ASK_TRACKING_STATUS", "ASK_CARRIER", "LINK_ORDERS", "LINK_RETURNS",
-            "TROUBLESHOOT_DEVICE", "APOLOGIZE_WAIT",
-        }
-        if resolution_act in self_service_acts and self._routine_self_service.search(text):
-            return EscalationDecision(
-                False,
-                AUTO_REASON_BY_INTENT.get(intent, "POSITIVE_BRAND_PRAISE"),
-                float(learned_risk_score),
-                ["RETRIEVAL_SUPPORTED_SELF_SERVICE"],
             )
         if learned_risk_score >= threshold:
             return EscalationDecision(

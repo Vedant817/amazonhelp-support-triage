@@ -8,10 +8,14 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 from scipy.optimize import minimize_scalar
+from scipy.sparse import csr_matrix, hstack
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import precision_recall_curve
+from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.multiclass import OneVsRestClassifier
+from sklearn.pipeline import FeatureUnion
 
-from src.classifier import INTENT_TAXONOMY
+from src.classifier import INTENT_TAXONOMY, preprocess_tweet
 
 
 MINILM_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
@@ -156,7 +160,7 @@ def select_precision_threshold(
 
 
 class DualHeadSupportModel:
-    """Shared MiniLM embeddings with separate intent and escalation logistic heads."""
+    """Semantic-plus-lexical features with calibrated intent and escalation heads."""
 
     def __init__(
         self,
@@ -164,27 +168,81 @@ class DualHeadSupportModel:
         intent_confidence_threshold: float = 0.45,
         target_escalation_recall: float = 0.85,
         target_high_risk_precision: float = 0.80,
+        intent_noise_prune_fraction: float = 0.05,
     ) -> None:
         self.encoder = encoder or MiniLMEncoder()
         self.intent_confidence_threshold = intent_confidence_threshold
         self.target_escalation_recall = target_escalation_recall
         self.target_high_risk_precision = target_high_risk_precision
-        self.intent_head = LogisticRegression(
-            max_iter=2000,
-            class_weight="balanced",
-            random_state=42,
-            C=2.0,
+        self.intent_noise_prune_fraction = intent_noise_prune_fraction
+        self.intent_vectorizer = self._make_vectorizer()
+        self.escalation_vectorizer = self._make_vectorizer()
+        self.intent_head = OneVsRestClassifier(
+            LogisticRegression(
+                max_iter=2000,
+                class_weight="balanced",
+                random_state=42,
+                C=1.0,
+                solver="liblinear",
+            )
         )
         self.escalation_head = LogisticRegression(
             max_iter=2000,
             random_state=42,
-            C=1.0,
+            C=0.5,
         )
         self.intent_temperature = TemperatureScaler()
         self.escalation_temperature = TemperatureScaler()
         self.escalation_threshold_ = 0.5
         self.high_precision_escalation_threshold_ = 1.0
+        self.intent_pruned_count_ = 0
         self.classes_: List[str] = []
+
+    @staticmethod
+    def _make_vectorizer() -> FeatureUnion:
+        return FeatureUnion([
+            ("word", TfidfVectorizer(
+                preprocessor=preprocess_tweet,
+                ngram_range=(1, 2),
+                min_df=2,
+                max_features=30000,
+                sublinear_tf=True,
+            )),
+            ("character", TfidfVectorizer(
+                preprocessor=preprocess_tweet,
+                analyzer="char_wb",
+                ngram_range=(3, 5),
+                min_df=3,
+                max_features=40000,
+                sublinear_tf=True,
+            )),
+        ])
+
+    @staticmethod
+    def _hybrid_features(vectorizer: FeatureUnion, texts: Sequence[str], embeddings: np.ndarray):
+        lexical = vectorizer.transform([str(text) for text in texts])
+        return hstack([lexical, csr_matrix(embeddings)], format="csr")
+
+    def _intent_keep_mask(self, embeddings: np.ndarray, labels: Sequence[str]) -> np.ndarray:
+        """Cross-fitted self-confidence filter for the noisiest weak labels."""
+        labels_arr = np.asarray(labels)
+        splitter = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        audit_head = LogisticRegression(
+            max_iter=2000, class_weight="balanced", random_state=42, C=2.0
+        )
+        oof = cross_val_predict(
+            audit_head, embeddings, labels_arr, cv=splitter, method="predict_proba"
+        )
+        classes = np.unique(labels_arr)
+        class_index = {label: idx for idx, label in enumerate(classes)}
+        label_indices = np.asarray([class_index[label] for label in labels_arr])
+        self_confidence = oof[np.arange(len(labels_arr)), label_indices]
+        keep = np.ones(len(labels_arr), dtype=bool)
+        for label in classes:
+            indices = np.flatnonzero(labels_arr == label)
+            cutoff = np.quantile(self_confidence[indices], self.intent_noise_prune_fraction)
+            keep[indices] = self_confidence[indices] >= cutoff
+        return keep
 
     def fit(
         self,
@@ -199,18 +257,35 @@ class DualHeadSupportModel:
     ) -> "DualHeadSupportModel":
         intent_embeddings = self.encoder.encode(intent_texts)
         escalation_embeddings = self.encoder.encode(escalation_texts)
-        self.intent_head.fit(intent_embeddings, list(intent_labels))
-        self.escalation_head.fit(escalation_embeddings, list(escalation_labels))
+        intent_keep = self._intent_keep_mask(intent_embeddings, intent_labels)
+        self.intent_pruned_count_ = int((~intent_keep).sum())
+        self.intent_vectorizer.fit([str(text) for text in intent_texts])
+        intent_features = self._hybrid_features(
+            self.intent_vectorizer, intent_texts, intent_embeddings
+        )
+        self.intent_head.fit(intent_features[intent_keep], np.asarray(intent_labels)[intent_keep])
+
+        self.escalation_vectorizer.fit([str(text) for text in escalation_texts])
+        escalation_features = self._hybrid_features(
+            self.escalation_vectorizer, escalation_texts, escalation_embeddings
+        )
+        self.escalation_head.fit(escalation_features, list(escalation_labels))
         self.classes_ = list(self.intent_head.classes_)
 
         cal_intent_embeddings = self.encoder.encode(cal_intent_texts)
-        cal_intent_logits = self.intent_head.decision_function(cal_intent_embeddings)
+        cal_intent_features = self._hybrid_features(
+            self.intent_vectorizer, cal_intent_texts, cal_intent_embeddings
+        )
+        cal_intent_logits = self.intent_head.decision_function(cal_intent_features)
         class_to_index = {label: idx for idx, label in enumerate(self.classes_)}
         numeric_labels = [class_to_index[label] for label in cal_intent_labels]
         self.intent_temperature.fit_multiclass(cal_intent_logits, numeric_labels)
 
         cal_escalation_embeddings = self.encoder.encode(cal_escalation_texts)
-        cal_escalation_logits = self.escalation_head.decision_function(cal_escalation_embeddings)
+        cal_escalation_features = self._hybrid_features(
+            self.escalation_vectorizer, cal_escalation_texts, cal_escalation_embeddings
+        )
+        cal_escalation_logits = self.escalation_head.decision_function(cal_escalation_features)
         self.escalation_temperature.fit_binary(cal_escalation_logits, cal_escalation_labels)
         cal_escalation_probs = _sigmoid(
             cal_escalation_logits / self.escalation_temperature.temperature_
@@ -229,7 +304,8 @@ class DualHeadSupportModel:
 
     def predict_with_confidence(self, text: str) -> Dict[str, Any]:
         embedding = self.encoder.encode([text])
-        logits = np.asarray(self.intent_head.decision_function(embedding)[0], dtype=float)
+        features = self._hybrid_features(self.intent_vectorizer, [text], embedding)
+        logits = np.asarray(self.intent_head.decision_function(features)[0], dtype=float)
         probs = _softmax(logits / self.intent_temperature.temperature_)
         best_idx = int(np.argmax(probs))
         confidence = float(probs[best_idx])
@@ -245,7 +321,12 @@ class DualHeadSupportModel:
         }
 
     def predict_escalation(self, text: str, embedding: Optional[np.ndarray] = None) -> Dict[str, Any]:
-        features = np.asarray(embedding, dtype=np.float32).reshape(1, -1) if embedding is not None else self.encoder.encode([text])
+        dense = (
+            np.asarray(embedding, dtype=np.float32).reshape(1, -1)
+            if embedding is not None
+            else self.encoder.encode([text])
+        )
+        features = self._hybrid_features(self.escalation_vectorizer, [text], dense)
         logit = float(self.escalation_head.decision_function(features)[0])
         probability = float(_sigmoid(np.array([logit / self.escalation_temperature.temperature_]))[0])
         return {

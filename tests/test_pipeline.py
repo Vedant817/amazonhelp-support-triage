@@ -154,6 +154,22 @@ class TestPipelineComponents(unittest.TestCase):
         self.assertFalse(routine.should_escalate)
         self.assertTrue(high_risk.should_escalate)
 
+    def test_explicit_routine_request_overrides_score_but_not_hard_gate(self):
+        escalator = SafetyGatedEscalator(learned_threshold=0.3)
+        routine = escalator.evaluate(
+            "You sent size 10 instead of size 8", "DAMAGED_OR_WRONG_ITEM", 0.95,
+            high_precision_threshold=0.8, resolution_act="LINK_RETURNS",
+        )
+        dispute = escalator.evaluate(
+            "It says delivered but never arrived. How can I track it?",
+            "ORDER_TRACKING_AND_DELAY", 0.01,
+            high_precision_threshold=0.8, resolution_act="LINK_ORDERS",
+        )
+        self.assertFalse(routine.should_escalate)
+        self.assertEqual(routine.triggers, ["EXPLICIT_ROUTINE_SELF_SERVICE"])
+        self.assertTrue(dispute.should_escalate)
+        self.assertEqual(dispute.triggers, ["HARD_GATE_DELIVERY_DISPUTE"])
+
     def test_closed_reason_codes(self):
         escalator = SafetyGatedEscalator(learned_threshold=0.5)
         decision = escalator.evaluate(

@@ -297,7 +297,7 @@ DASHBOARD_HTML = r"""<!doctype html>
         const health = await response.json();
         byId("healthDot").className = "status-dot online";
         setText("healthText", `${health.status} · ${health.generation_mode} generation · no hosted API`);
-        setText("healthEncoder", `${health.intent_encoder} @ ${health.intent_encoder_revision.slice(0, 8)}`);
+        setText("healthEncoder", `${health.classification_features} · ${health.weak_intent_labels_pruned} noisy labels removed`);
         setText("healthGenerator", health.generation_model_revision
           ? `${health.generation_backend} @ ${health.generation_model_revision.slice(0, 8)}`
           : health.generation_backend);

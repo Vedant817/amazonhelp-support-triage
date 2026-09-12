@@ -80,6 +80,8 @@ class HealthResponse(BaseModel):
     generation_model_revision: Optional[str]
     intent_encoder: str
     intent_encoder_revision: str
+    classification_features: str
+    weak_intent_labels_pruned: int
     retrieval_method: str
     inference_device: str
     hosted_api_required: bool

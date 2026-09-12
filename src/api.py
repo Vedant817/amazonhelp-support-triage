@@ -94,7 +94,7 @@ def health():
     return HealthResponse(
         status="healthy",
         brand="@AmazonHelp",
-        model_version="2.0.0-minilm-dual-head",
+        model_version="2.1.0-noise-aware-hybrid-dual-head",
         corpus_size=pipeline_state["corpus_size"],
         intent_temperature=round(model.intent_temperature.temperature_, 4),
         escalation_temperature=round(model.escalation_temperature.temperature_, 4),
@@ -107,6 +107,8 @@ def health():
         generation_model_revision=QWEN_REVISION if generation_mode == "local" else None,
         intent_encoder=model.encoder.model_name,
         intent_encoder_revision=model.encoder.revision,
+        classification_features="MiniLM + word TF-IDF + character TF-IDF",
+        weak_intent_labels_pruned=model.intent_pruned_count_,
         retrieval_method="BM25 + MiniLM reciprocal-rank fusion",
         inference_device=str(encoder_device or model.encoder.device or "cpu"),
         hosted_api_required=False,
@@ -225,6 +227,8 @@ def triage(req: TriageRequest):
             duration_ms=round(classification_ms, 2),
             details={
                 "encoder": model.encoder.model_name,
+                "features": "MiniLM + word/character TF-IDF",
+                "weak_labels_pruned": model.intent_pruned_count_,
                 "predicted_intent": classification["intent"],
                 "confidence": round(classification["confidence"], 4),
                 "confidence_threshold": round(model.intent_confidence_threshold, 4),

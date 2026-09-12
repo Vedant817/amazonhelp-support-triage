@@ -7,13 +7,14 @@ The current system is:
 
 1. non-vetoable policy gates for public PII, takeover, legal threats, delivery disputes,
    severe damage, financial disputes, and prompt manipulation;
-2. one revision-pinned MiniLM encoder with separate intent and escalation logistic heads;
-3. temperature scaling on reply-labeled holdouts;
-4. confidence abstention plus recall-targeted and high-precision escalation thresholds;
-5. BM25 + MiniLM retrieval fused with reciprocal-rank fusion;
-6. a resolution act extracted from historical replies;
-7. either local Qwen rewriting or deterministic act-conditioned offline rewriting;
-8. URL, PII, false-promise, and 280-character guardrails.
+2. MiniLM semantic features fused with word and character TF-IDF features;
+3. out-of-fold confidence filtering of the noisiest 5% of intent weak labels;
+4. separate intent and escalation heads with holdout temperature scaling;
+5. confidence abstention plus recall-targeted and high-precision escalation thresholds;
+6. BM25 + MiniLM retrieval fused with reciprocal-rank fusion;
+7. a resolution act extracted from historical replies;
+8. either local Qwen rewriting or deterministic act-conditioned offline rewriting;
+9. URL, PII, false-promise, and 280-character guardrails.
 
 ## Verified status
 
@@ -25,13 +26,13 @@ run in this artifact. On the audited 200-case gold set:
 |---|---:|---:|---:|---:|
 | Majority + always escalate | 0.061 | 1.000 | 0.550 | 0.000 |
 | TF-IDF + keyword escalation + retrieve/replay | 0.673 | 0.309 | 0.630 | 0.000 |
-| MiniLM dual-head + gates + retrieve/rewrite | **0.731** | **0.873** | 0.555 | **0.445** |
+| Noise-aware hybrid dual-head + gates + retrieve/rewrite | **0.748** | **0.891** | 0.570 | **0.470** |
 
 The proposed system's bootstrap 95% intervals are:
 
-- intent macro-F1: 0.665–0.790;
-- escalation recall: 0.805–0.929;
-- escalation precision: 0.480–0.629.
+- intent macro-F1: 0.683–0.806;
+- escalation recall: 0.829–0.945;
+- escalation precision: 0.500–0.643.
 
 These results are materially safer than the keyword baseline on escalation recall, but
 they do **not** meet the intended intent-quality or escalation-precision targets. There
@@ -119,11 +120,14 @@ OOD, CRAG, and a keyword-based “LLM judge” are not part of the scored produc
 
 MiniLM maps text into 384-dimensional vectors suitable for semantic similarity
 ([model card](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)). This
-implementation currently trains heads over frozen embeddings; it is not claimed as
-SetFit fine-tuning. SetFit remains the planned method after independent labels exist
+implementation fuses those frozen embeddings with learned word and character TF-IDF
+features and filters low-confidence weak labels using out-of-fold predictions. It is
+not claimed as SetFit fine-tuning. SetFit remains appropriate after independent labels exist
 ([Tunstall et al., 2022](https://arxiv.org/abs/2209.11055)). Temperature scaling follows
 the single-parameter calibration method of
 [Guo et al. (2017)](https://proceedings.mlr.press/v70/guo17a.html).
+The weak-label filter is inspired by confident learning but is not claimed as a full
+implementation ([Northcutt et al., 2021](https://arxiv.org/abs/1911.00068)).
 
 The retrieve-then-rewrite design is inspired by retrieval-augmented generation, but is
 described by what it actually does rather than claimed as the exact RAG training method

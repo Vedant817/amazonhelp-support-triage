@@ -3,8 +3,8 @@
 ## Executive result
 
 The rebuilt system fixes the largest safety failure but does not yet establish a strong
-intent model. On the audited 200-case gold set, escalation recall is 0.873 versus 0.309
-for the keyword baseline. Intent macro-F1 is 0.731 versus 0.673, well below the proposed
+intent model. On the audited 200-case gold set, escalation recall is 0.891 versus 0.309
+for the keyword baseline. Intent macro-F1 is 0.748 versus 0.673, below the proposed
 0.90 target. These are the values written by
 `python main.py benchmark`; no other number is treated as
 current.
@@ -29,7 +29,10 @@ IDs and rationales are in `data/golden/LABEL_AUDIT.md`.
 ### Learned decisions
 
 The local `sentence-transformers/all-MiniLM-L6-v2` encoder produces normalized
-384-dimensional embeddings. Separate regularized logistic heads learn:
+384-dimensional embeddings. Word and character TF-IDF features preserve lexical and
+typo-level evidence that sentence embeddings can smooth away. A five-fold out-of-fold
+self-confidence audit removes the lowest-confidence 5% within each intent class before
+the final head is fitted. Separate regularized heads then learn:
 
 - the six-way intent;
 - the binary escalation decision.
@@ -71,42 +74,45 @@ plus quadratic weighted kappa.
 
 | Metric | Majority / always escalate | TF-IDF / keyword | Proposed |
 |---|---:|---:|---:|
-| Intent accuracy | 0.225 | 0.685 | 0.740 |
-| Intent macro-F1 | 0.061 | 0.673 | 0.731 |
-| Escalation accuracy | 0.550 | 0.520 | 0.545 |
-| Escalate recall | 1.000 | 0.309 | 0.873 |
-| Escalate precision | 0.550 | 0.630 | 0.555 |
-| Exact reason match | 0.000 | 0.000 | 0.445 |
+| Intent accuracy | 0.225 | 0.685 | 0.765 |
+| Intent macro-F1 | 0.061 | 0.673 | 0.748 |
+| Escalation accuracy | 0.550 | 0.520 | 0.570 |
+| Escalate recall | 1.000 | 0.309 | 0.891 |
+| Escalate precision | 0.550 | 0.630 | 0.570 |
+| Exact reason match | 0.000 | 0.000 | 0.470 |
 | Replies ≤280 characters | 1.000 | 1.000 | 1.000 |
 | No direct PII echo | 1.000 | 1.000 | 1.000 |
 
 Proposed-model 95% paired bootstrap intervals (2,000 iterations):
 
-- intent macro-F1: 0.665–0.790;
-- escalation recall: 0.805–0.929;
-- escalation precision: 0.480–0.629.
+- intent macro-F1: 0.683–0.806;
+- escalation recall: 0.829–0.945;
+- escalation precision: 0.500–0.643.
 
 Per-class proposed intent results:
 
 | Intent | Precision | Recall | F1 |
 |---|---:|---:|---:|
-| Account and security | 0.769 | 0.571 | 0.656 |
-| Damaged or wrong item | 0.763 | 0.829 | 0.795 |
-| Feedback and general | 0.516 | 0.640 | 0.571 |
-| Order tracking and delay | 0.818 | 0.800 | 0.809 |
-| Product and technical | 0.733 | 0.880 | 0.800 |
-| Refund and return | 0.806 | 0.714 | 0.758 |
+| Account and security | 0.909 | 0.571 | 0.702 |
+| Damaged or wrong item | 0.800 | 0.800 | 0.800 |
+| Feedback and general | 0.542 | 0.520 | 0.531 |
+| Order tracking and delay | 0.800 | 0.889 | 0.842 |
+| Product and technical | 0.719 | 0.920 | 0.807 |
+| Refund and return | 0.784 | 0.829 | 0.806 |
 
 Calibration was fitted on 763 reply-labeled intent examples and 870 reply-labeled
-escalation examples. The fitted temperatures are 0.887 for intent and 0.889 for
-escalation. The recall and high-precision thresholds are 0.2439 and 0.7302. Gold labels
+escalation examples. The fitted temperatures are 1.304 for intent and 0.867 for
+escalation. The recall and high-precision thresholds are 0.2337 and 0.6430. Gold labels
 were not used to choose them.
+
+On the gold diagnostic, 10-bin quantile ECE is 0.0498 and MCE is 0.0993. These are
+descriptive test-set diagnostics, not calibration-fit inputs.
 
 ## What the result proves—and does not
 
 It proves that, in this frozen checkout and audited gold set:
 
-- the scored path uses dense MiniLM features, not TF-IDF logit boosts;
+- the scored path uses a fitted semantic-plus-lexical representation, not keyword logit boosts;
 - a learned, cost-sensitive decision plus hard gates reaches the intended escalation
   recall region;
 - retrieved resolution acts change the generated next step;
@@ -152,6 +158,9 @@ artifact.
   [model card](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2).
 - Temperature scaling is a single fitted parameter following
   [Guo et al. (2017)](https://proceedings.mlr.press/v70/guo17a.html).
+- The cross-fitted weak-label audit is a conservative self-confidence filter inspired
+  by confident learning; it is not claimed as a full Cleanlab implementation
+  ([Northcutt et al., 2021](https://arxiv.org/abs/1911.00068)).
 - SetFit is not claimed as implemented; it is the planned fine-tuning method after real
   labels exist ([Tunstall et al., 2022](https://arxiv.org/abs/2209.11055)).
 - Retrieval grounding is inspired by, but not claimed as an exact implementation of,

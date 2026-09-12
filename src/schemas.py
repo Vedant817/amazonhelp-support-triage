@@ -75,6 +75,10 @@ class HealthResponse(BaseModel):
     high_precision_escalation_threshold: float
     intent_confidence_threshold: float
     target_escalation_recall: float
+    escalation_calibration_recall: float
+    escalation_recall_lower_bound: float
+    escalation_recall_bound_target_met: bool
+    escalation_calibration_positive_count: int
     generation_mode: str
     generation_backend: str
     generation_model_revision: Optional[str]
@@ -82,6 +86,9 @@ class HealthResponse(BaseModel):
     intent_encoder_revision: str
     classification_features: str
     weak_intent_labels_pruned: int
+    probabilistic_intent_label_count: int
+    contrastive_training_pairs: int
+    human_reason_training_count: int
     retrieval_method: str
     inference_device: str
     hosted_api_required: bool

@@ -4,6 +4,7 @@ import unittest
 os.environ.setdefault("SUPPORT_INTENT_CAP_PER_CLASS", "30")
 os.environ.setdefault("SUPPORT_RETRIEVAL_SIZE", "100")
 os.environ.setdefault("SUPPORT_GENERATION_MODE", "offline")
+os.environ.setdefault("SUPPORT_CONTRASTIVE_PAIRS", "0")
 
 from fastapi.testclient import TestClient
 
@@ -24,13 +25,15 @@ class TestSupportAPI(unittest.TestCase):
         response = self.client.get("/api/v1/health")
         self.assertEqual(response.status_code, 200)
         data = response.json()
-        self.assertIn("noise-aware-hybrid-dual-head", data["model_version"])
+        self.assertIn("probabilistic-local-dual-head", data["model_version"])
         self.assertEqual(data["generation_mode"], "offline")
         self.assertGreater(data["escalation_threshold"], 0.0)
         self.assertGreater(data["high_precision_escalation_threshold"], 0.0)
         self.assertEqual(data["intent_encoder"], "sentence-transformers/all-MiniLM-L6-v2")
         self.assertIn("character TF-IDF", data["classification_features"])
         self.assertGreater(data["weak_intent_labels_pruned"], 0)
+        self.assertGreater(data["probabilistic_intent_label_count"], 0)
+        self.assertEqual(data["human_reason_training_count"], 0)
         self.assertEqual(data["generation_backend"], "act-conditioned deterministic rewrite")
         self.assertFalse(data["hosted_api_required"])
 

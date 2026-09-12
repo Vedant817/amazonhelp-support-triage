@@ -125,6 +125,7 @@ def infer_reply_escalation(reply_text: str) -> Optional[bool]:
 def build_reply_supervision(
     pairs: pd.DataFrame,
     reviewed: Optional[pd.DataFrame] = None,
+    use_probabilistic_intent_labels: bool = False,
 ) -> pd.DataFrame:
     """Add weak labels, acts, and provenance; merge optional human-reviewed labels by inbound_id."""
     frame = pairs.copy()
@@ -133,6 +134,26 @@ def build_reply_supervision(
     frame["escalate_label"] = frame["reply_text"].map(infer_reply_escalation)
     frame["intent_label_source"] = frame["intent_label"].map(lambda x: "reply_weak" if pd.notna(x) else "unlabeled")
     frame["escalate_label_source"] = frame["escalate_label"].map(lambda x: "reply_weak" if pd.notna(x) else "unlabeled")
+    frame["intent_label_confidence"] = frame["intent_label"].map(lambda x: 1.0 if pd.notna(x) else 0.0)
+    frame["reason_label"] = None
+    frame["reason_label_source"] = "unlabeled"
+    frame["resolution_act_source"] = "reply_weak"
+
+    if use_probabilistic_intent_labels:
+        from src.classifier import INTENT_TAXONOMY
+        from src.weak_label_model import aggregate_intent_weak_labels
+
+        aggregated = aggregate_intent_weak_labels(
+            frame, INTENT_TAXONOMY, minimum_confidence=0.75
+        )
+        for index, (label, confidence) in enumerate(zip(aggregated.labels, aggregated.confidences)):
+            frame.at[frame.index[index], "intent_label_confidence"] = float(confidence)
+            # Preserve the deliberately high-precision reply label. The label
+            # model expands coverage only where reply supervision abstained;
+            # conflicts are routed to active review instead of auto-correction.
+            if label is not None and pd.isna(frame.at[frame.index[index], "intent_label"]):
+                frame.at[frame.index[index], "intent_label"] = label
+                frame.at[frame.index[index], "intent_label_source"] = "probabilistic_weak_label_model"
 
     if reviewed is not None and not reviewed.empty:
         required = {"inbound_id", "reviewed_intent", "reviewed_escalate"}
@@ -159,4 +180,16 @@ def build_reply_supervision(
             if pd.notna(row["reviewed_escalate"]):
                 frame.at[idx, "escalate_label"] = _parse_reviewed_escalation(row["reviewed_escalate"])
                 frame.at[idx, "escalate_label_source"] = "human_reviewed"
+            if "reviewed_reason_code" in review_map.columns and pd.notna(row["reviewed_reason_code"]):
+                reason = str(row["reviewed_reason_code"]).strip()
+                if not re.fullmatch(r"[A-Z][A-Z0-9_]{2,79}", reason):
+                    raise ValueError(f"Invalid reviewed_reason_code for inbound_id {inbound_id}: {reason!r}")
+                frame.at[idx, "reason_label"] = reason
+                frame.at[idx, "reason_label_source"] = "human_reviewed"
+            if "reviewed_resolution_act" in review_map.columns and pd.notna(row["reviewed_resolution_act"]):
+                act = str(row["reviewed_resolution_act"]).strip()
+                if act not in RESOLUTION_ACTS:
+                    raise ValueError(f"Invalid reviewed_resolution_act for inbound_id {inbound_id}: {act!r}")
+                frame.at[idx, "resolution_act"] = act
+                frame.at[idx, "resolution_act_source"] = "human_reviewed"
     return frame

@@ -6,13 +6,21 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 
-from src.dual_head import TemperatureScaler, select_precision_threshold, select_recall_threshold
+from src.active_learning import normalized_entropy, select_active_review_batch
+from src.dual_head import (
+    TemperatureScaler,
+    one_sided_binomial_lower_bound,
+    select_precision_threshold,
+    select_recall_constrained_threshold,
+    select_recall_threshold,
+)
 from src.escalator import SafetyGatedEscalator
 from src.generator import ProductionGroundedGenerator
 from src.guardrails import ProductionPolicyGuard
 from src.llm_judge import ReplyQualityJudge
 from src.retriever import HistoricalResolutionRetriever
 from src.supervision import build_reply_supervision, infer_resolution_act, strip_agent_pii
+from src.weak_label_model import DawidSkeneLabelModel, aggregate_intent_weak_labels
 
 
 class FakeDenseEncoder:
@@ -40,6 +48,25 @@ class FakeLocalModel:
 
 
 class TestPipelineComponents(unittest.TestCase):
+    def test_active_review_selection_is_balanced_and_preserves_uncertainty(self):
+        frame = pd.DataFrame({
+            "inbound_id": [str(i) for i in range(12)],
+            "intent_label": ["A"] * 6 + ["B"] * 4 + [None] * 2,
+            "escalate_label": [True, False, None] * 4,
+        })
+        embeddings = np.eye(12, dtype=np.float32)
+        probabilities = np.array(
+            [[0.51, 0.49], [0.9, 0.1], [0.6, 0.4], [0.8, 0.2], [0.7, 0.3], [0.55, 0.45],
+             [0.49, 0.51], [0.1, 0.9], [0.4, 0.6], [0.2, 0.8], [0.52, 0.48], [0.48, 0.52]]
+        )
+        selected = select_active_review_batch(
+            frame, embeddings, probabilities, ["A", "B"], np.linspace(0.1, 0.9, 12), batch_size=6
+        )
+        self.assertEqual(len(selected), 6)
+        self.assertEqual(set(selected["provisional_intent"]), {"A", "B"})
+        self.assertIn("active_learning_score", selected.columns)
+        self.assertAlmostEqual(normalized_entropy(np.array([[0.5, 0.5]]))[0], 1.0)
+
     def test_reply_supervision_does_not_use_customer_keyword(self):
         frame = pd.DataFrame([{
             "inbound_id": "1",
@@ -49,6 +76,36 @@ class TestPipelineComponents(unittest.TestCase):
         labeled = build_reply_supervision(frame)
         self.assertEqual(labeled.iloc[0]["intent_label"], "ORDER_TRACKING_AND_DELAY")
         self.assertFalse(bool(labeled.iloc[0]["escalate_label"]))
+
+    def test_probabilistic_weak_labels_keep_consensus_and_abstain_without_evidence(self):
+        frame = pd.DataFrame([
+            {
+                "inbound_id": "1", "customer_text": "Where is my late package?",
+                "reply_text": "What does tracking show?",
+            },
+            {
+                "inbound_id": "2", "customer_text": "Please help",
+                "reply_text": "We're here to help.",
+            },
+        ])
+        labeled = build_reply_supervision(frame)
+        result = aggregate_intent_weak_labels(
+            labeled,
+            [
+                "ORDER_TRACKING_AND_DELAY", "REFUND_AND_RETURN", "DAMAGED_OR_WRONG_ITEM",
+                "ACCOUNT_AND_SECURITY", "PRODUCT_AND_TECHNICAL", "FEEDBACK_AND_GENERAL",
+            ],
+            minimum_confidence=0.0,
+        )
+        self.assertEqual(result.labels[0], "ORDER_TRACKING_AND_DELAY")
+        self.assertIsNone(result.labels[1])
+        self.assertGreaterEqual(result.vote_counts[0], 2)
+
+    def test_label_model_returns_normalized_probabilities(self):
+        matrix = np.array([[0, 0, -1], [1, 1, 1], [0, -1, 0], [1, 1, -1]])
+        probabilities = DawidSkeneLabelModel(["A", "B"]).fit_predict_proba(matrix)
+        np.testing.assert_allclose(probabilities.sum(axis=1), 1.0)
+        self.assertEqual(np.argmax(probabilities, axis=1).tolist(), [0, 1, 0, 1])
 
     def test_generic_contact_us_is_not_a_human_transfer_label(self):
         frame = pd.DataFrame([{
@@ -89,6 +146,24 @@ class TestPipelineComponents(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_reply_supervision(frame, reviewed)
 
+    def test_reviewed_reason_and_act_override_are_validated(self):
+        frame = pd.DataFrame([{
+            "inbound_id": "1", "customer_text": "Help", "reply_text": "Contact us"
+        }])
+        reviewed = pd.DataFrame([{
+            "inbound_id": "1",
+            "reviewed_intent": "ACCOUNT_AND_SECURITY",
+            "reviewed_escalate": True,
+            "reviewed_reason_code": "ACCOUNT_SECURITY_OR_LOCKOUT",
+            "reviewed_resolution_act": "DM_WITH_ORDER_ID",
+        }])
+        labeled = build_reply_supervision(frame, reviewed)
+        self.assertEqual(labeled.iloc[0]["reason_label"], "ACCOUNT_SECURITY_OR_LOCKOUT")
+        self.assertEqual(labeled.iloc[0]["resolution_act"], "DM_WITH_ORDER_ID")
+        reviewed.loc[0, "reviewed_resolution_act"] = "INVENTED_ACT"
+        with self.assertRaises(ValueError):
+            build_reply_supervision(frame, reviewed)
+
     def test_resolution_act_and_pii_stripping(self):
         self.assertEqual(infer_resolution_act("Please DM us so we can help. ^AB"), "DM_WITH_ORDER_ID")
         cleaned = strip_agent_pii("@person Email test@example.com and order 123-1234567-1234567. ^AB")
@@ -107,6 +182,15 @@ class TestPipelineComponents(unittest.TestCase):
         predicted = np.array([0.9, 0.7, 0.6, 0.1]) >= threshold
         self.assertEqual(int(predicted[:2].sum()), 2)
 
+    def test_exact_recall_bound_and_insufficient_sample_are_explicit(self):
+        self.assertAlmostEqual(one_sided_binomial_lower_bound(98, 110), 0.8292467, places=6)
+        selection = select_recall_constrained_threshold(
+            [True, True, False, False], [0.9, 0.7, 0.6, 0.1], target_recall=0.85
+        )
+        self.assertEqual(selection.threshold, 0.0)
+        self.assertFalse(selection.target_met)
+        self.assertEqual(selection.positive_count, 2)
+
     def test_precision_threshold_hits_floor(self):
         threshold = select_precision_threshold(
             [True, True, False, False], [0.9, 0.7, 0.6, 0.1], 1.0
@@ -121,6 +205,16 @@ class TestPipelineComponents(unittest.TestCase):
         )
         self.assertTrue(decision.should_escalate)
         self.assertIn("HARD_GATE", decision.triggers[0])
+
+    def test_reviewed_reason_can_replace_intent_mapping_on_learned_route(self):
+        decision = SafetyGatedEscalator(learned_threshold=0.5).evaluate(
+            "Please investigate this unusual case",
+            "FEEDBACK_AND_GENERAL",
+            learned_risk_score=0.9,
+            predicted_reason="SPECIALIST_POLICY_REVIEW",
+        )
+        self.assertTrue(decision.should_escalate)
+        self.assertEqual(decision.stated_reason, "SPECIALIST_POLICY_REVIEW")
 
     def test_delivery_dispute_and_severe_damage_are_policy_gated(self):
         escalator = SafetyGatedEscalator(learned_threshold=0.8)

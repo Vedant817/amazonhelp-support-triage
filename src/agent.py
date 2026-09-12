@@ -33,6 +33,7 @@ class AmazonSupportAgent:
         started = time.time()
         classification = self.model.predict_with_confidence(customer_tweet)
         learned = self.model.predict_escalation(customer_tweet, classification["embedding"])
+        reason_prediction = self.model.predict_reason(customer_tweet, classification["embedding"])
         exemplars = self.retriever.retrieve_similar(
             customer_tweet, intent_filter=classification["intent"], top_k=3
         )
@@ -45,6 +46,7 @@ class AmazonSupportAgent:
             learned_threshold=learned["threshold"],
             high_precision_threshold=self.model.high_precision_escalation_threshold_,
             resolution_act=evidence_act,
+            predicted_reason=(reason_prediction or {}).get("reason"),
         )
         act = self.generator.select_act(exemplars, classification["intent"], decision.should_escalate)
         raw_reply = self.generator.generate(

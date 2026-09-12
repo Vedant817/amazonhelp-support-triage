@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import argparse
 import sys
 from pathlib import Path
 
@@ -116,10 +117,14 @@ SCENARIOS = [
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--contrastive-pairs", type=int, default=0)
+    args = parser.parse_args()
     artifacts = build_learned_pipeline(
         str(ROOT / "data/processed/amazonhelp_english_pairs.csv"),
         str(ROOT / "data/golden/golden_eval_set.csv"),
         reviewed_csv=str(ROOT / "data/training/labels_for_human_review.csv"),
+        contrastive_pairs=args.contrastive_pairs,
     )
     agent = AmazonSupportAgent(artifacts.model, artifacts.retriever)
     rows = []

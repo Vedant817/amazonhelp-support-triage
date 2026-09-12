@@ -115,6 +115,7 @@ def run(args: argparse.Namespace) -> None:
         reviewed_csv=args.reviewed_labels,
         intent_cap_per_class=args.intent_cap_per_class,
         retrieval_size=args.retrieval_size,
+        contrastive_pairs=args.contrastive_pairs,
     )
     model = artifacts.model
     supervision = artifacts.supervision
@@ -185,6 +186,7 @@ def run(args: argparse.Namespace) -> None:
         started = time.time()
         classification = model.predict_with_confidence(text)
         learned = model.predict_escalation(text, classification["embedding"])
+        reason_prediction = model.predict_reason(text, classification["embedding"])
         exemplars = artifacts.retriever.retrieve_similar(
             text, intent_filter=classification["intent"], top_k=3
         )
@@ -197,6 +199,7 @@ def run(args: argparse.Namespace) -> None:
             learned["threshold"],
             model.high_precision_escalation_threshold_,
             evidence_act,
+            (reason_prediction or {}).get("reason"),
         )
         act = generator.select_act(exemplars, classification["intent"], decision.should_escalate)
         raw = generator.generate(text, classification["intent"], exemplars, decision.to_dict())
@@ -217,12 +220,18 @@ def run(args: argparse.Namespace) -> None:
             "gold_size": len(gold),
             "gold_label_audit": "data/golden/LABEL_AUDIT.md",
             "gold_ids_excluded_from_training_and_retrieval": True,
-            "supervision": "reply-side weak labels plus optional human-reviewed overrides",
+            "supervision": (
+                "reply-side weak labels plus conservative probabilistic abstention filling "
+                "and optional human-reviewed overrides"
+            ),
             "human_reviewed_label_count": int((supervision["intent_label_source"] == "human_reviewed").sum()),
             "intent_train_size": artifacts.intent_train_size,
             "intent_calibration_size": artifacts.intent_calibration_size,
             "weak_intent_labels_pruned": model.intent_pruned_count_,
+            "probabilistic_intent_label_count": artifacts.probabilistic_intent_label_count,
             "classification_features": "MiniLM + word TF-IDF + character TF-IDF",
+            "contrastive_training_pairs": model.encoder.contrastive_pairs_seen_,
+            "human_reason_training_count": model.reason_training_count_,
             "escalation_train_size": artifacts.escalation_train_size,
             "escalation_calibration_size": artifacts.escalation_calibration_size,
             "generation_mode": args.generation_mode,
@@ -255,6 +264,17 @@ def run(args: argparse.Namespace) -> None:
             "selection_target_recall": model.target_escalation_recall,
             "high_risk_selection_target_precision": model.target_high_risk_precision,
             "selection_source": "reply-labeled holdout; no gold labels",
+            "calibration_observed_recall": round(
+                model.escalation_threshold_selection_.observed_recall, 6
+            ),
+            "calibration_recall_lower_bound": round(
+                model.escalation_threshold_selection_.recall_lower_bound, 6
+            ),
+            "calibration_confidence_level": round(
+                model.escalation_threshold_selection_.confidence_level, 6
+            ),
+            "calibration_positive_count": model.escalation_threshold_selection_.positive_count,
+            "recall_bound_target_met": model.escalation_threshold_selection_.target_met,
             "gold_cost_curve_diagnostic": evaluator.optimize_cost_threshold(
                 gold["gold_escalate"].astype(bool).tolist(), risk_scores, 1.0, 10.0
             ),
@@ -351,6 +371,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--intent-cap-per-class", type=int, default=1200)
     parser.add_argument("--retrieval-size", type=int, default=8000)
     parser.add_argument("--bootstrap-iterations", type=int, default=2000)
+    parser.add_argument(
+        "--contrastive-pairs", type=int, default=0,
+        help="Experimental local contrastive ablation; disabled by default until reviewed labels exist",
+    )
     return parser.parse_args()
 
 

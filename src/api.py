@@ -49,6 +49,7 @@ async def lifespan(app: FastAPI):
         reviewed_csv="data/training/labels_for_human_review.csv",
         intent_cap_per_class=int(os.getenv("SUPPORT_INTENT_CAP_PER_CLASS", "1200")),
         retrieval_size=int(os.getenv("SUPPORT_RETRIEVAL_SIZE", "8000")),
+        contrastive_pairs=int(os.getenv("SUPPORT_CONTRASTIVE_PAIRS", "0")),
     )
     generation_mode = os.getenv("SUPPORT_GENERATION_MODE", "offline").lower()
     pipeline_state.update(
@@ -59,6 +60,7 @@ async def lifespan(app: FastAPI):
         guard=ProductionPolicyGuard(),
         session_tracker=CustomerSessionTracker(),
         corpus_size=len(artifacts.retriever.records),
+        probabilistic_intent_label_count=artifacts.probabilistic_intent_label_count,
         generation_mode=generation_mode,
     )
     yield
@@ -89,12 +91,13 @@ def serve_dashboard():
 @app.get("/api/v1/health", response_model=HealthResponse)
 def health():
     model = pipeline_state["model"]
+    threshold_selection = model.escalation_threshold_selection_
     encoder_device = getattr(getattr(model.encoder, "_model", None), "device", None)
     generation_mode = pipeline_state["generation_mode"]
     return HealthResponse(
         status="healthy",
         brand="@AmazonHelp",
-        model_version="2.1.0-noise-aware-hybrid-dual-head",
+        model_version="2.2.0-probabilistic-local-dual-head",
         corpus_size=pipeline_state["corpus_size"],
         intent_temperature=round(model.intent_temperature.temperature_, 4),
         escalation_temperature=round(model.escalation_temperature.temperature_, 4),
@@ -102,13 +105,24 @@ def health():
         high_precision_escalation_threshold=round(model.high_precision_escalation_threshold_, 4),
         intent_confidence_threshold=round(model.intent_confidence_threshold, 4),
         target_escalation_recall=round(model.target_escalation_recall, 4),
+        escalation_calibration_recall=round(threshold_selection.observed_recall, 4),
+        escalation_recall_lower_bound=round(threshold_selection.recall_lower_bound, 4),
+        escalation_recall_bound_target_met=threshold_selection.target_met,
+        escalation_calibration_positive_count=threshold_selection.positive_count,
         generation_mode=generation_mode,
         generation_backend=QWEN_MODEL_ID if generation_mode == "local" else "act-conditioned deterministic rewrite",
         generation_model_revision=QWEN_REVISION if generation_mode == "local" else None,
         intent_encoder=model.encoder.model_name,
         intent_encoder_revision=model.encoder.revision,
-        classification_features="MiniLM + word TF-IDF + character TF-IDF",
+        classification_features=(
+            "contrastive MiniLM + word TF-IDF + character TF-IDF"
+            if model.encoder.contrastive_pairs_seen_ else
+            "MiniLM + word TF-IDF + character TF-IDF"
+        ),
         weak_intent_labels_pruned=model.intent_pruned_count_,
+        probabilistic_intent_label_count=pipeline_state["probabilistic_intent_label_count"],
+        contrastive_training_pairs=model.encoder.contrastive_pairs_seen_,
+        human_reason_training_count=model.reason_training_count_,
         retrieval_method="BM25 + MiniLM reciprocal-rank fusion",
         inference_device=str(encoder_device or model.encoder.device or "cpu"),
         hosted_api_required=False,
@@ -139,6 +153,7 @@ def triage(req: TriageRequest):
 
     stage_started = time.perf_counter()
     learned_escalation = model.predict_escalation(req.text, classification["embedding"])
+    reason_prediction = model.predict_reason(req.text, classification["embedding"])
     risk_scoring_ms = (time.perf_counter() - stage_started) * 1000.0
 
     stage_started = time.perf_counter()
@@ -159,6 +174,7 @@ def triage(req: TriageRequest):
         learned_threshold=learned_escalation["threshold"],
         high_precision_threshold=model.high_precision_escalation_threshold_,
         resolution_act=evidence_act,
+        predicted_reason=(reason_prediction or {}).get("reason"),
     )
 
     session = None
@@ -227,8 +243,15 @@ def triage(req: TriageRequest):
             duration_ms=round(classification_ms, 2),
             details={
                 "encoder": model.encoder.model_name,
-                "features": "MiniLM + word/character TF-IDF",
+                "features": (
+                    "contrastive MiniLM + word/character TF-IDF"
+                    if model.encoder.contrastive_pairs_seen_ else
+                    "MiniLM + word/character TF-IDF"
+                ),
+                "supervision": "probabilistic weak-label aggregation + reviewed overrides",
+                "human_reason_training_count": model.reason_training_count_,
                 "weak_labels_pruned": model.intent_pruned_count_,
+                "contrastive_training_pairs": model.encoder.contrastive_pairs_seen_,
                 "predicted_intent": classification["intent"],
                 "confidence": round(classification["confidence"], 4),
                 "confidence_threshold": round(model.intent_confidence_threshold, 4),

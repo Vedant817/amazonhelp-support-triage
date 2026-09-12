@@ -1,0 +1,145 @@
+"""Probabilistic aggregation of abstaining intent labeling functions."""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from typing import Optional, Sequence
+
+import numpy as np
+import pandas as pd
+from scipy.special import logsumexp
+
+
+ABSTAIN = -1
+
+
+@dataclass
+class WeakLabelResult:
+    probabilities: np.ndarray
+    labels: list[Optional[str]]
+    confidences: np.ndarray
+    vote_counts: np.ndarray
+
+
+class DawidSkeneLabelModel:
+    """Small multiclass EM label model with abstaining labeling functions."""
+
+    def __init__(self, class_names: Sequence[str], smoothing: float = 1.0, max_iter: int = 100):
+        self.class_names = list(class_names)
+        self.smoothing = float(smoothing)
+        self.max_iter = int(max_iter)
+        self.class_prior_: Optional[np.ndarray] = None
+        self.confusions_: Optional[np.ndarray] = None
+
+    def fit_predict_proba(self, label_matrix: np.ndarray) -> np.ndarray:
+        labels = np.asarray(label_matrix, dtype=int)
+        if labels.ndim != 2 or labels.shape[1] < 2:
+            raise ValueError("label_matrix must contain at least two labeling functions")
+        n, m = labels.shape
+        k = len(self.class_names)
+        if np.any((labels < ABSTAIN) | (labels >= k)):
+            raise ValueError("label_matrix contains an invalid class index")
+
+        # Majority-vote initialization anchors latent components to class names.
+        posterior = np.ones((n, k), dtype=float)
+        for class_index in range(k):
+            posterior[:, class_index] += np.sum(labels == class_index, axis=1)
+        posterior /= posterior.sum(axis=1, keepdims=True)
+
+        previous = posterior
+        for _ in range(self.max_iter):
+            prior = (previous.sum(axis=0) + self.smoothing) / (n + self.smoothing * k)
+            confusion = np.empty((m, k, k), dtype=float)
+            for source in range(m):
+                observed = labels[:, source]
+                for true_class in range(k):
+                    weighted = np.array([
+                        previous[observed == emitted, true_class].sum()
+                        for emitted in range(k)
+                    ]) + self.smoothing
+                    confusion[source, true_class] = weighted / weighted.sum()
+
+            log_posterior = np.tile(np.log(prior), (n, 1))
+            for source in range(m):
+                observed = labels[:, source]
+                present = observed != ABSTAIN
+                if not present.any():
+                    continue
+                for true_class in range(k):
+                    log_posterior[present, true_class] += np.log(
+                        confusion[source, true_class, observed[present]]
+                    )
+            log_posterior -= logsumexp(log_posterior, axis=1, keepdims=True)
+            posterior = np.exp(log_posterior)
+            if np.max(np.abs(posterior - previous)) < 1e-6:
+                break
+            previous = posterior
+
+        self.class_prior_ = prior
+        self.confusions_ = confusion
+        return posterior
+
+
+def _customer_issue_label(text: str) -> Optional[str]:
+    value = str(text or "").lower()
+    patterns = (
+        ("ACCOUNT_AND_SECURITY", r"\b(?:hacked|phishing|password|login|log in|sign in|otp|2fa|verification code|account locked)\b"),
+        ("DAMAGED_OR_WRONG_ITEM", r"\b(?:damaged|broken|defective|wrong item|empty box|missing (?:piece|part|contents))\b"),
+        ("REFUND_AND_RETURN", r"\b(?:refund|return|money back|charged twice|double charged|overcharged)\b"),
+        ("ORDER_TRACKING_AND_DELAY", r"\b(?:tracking|delivery|delivered|shipment|shipping|carrier|courier|package|late|not arrived)\b"),
+        ("PRODUCT_AND_TECHNICAL", r"\b(?:kindle|fire tv|firestick|alexa|echo|prime video|device|bluetooth|wi-?fi|app|website)\b"),
+    )
+    matches = [label for label, pattern in patterns if re.search(pattern, value)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _customer_request_label(text: str) -> Optional[str]:
+    value = str(text or "").lower()
+    if re.search(r"\b(?:how|where)\b.{0,30}\b(?:return|refund|money back)\b", value):
+        return "REFUND_AND_RETURN"
+    if re.search(r"\b(?:where|track|when)\b.{0,35}\b(?:order|package|delivery|arrive)\b", value):
+        return "ORDER_TRACKING_AND_DELAY"
+    if re.search(r"\b(?:thank|love|great|excellent|wonderful|amazing)\b", value) and not re.search(
+        r"\b(?:late|broken|wrong|refund|hacked|terrible|worst)\b", value
+    ):
+        return "FEEDBACK_AND_GENERAL"
+    return None
+
+
+def aggregate_intent_weak_labels(
+    frame: pd.DataFrame,
+    class_names: Sequence[str],
+    minimum_confidence: float = 0.58,
+) -> WeakLabelResult:
+    """Aggregate reply, resolution-act, and customer-side weak sources."""
+    classes = list(class_names)
+    class_index = {label: index for index, label in enumerate(classes)}
+    act_map = {
+        "ASK_TRACKING_STATUS": "ORDER_TRACKING_AND_DELAY",
+        "ASK_CARRIER": "ORDER_TRACKING_AND_DELAY",
+        "LINK_ORDERS": "ORDER_TRACKING_AND_DELAY",
+        "APOLOGIZE_WAIT": "ORDER_TRACKING_AND_DELAY",
+        "LINK_RETURNS": "REFUND_AND_RETURN",
+        "TROUBLESHOOT_DEVICE": "PRODUCT_AND_TECHNICAL",
+    }
+    sources = []
+    for _, row in frame.iterrows():
+        emitted = [
+            row.get("intent_label"),
+            act_map.get(str(row.get("resolution_act", ""))),
+            _customer_issue_label(row.get("customer_text", "")),
+            _customer_request_label(row.get("customer_text", "")),
+        ]
+        sources.append([class_index.get(label, ABSTAIN) for label in emitted])
+    matrix = np.asarray(sources, dtype=int)
+    probabilities = DawidSkeneLabelModel(classes).fit_predict_proba(matrix)
+    best = np.argmax(probabilities, axis=1)
+    confidence = probabilities[np.arange(len(frame)), best]
+    votes = np.sum(matrix != ABSTAIN, axis=1)
+    labels = [
+        classes[index] if votes[row] > 0 and confidence[row] >= minimum_confidence else None
+        for row, index in enumerate(best)
+    ]
+    return WeakLabelResult(probabilities, labels, confidence, votes)
+

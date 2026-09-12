@@ -70,7 +70,12 @@ def run_stress():
         sys.exit(ret)
 
 
-def run_benchmark(generation_mode: str = "offline", judge_local: bool = False, include_zero_shot_local: bool = False):
+def run_benchmark(
+    generation_mode: str = "offline",
+    judge_local: bool = False,
+    include_zero_shot_local: bool = False,
+    contrastive_pairs: int = 0,
+):
     """Run the uncontaminated 200 Golden Evaluation Set benchmark."""
     print("\n" + "=" * 80)
     print("      Running 200 Golden Set Benchmark Reproduction")
@@ -81,6 +86,8 @@ def run_benchmark(generation_mode: str = "offline", judge_local: bool = False, i
         command.append("--judge-local")
     if include_zero_shot_local:
         command.append("--include-zero-shot-local")
+    if contrastive_pairs:
+        command.extend(["--contrastive-pairs", str(contrastive_pairs)])
     ret = subprocess.call(command)
     if ret != 0:
         print("\n[ERROR] Benchmark failed!")
@@ -120,6 +127,10 @@ Examples:
     parser.add_argument("--generation-mode", choices=["offline", "local"], default=None)
     parser.add_argument("--judge-local", action="store_true", help="Run the pinned local-model reply judge")
     parser.add_argument("--include-zero-shot-local", action="store_true", help="Add the local Qwen zero-shot baseline")
+    parser.add_argument(
+        "--contrastive-pairs", type=int, default=0,
+        help="Experimental local contrastive intent-pair ablation",
+    )
 
     args = parser.parse_args()
 
@@ -135,7 +146,12 @@ Examples:
     elif args.command == "stress":
         run_stress()
     elif args.command == "benchmark":
-        run_benchmark(args.generation_mode or "offline", args.judge_local, args.include_zero_shot_local)
+        run_benchmark(
+            args.generation_mode or "offline",
+            args.judge_local,
+            args.include_zero_shot_local,
+            args.contrastive_pairs,
+        )
 
 
 if __name__ == "__main__":

@@ -124,6 +124,7 @@ class SafetyGatedEscalator:
         learned_threshold: Optional[float] = None,
         high_precision_threshold: Optional[float] = None,
         resolution_act: Optional[str] = None,
+        predicted_reason: Optional[str] = None,
     ) -> EscalationDecision:
         hard = self.hard_gate(text)
         if hard:
@@ -151,14 +152,14 @@ class SafetyGatedEscalator:
         if high_precision_threshold is not None and learned_risk_score >= high_precision_threshold:
             return EscalationDecision(
                 True,
-                ESCALATE_REASON_BY_INTENT.get(intent, "HIGH_HOSTILITY_OR_LEGAL_RISK"),
+                predicted_reason or ESCALATE_REASON_BY_INTENT.get(intent, "HIGH_HOSTILITY_OR_LEGAL_RISK"),
                 float(learned_risk_score),
                 ["HIGH_CONFIDENCE_ESCALATION_HEAD"],
             )
         if learned_risk_score >= threshold:
             return EscalationDecision(
                 True,
-                ESCALATE_REASON_BY_INTENT.get(intent, "HIGH_HOSTILITY_OR_LEGAL_RISK"),
+                predicted_reason or ESCALATE_REASON_BY_INTENT.get(intent, "HIGH_HOSTILITY_OR_LEGAL_RISK"),
                 float(learned_risk_score),
                 ["LEARNED_ESCALATION_HEAD"],
             )

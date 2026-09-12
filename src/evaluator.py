@@ -15,6 +15,7 @@ from sklearn.metrics import (
     confusion_matrix,
     classification_report
 )
+from scipy.stats import beta
 
 class SupportPipelineEvaluator:
     """
@@ -61,6 +62,14 @@ class SupportPipelineEvaluator:
 
         reason_matches = sum(str(tr) == str(pr) for tr, pr in zip(true_reasons, pred_reasons))
         reason_exact_match = round(reason_matches / max(len(true_reasons), 1), 4)
+        positives = int(np.sum(np.asarray(y_true_esc, dtype=bool)))
+        true_positives = int(np.sum(
+            np.asarray(y_true_esc, dtype=bool) & np.asarray(y_pred_esc, dtype=bool)
+        ))
+        recall_lower = (
+            float(beta.ppf(0.05, true_positives, positives - true_positives + 1))
+            if true_positives > 0 else 0.0
+        )
 
         return {
             "accuracy": round(float(acc), 4),
@@ -68,6 +77,9 @@ class SupportPipelineEvaluator:
             "escalate_f1": round(float(f1_esc), 4),
             "escalate_precision": round(float(p_esc), 4),
             "escalate_recall": round(float(r_esc), 4),
+            "escalate_recall_one_sided_95_lower": round(recall_lower, 4),
+            "escalate_positive_count": positives,
+            "auto_handle_rate": round(float(np.mean(~np.asarray(y_pred_esc, dtype=bool))), 4),
             "auto_handle_f1": round(float(f1_auto), 4),
             "auto_handle_precision": round(float(p_auto), 4),
             "auto_handle_recall": round(float(r_auto), 4),

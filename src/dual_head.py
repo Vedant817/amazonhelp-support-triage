@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import math
+import hashlib
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
 from scipy.optimize import minimize_scalar
+from scipy.stats import beta
 from scipy.sparse import csr_matrix, hstack
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
@@ -81,6 +85,7 @@ class MiniLMEncoder:
         self.revision = revision
         self.device = device
         self._model = None
+        self.contrastive_pairs_seen_ = 0
 
     def _load(self):
         if self._model is None:
@@ -107,15 +112,135 @@ class MiniLMEncoder:
             dtype=np.float32,
         )
 
+    def fine_tune_contrastive(
+        self,
+        texts: Sequence[str],
+        labels: Sequence[str],
+        pair_count: int = 1200,
+        batch_size: int = 32,
+        epochs: int = 1,
+        seed: int = 42,
+        output_path: Optional[str] = None,
+    ) -> "MiniLMEncoder":
+        """Fine-tune locally on balanced positive/negative intent pairs."""
+        if pair_count <= 0:
+            return self
+        values = np.asarray([str(text) for text in texts], dtype=object)
+        targets = np.asarray([str(label) for label in labels], dtype=object)
+        fingerprint = hashlib.sha256()
+        fingerprint.update(f"{self.model_name}:{self.revision}:{pair_count}:{seed}".encode())
+        for text, label in zip(values, targets):
+            fingerprint.update(str(label).encode("utf-8"))
+            fingerprint.update(b"\0")
+            fingerprint.update(str(text).encode("utf-8"))
+            fingerprint.update(b"\n")
+        expected_fingerprint = fingerprint.hexdigest()
+        cache_path = Path(output_path) if output_path else None
+        metadata_path = cache_path / "support_training_metadata.json" if cache_path else None
+        if metadata_path and metadata_path.exists():
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if metadata.get("training_fingerprint") == expected_fingerprint:
+                from sentence_transformers import SentenceTransformer
 
-def select_recall_threshold(
+                self._model = SentenceTransformer(
+                    str(cache_path), device=self.device, trust_remote_code=False
+                )
+                self.contrastive_pairs_seen_ = int(metadata["contrastive_pairs"])
+                return self
+
+        import torch
+        from torch.utils.data import DataLoader
+        from sentence_transformers import InputExample, losses
+
+        groups = {label: np.flatnonzero(targets == label) for label in np.unique(targets)}
+        groups = {label: indices for label, indices in groups.items() if len(indices) >= 2}
+        if len(groups) < 2:
+            raise ValueError("Contrastive fine-tuning needs at least two classes with two examples each")
+        rng = np.random.default_rng(seed)
+        class_names = sorted(groups)
+        examples = []
+        for index in range(pair_count):
+            anchor_class = class_names[index % len(class_names)]
+            anchor, positive = rng.choice(groups[anchor_class], size=2, replace=False)
+            if index % 2 == 0:
+                examples.append(InputExample(texts=[values[anchor], values[positive]], label=1.0))
+            else:
+                negative_class = rng.choice([label for label in class_names if label != anchor_class])
+                negative = int(rng.choice(groups[negative_class]))
+                examples.append(InputExample(texts=[values[anchor], values[negative]], label=0.0))
+
+        model = self._load()
+        torch.manual_seed(seed)
+        generator = torch.Generator().manual_seed(seed)
+        loader = DataLoader(
+            examples, shuffle=True, batch_size=batch_size, generator=generator
+        )
+        objective = losses.ContrastiveLoss(model=model, margin=0.5)
+        steps = max(1, math.ceil(len(examples) / batch_size) * epochs)
+        model.fit(
+            train_objectives=[(loader, objective)],
+            epochs=epochs,
+            warmup_steps=max(1, steps // 10),
+            optimizer_params={"lr": 2e-5},
+            show_progress_bar=False,
+        )
+        self.contrastive_pairs_seen_ = len(examples)
+        if cache_path:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(str(cache_path))
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "base_model": self.model_name,
+                        "base_revision": self.revision,
+                        "contrastive_pairs": len(examples),
+                        "training_fingerprint": expected_fingerprint,
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        return self
+
+
+@dataclass(frozen=True)
+class RecallThresholdSelection:
+    threshold: float
+    observed_recall: float
+    recall_lower_bound: float
+    positive_count: int
+    true_positive_count: int
+    target_recall: float
+    confidence_level: float
+    target_met: bool
+
+
+def one_sided_binomial_lower_bound(
+    successes: int,
+    trials: int,
+    confidence_level: float = 0.95,
+) -> float:
+    """Exact Clopper-Pearson lower confidence bound for a binomial rate."""
+    if trials <= 0 or successes < 0 or successes > trials:
+        raise ValueError("successes and trials must satisfy 0 <= successes <= trials")
+    if not 0.0 < confidence_level < 1.0:
+        raise ValueError("confidence_level must be between zero and one")
+    if successes == 0:
+        return 0.0
+    return float(beta.ppf(1.0 - confidence_level, successes, trials - successes + 1))
+
+
+def select_recall_constrained_threshold(
     labels: Sequence[bool],
     probabilities: Sequence[float],
     target_recall: float = 0.85,
-) -> float:
-    """Choose the highest threshold that achieves the target positive-class recall."""
+    confidence_level: float = 0.95,
+) -> RecallThresholdSelection:
+    """Maximize precision while the exact recall lower bound meets its target."""
     labels_arr = np.asarray(labels, dtype=bool)
     probs_arr = np.asarray(probabilities, dtype=float)
+    if labels_arr.shape != probs_arr.shape or labels_arr.ndim != 1:
+        raise ValueError("Escalation labels and probabilities must be aligned vectors")
     positives = int(labels_arr.sum())
     if positives == 0:
         raise ValueError("Escalation calibration requires at least one positive example")
@@ -127,11 +252,45 @@ def select_recall_threshold(
         fp = int(np.sum(predicted & ~labels_arr))
         recall = tp / positives
         precision = tp / max(tp + fp, 1)
-        if recall >= target_recall:
-            valid.append((float(threshold), precision, recall))
-    if not valid:
-        return 0.0
-    return max(valid, key=lambda item: (item[1], item[0]))[0]
+        lower = one_sided_binomial_lower_bound(tp, positives, confidence_level)
+        if lower >= target_recall:
+            valid.append((float(threshold), precision, recall, lower, tp))
+    if valid:
+        threshold, _, recall, lower, tp = max(valid, key=lambda item: (item[1], item[0]))
+        return RecallThresholdSelection(
+            threshold=threshold,
+            observed_recall=recall,
+            recall_lower_bound=lower,
+            positive_count=positives,
+            true_positive_count=tp,
+            target_recall=target_recall,
+            confidence_level=confidence_level,
+            target_met=True,
+        )
+
+    # A zero threshold predicts every finite score positive. If even its exact
+    # bound misses the target, the calibration sample is too small to certify it.
+    tp = positives
+    lower = one_sided_binomial_lower_bound(tp, positives, confidence_level)
+    return RecallThresholdSelection(
+        threshold=0.0,
+        observed_recall=1.0,
+        recall_lower_bound=lower,
+        positive_count=positives,
+        true_positive_count=tp,
+        target_recall=target_recall,
+        confidence_level=confidence_level,
+        target_met=lower >= target_recall,
+    )
+
+
+def select_recall_threshold(
+    labels: Sequence[bool],
+    probabilities: Sequence[float],
+    target_recall: float = 0.85,
+) -> float:
+    """Compatibility wrapper returning the statistically constrained threshold."""
+    return select_recall_constrained_threshold(labels, probabilities, target_recall).threshold
 
 
 def select_precision_threshold(
@@ -169,12 +328,16 @@ class DualHeadSupportModel:
         target_escalation_recall: float = 0.85,
         target_high_risk_precision: float = 0.80,
         intent_noise_prune_fraction: float = 0.05,
+        contrastive_pair_count: int = 0,
+        contrastive_output_path: Optional[str] = None,
     ) -> None:
         self.encoder = encoder or MiniLMEncoder()
         self.intent_confidence_threshold = intent_confidence_threshold
         self.target_escalation_recall = target_escalation_recall
         self.target_high_risk_precision = target_high_risk_precision
         self.intent_noise_prune_fraction = intent_noise_prune_fraction
+        self.contrastive_pair_count = int(contrastive_pair_count)
+        self.contrastive_output_path = contrastive_output_path
         self.intent_vectorizer = self._make_vectorizer()
         self.escalation_vectorizer = self._make_vectorizer()
         self.intent_head = OneVsRestClassifier(
@@ -194,9 +357,13 @@ class DualHeadSupportModel:
         self.intent_temperature = TemperatureScaler()
         self.escalation_temperature = TemperatureScaler()
         self.escalation_threshold_ = 0.5
+        self.escalation_threshold_selection_: Optional[RecallThresholdSelection] = None
         self.high_precision_escalation_threshold_ = 1.0
         self.intent_pruned_count_ = 0
         self.classes_: List[str] = []
+        self.reason_head: Optional[LogisticRegression] = None
+        self.reason_classes_: List[str] = []
+        self.reason_training_count_ = 0
 
     @staticmethod
     def _make_vectorizer() -> FeatureUnion:
@@ -254,7 +421,16 @@ class DualHeadSupportModel:
         cal_intent_labels: Sequence[str],
         cal_escalation_texts: Sequence[str],
         cal_escalation_labels: Sequence[bool],
+        reason_texts: Optional[Sequence[str]] = None,
+        reason_labels: Optional[Sequence[str]] = None,
     ) -> "DualHeadSupportModel":
+        if self.contrastive_pair_count > 0:
+            self.encoder.fine_tune_contrastive(
+                intent_texts,
+                intent_labels,
+                pair_count=self.contrastive_pair_count,
+                output_path=self.contrastive_output_path,
+            )
         intent_embeddings = self.encoder.encode(intent_texts)
         escalation_embeddings = self.encoder.encode(escalation_texts)
         intent_keep = self._intent_keep_mask(intent_embeddings, intent_labels)
@@ -290,16 +466,27 @@ class DualHeadSupportModel:
         cal_escalation_probs = _sigmoid(
             cal_escalation_logits / self.escalation_temperature.temperature_
         )
-        self.escalation_threshold_ = select_recall_threshold(
+        self.escalation_threshold_selection_ = select_recall_constrained_threshold(
             cal_escalation_labels,
             cal_escalation_probs,
             self.target_escalation_recall,
         )
+        self.escalation_threshold_ = self.escalation_threshold_selection_.threshold
         self.high_precision_escalation_threshold_ = select_precision_threshold(
             cal_escalation_labels,
             cal_escalation_probs,
             self.target_high_risk_precision,
         )
+        if reason_texts and reason_labels and len(set(reason_labels)) >= 2:
+            reason_embeddings = self.encoder.encode(reason_texts)
+            reason_features = self._hybrid_features(
+                self.intent_vectorizer, reason_texts, reason_embeddings
+            )
+            self.reason_head = LogisticRegression(
+                max_iter=2000, class_weight="balanced", random_state=42
+            ).fit(reason_features, reason_labels)
+            self.reason_classes_ = list(self.reason_head.classes_)
+            self.reason_training_count_ = len(reason_labels)
         return self
 
     def predict_with_confidence(self, text: str) -> Dict[str, Any]:
@@ -334,4 +521,22 @@ class DualHeadSupportModel:
             "risk_score": probability,
             "threshold": self.escalation_threshold_,
             "logit": logit,
+        }
+
+    def predict_reason(
+        self, text: str, embedding: Optional[np.ndarray] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Predict a reviewed closed-set escalation reason when a head is available."""
+        if self.reason_head is None:
+            return None
+        dense = (
+            np.asarray(embedding, dtype=np.float32).reshape(1, -1)
+            if embedding is not None else self.encoder.encode([text])
+        )
+        features = self._hybrid_features(self.intent_vectorizer, [text], dense)
+        probabilities = self.reason_head.predict_proba(features)[0]
+        index = int(np.argmax(probabilities))
+        return {
+            "reason": self.reason_classes_[index],
+            "confidence": float(probabilities[index]),
         }

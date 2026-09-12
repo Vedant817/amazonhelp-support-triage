@@ -1,11 +1,10 @@
 {
   "scenario_count": 16,
-  "intent_pass_rate": 0.75,
+  "intent_pass_rate": 0.8125,
   "routing_pass_rate": 0.9375,
   "failed_intents": [
     "legal_delivery_threat",
     "wrong_house",
-    "routine_return",
     "negated_refund"
   ],
   "failed_routes": [

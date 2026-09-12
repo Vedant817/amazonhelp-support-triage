@@ -221,6 +221,8 @@ def run(args: argparse.Namespace) -> None:
             "human_reviewed_label_count": int((supervision["intent_label_source"] == "human_reviewed").sum()),
             "intent_train_size": artifacts.intent_train_size,
             "intent_calibration_size": artifacts.intent_calibration_size,
+            "weak_intent_labels_pruned": model.intent_pruned_count_,
+            "classification_features": "MiniLM + word TF-IDF + character TF-IDF",
             "escalation_train_size": artifacts.escalation_train_size,
             "escalation_calibration_size": artifacts.escalation_calibration_size,
             "generation_mode": args.generation_mode,
@@ -236,6 +238,11 @@ def run(args: argparse.Namespace) -> None:
             "escalation_temperature": round(model.escalation_temperature.temperature_, 6),
             "calibration_source": "reply-labeled holdout; no gold labels",
         },
+        "intent_calibration": evaluator.compute_ece(
+            gold["gold_intent"].tolist(),
+            systems[PROPOSED]["intent_preds"],
+            confidences,
+        ),
         "abstention": {
             "threshold": model.intent_confidence_threshold,
             "coverage_accuracy_curve": evaluator.coverage_accuracy_curve(
@@ -261,6 +268,7 @@ def run(args: argparse.Namespace) -> None:
         "gold_intent": gold["gold_intent"],
         "predicted_intent": systems[PROPOSED]["intent_preds"],
         "confidence": confidences,
+        "escalation_risk_score": risk_scores,
         "gold_escalate": gold["gold_escalate"],
         "predicted_escalate": systems[PROPOSED]["esc_preds"],
         "gold_reason": gold["gold_escalate_reason"],

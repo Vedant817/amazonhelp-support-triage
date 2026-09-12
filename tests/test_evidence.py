@@ -35,6 +35,9 @@ class TestEvidenceArtifacts(unittest.TestCase):
         self.assertEqual(results["run_metadata"]["gold_size"], 200)
         self.assertTrue(results["run_metadata"]["gold_ids_excluded_from_training_and_retrieval"])
         self.assertEqual(len(predictions), 200)
+        self.assertIn("intent_calibration", results)
+        self.assertIn("escalation_risk_score", predictions.columns)
+        self.assertGreater(results["run_metadata"]["weak_intent_labels_pruned"], 0)
         zero_shot_status = results["run_metadata"]["zero_shot_local_baseline"]
         if zero_shot_status == "run":
             self.assertIn("Baseline 3: zero-shot local Qwen", results["systems"])

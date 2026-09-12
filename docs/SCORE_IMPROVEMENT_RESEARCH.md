@@ -1,5 +1,11 @@
 # Research-backed plan to improve triage performance
 
+> Implementation update (2026-09-12): uncertainty/diversity review selection,
+> conservative probabilistic weak-label coverage expansion, exact recall-bound threshold
+> selection, and a local contrastive ablation are implemented. The active batch contains
+> 400 leak-free rows, but still has zero completed human reviews. The default contrastive
+> pair count is zero because the weak-label ablation reduced escalation recall.
+
 ## Executive conclusion
 
 The next improvement should not be another keyword layer or a larger zero-shot
@@ -22,10 +28,10 @@ This remains fully local. It does not require a hosted model or an API key.
 
 ## What the present evidence says
 
-The current saved benchmark reports intent macro-F1 `0.7478`, escalation recall
-`0.8909`, escalation precision `0.5698`, reason exact match `0.47`, and ECE
-`0.0498`. The escalation recall point estimate is encouraging, but its saved
-95% bootstrap interval starts at `0.8285`. It therefore does **not** establish a
+The current saved benchmark reports intent macro-F1 `0.7812`, escalation recall
+`0.9000`, escalation precision `0.5723`, reason exact match `0.47`, and ECE
+`0.0630`. The escalation recall point estimate is encouraging, but its exact
+one-sided 95% lower bound is `0.8399`. It therefore does **not** establish a
 recall guarantee of 0.85.
 
 There are 31,942 leak-free historical customer/reply pairs, but the weak intent

@@ -7,14 +7,16 @@ The current system is:
 
 1. non-vetoable policy gates for public PII, takeover, legal threats, delivery disputes,
    severe damage, financial disputes, and prompt manipulation;
-2. MiniLM semantic features fused with word and character TF-IDF features;
-3. out-of-fold confidence filtering of the noisiest 5% of intent weak labels;
-4. separate intent and escalation heads with holdout temperature scaling;
-5. confidence abstention plus recall-targeted and high-precision escalation thresholds;
-6. BM25 + MiniLM retrieval fused with reciprocal-rank fusion;
-7. a resolution act extracted from historical replies;
-8. either local Qwen rewriting or deterministic act-conditioned offline rewriting;
-9. URL, PII, false-promise, and 280-character guardrails.
+2. reply-side labels plus conservative probabilistic coverage expansion from four
+   abstaining weak sources;
+3. MiniLM semantic features fused with word and character TF-IDF features;
+4. out-of-fold confidence filtering of the noisiest 5% of intent weak labels;
+5. separate intent and escalation heads with holdout temperature scaling;
+6. confidence abstention plus an exact-confidence-bound escalation threshold;
+7. BM25 + MiniLM retrieval fused with reciprocal-rank fusion;
+8. a resolution act extracted from historical replies;
+9. either local Qwen rewriting or deterministic act-conditioned offline rewriting;
+10. URL, PII, false-promise, and 280-character guardrails.
 
 ## Verified status
 
@@ -25,14 +27,19 @@ run in this artifact. On the audited 200-case gold set:
 | System | Intent macro-F1 | Escalate recall | Escalate precision | Reason exact match |
 |---|---:|---:|---:|---:|
 | Majority + always escalate | 0.061 | 1.000 | 0.550 | 0.000 |
-| TF-IDF + keyword escalation + retrieve/replay | 0.673 | 0.309 | 0.630 | 0.000 |
-| Noise-aware hybrid dual-head + gates + retrieve/rewrite | **0.748** | **0.891** | 0.570 | **0.470** |
+| TF-IDF + keyword escalation + retrieve/replay | 0.736 | 0.309 | 0.630 | 0.000 |
+| Probabilistic hybrid dual-head + gates + retrieve/rewrite | **0.781** | **0.900** | 0.572 | **0.470** |
 
 The proposed system's bootstrap 95% intervals are:
 
-- intent macro-F1: 0.683–0.806;
-- escalation recall: 0.829–0.945;
-- escalation precision: 0.500–0.643.
+- intent macro-F1: 0.719–0.839;
+- escalation recall: 0.839–0.953;
+- escalation precision: 0.500–0.645.
+
+The exact one-sided 95% lower bound for gold escalation recall is 0.8399, so the
+gold set still does not certify recall >=0.85. The independent reply-labeled calibration
+split does meet its selection constraint (lower bound 0.8521 over 323 positives), but
+that is historical channel-transfer supervision rather than final policy evidence.
 
 These results are materially safer than the keyword baseline on escalation recall, but
 they do **not** meet the intended intent-quality or escalation-precision targets. There
@@ -57,6 +64,16 @@ python -m venv .venv
 The first learned run downloads the pinned
 `sentence-transformers/all-MiniLM-L6-v2` revision. Model files use the normal Hugging
 Face cache and are not committed.
+
+Regenerate the active-learning review batch only while its review fields are empty:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\prepare_review_labels.py --force
+```
+
+The experimental local contrastive ablation can be reproduced with
+`python main.py benchmark --contrastive-pairs 600`. It is deliberately not the default
+until reviewed training labels exist and it improves intent without reducing routing safety.
 
 The API defaults to deterministic offline generation so it can be reproduced without
 loading a generative model. To use the pinned local Qwen model:
@@ -95,12 +112,15 @@ agreement score. First have reviewers complete the generated
 ## Label and leakage controls
 
 - The gold tweet IDs are removed before supervision and retrieval are built.
-- Intent weak labels are inferred from AmazonHelp's reply, not from the customer's keywords.
+- High-precision intent weak labels are inferred from AmazonHelp's reply. A multiclass
+  EM label model combines reply, resolution-act, and customer-side labeling functions
+  only to fill reply-label abstentions at confidence >=0.75; it never overwrites reply labels.
 - Whether Amazon moved a conversation to DM/phone/chat supplies the escalation weak label.
 - Ambiguous historical replies remain unlabeled.
 - `scripts/audit_gold_labels.py` applies only four documented policy corrections; see
   `data/golden/LABEL_AUDIT.md`.
-- Independent reviewers can override weak labels by filling the prepared 400-row sheet.
+- Independent reviewers can override weak labels and add reason/act labels by filling
+  the 400-row uncertainty-and-diversity review sheet.
 
 ## Evaluation contract
 
@@ -121,8 +141,10 @@ OOD, CRAG, and a keyword-based “LLM judge” are not part of the scored produc
 MiniLM maps text into 384-dimensional vectors suitable for semantic similarity
 ([model card](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)). This
 implementation fuses those frozen embeddings with learned word and character TF-IDF
-features and filters low-confidence weak labels using out-of-fold predictions. It is
-not claimed as SetFit fine-tuning. SetFit remains appropriate after independent labels exist
+features and filters low-confidence weak labels using out-of-fold predictions. A local
+contrastive fine-tuning ablation is available through `--contrastive-pairs`, but is off
+by default: on weak labels it produced only a small intent gain and reduced escalation
+recall. It is not claimed as SetFit. SetFit remains appropriate after independent labels exist
 ([Tunstall et al., 2022](https://arxiv.org/abs/2209.11055)). Temperature scaling follows
 the single-parameter calibration method of
 [Guo et al. (2017)](https://proceedings.mlr.press/v70/guo17a.html).

@@ -1,0 +1,91 @@
+{
+  "top_3": {
+    "recall_at_3": 0.924,
+    "macro_recall_at_3": 0.3042,
+    "mrr_at_3": 0.876,
+    "query_count": 500,
+    "per_act": {
+      "APOLOGIZE_WAIT": {
+        "recall_at_k": 0.2727,
+        "support": 11
+      },
+      "ASK_CARRIER": {
+        "recall_at_k": 0.2857,
+        "support": 7
+      },
+      "ASK_TRACKING_STATUS": {
+        "recall_at_k": 0.3333,
+        "support": 3
+      },
+      "DM_WITH_ORDER_ID": {
+        "recall_at_k": 0.3333,
+        "support": 3
+      },
+      "GENERAL_SUPPORT": {
+        "recall_at_k": 0.9978,
+        "support": 452
+      },
+      "LINK_ORDERS": {
+        "recall_at_k": 0.0,
+        "support": 4
+      },
+      "LINK_RETURNS": {
+        "recall_at_k": 0.0,
+        "support": 1
+      },
+      "TROUBLESHOOT_DEVICE": {
+        "recall_at_k": 0.2105,
+        "support": 19
+      }
+    }
+  },
+  "candidate_pool_12": {
+    "recall_at_12": 0.96,
+    "macro_recall_at_12": 0.7007,
+    "mrr_at_12": 0.8819,
+    "query_count": 500,
+    "per_act": {
+      "APOLOGIZE_WAIT": {
+        "recall_at_k": 0.7273,
+        "support": 11
+      },
+      "ASK_CARRIER": {
+        "recall_at_k": 0.5714,
+        "support": 7
+      },
+      "ASK_TRACKING_STATUS": {
+        "recall_at_k": 1.0,
+        "support": 3
+      },
+      "DM_WITH_ORDER_ID": {
+        "recall_at_k": 0.3333,
+        "support": 3
+      },
+      "GENERAL_SUPPORT": {
+        "recall_at_k": 1.0,
+        "support": 452
+      },
+      "LINK_ORDERS": {
+        "recall_at_k": 0.5,
+        "support": 4
+      },
+      "LINK_RETURNS": {
+        "recall_at_k": 1.0,
+        "support": 1
+      },
+      "TROUBLESHOOT_DEVICE": {
+        "recall_at_k": 0.4737,
+        "support": 19
+      }
+    }
+  },
+  "target_source": "resolution act inferred from the held-out historical AmazonHelp reply",
+  "held_out_before_index_build": true,
+  "gold_ids_excluded": true,
+  "intent_filter": "held-out reply-side weak intent when available; diagnostic upper bound",
+  "index_size": 8000,
+  "majority_act": "GENERAL_SUPPORT",
+  "majority_recall_at_3": 0.904,
+  "model": "sentence-transformers/all-MiniLM-L6-v2",
+  "revision": "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+}

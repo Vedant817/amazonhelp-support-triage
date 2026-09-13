@@ -2,6 +2,11 @@
   "run_metadata": {
     "gold_size": 200,
     "gold_label_audit": "data/golden/LABEL_AUDIT.md",
+    "gold_manifest": "data/golden/MANIFEST.json",
+    "gold_sha256": {
+      "golden_eval_set.csv": "272d9f4e41b7b0180c67fc850cb64fcc99d688bba504e0af426d1b707b4f60b2",
+      "golden_eval_set.jsonl": "413faf51aa26c5e4166c9428e0677740e81b35c51bf432c129cff9f738070483"
+    },
     "gold_ids_excluded_from_training_and_retrieval": true,
     "historical_context_coverage": 0.506316,
     "context_is_causally_prior_only": true,
@@ -15,10 +20,13 @@
     "semantic_blend_weight": 0.0,
     "semantic_blend_calibration_nll_gain": 0.0,
     "intent_selected_c": 1.0,
-    "intent_training_cv_macro_f1": 0.0,
+    "intent_training_cv_macro_f1": null,
     "escalation_selected_c": 0.25,
     "escalation_selected_class_weight": null,
     "escalation_training_cv_average_precision": 0.611819,
+    "escalation_knn_blend_weight": 0.0,
+    "escalation_knn_neighbor_count": 0,
+    "escalation_knn_calibration_ap_gain": 0.0,
     "supervision": "reply-side weak labels plus conservative probabilistic abstention filling and optional human-reviewed overrides",
     "human_reviewed_label_count": 0,
     "intent_train_size": 3900,
@@ -178,7 +186,7 @@
         "twitter_length_compliance": 1.0,
         "no_pii_echo_rate": 1.0
       },
-      "mean_latency_ms": 0.0,
+      "mean_latency_ms": 0.01,
       "invalid_structured_outputs": 0
     },
     "Baseline 2: TF-IDF + keyword escalation + retrieve/replay": {
@@ -324,7 +332,7 @@
         "twitter_length_compliance": 1.0,
         "no_pii_echo_rate": 1.0
       },
-      "mean_latency_ms": 164.85,
+      "mean_latency_ms": 141.45,
       "invalid_structured_outputs": 0
     },
     "Proposed: MiniLM dual-head + safety gates + retrieve/rewrite": {
@@ -470,8 +478,22 @@
         "twitter_length_compliance": 1.0,
         "no_pii_echo_rate": 1.0
       },
-      "mean_latency_ms": 133.62,
+      "mean_latency_ms": 90.3,
       "invalid_structured_outputs": 0
+    }
+  },
+  "paired_significance": {
+    "intent_proposed_vs_tfidf": {
+      "a_correct_b_wrong": 10,
+      "a_wrong_b_correct": 20,
+      "discordant_count": 30,
+      "exact_two_sided_p_value": 0.098737
+    },
+    "escalation_proposed_vs_keyword": {
+      "a_correct_b_wrong": 56,
+      "a_wrong_b_correct": 67,
+      "discordant_count": 123,
+      "exact_two_sided_p_value": 0.367297
     }
   },
   "temperature_scaling": {

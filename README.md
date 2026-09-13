@@ -3,6 +3,10 @@
 This repository implements a local, evidence-first support pipeline over historical
 `@AmazonHelp` conversations. It does not call a hosted model API.
 
+For a requirement-by-requirement reviewer index and five-minute demo path, start with
+[`SUBMISSION.md`](SUBMISSION.md). The complete technical discussion is in
+[`REPORT.md`](REPORT.md).
+
 The current system is:
 
 1. non-vetoable policy gates for public PII, takeover, legal threats, delivery disputes,
@@ -60,12 +64,26 @@ metric. This negative validation is more trustworthy than reporting a flattering
 
 ## Install and run
 
+Prerequisite: Python 3.10 or 3.11. The checked-in dependency versions are pinned in
+`requirements.txt`. Windows PowerShell (the environment used for the saved run):
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe main.py test
 .\.venv\Scripts\python.exe main.py benchmark
 .\.venv\Scripts\python.exe main.py serve
+```
+
+macOS/Linux:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+python main.py test
+python main.py benchmark
+python main.py serve
 ```
 
 The first learned run downloads the pinned

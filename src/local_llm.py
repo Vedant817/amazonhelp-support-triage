@@ -5,8 +5,8 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 
-QWEN_MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
-QWEN_REVISION = "7ae557604adf67be50417f59c2c2f167def9a775"
+QWEN_MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
+QWEN_REVISION = "989aa7980e4cf806f80c7fef2b1adb7bc71aa306"
 
 
 class LocalInstructionModel:

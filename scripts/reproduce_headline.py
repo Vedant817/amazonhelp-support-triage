@@ -25,9 +25,11 @@ sys.path.insert(0, str(ROOT))
 from src.classifier import INTENT_TAXONOMY, MajorityBaselineClassifier, TfidfBaselineClassifier
 from src.escalator import SafetyGatedEscalator, SimpleKeywordEscalationBaseline, TrivialEscalationBaseline
 from src.evaluator import SupportPipelineEvaluator
+from src.evidence_integrity import verify_evaluation_manifest
 from src.generator import ProductionGroundedGenerator, RetrievalReplayBaseline, TrivialReplyBaseline
 from src.guardrails import ProductionPolicyGuard
-from src.llm_judge import ReplyQualityJudge
+from src.llm_judge import JudgeOutputError, ReplyQualityJudge
+from src.review_store import reply_source_hash
 from src.local_llm import LocalInstructionModel
 from src.model_factory import build_learned_pipeline
 from src.zero_shot import ZeroShotLocalBaseline
@@ -92,13 +94,25 @@ def _same_reply_agreement(judge_rows: pd.DataFrame, ratings_path: Path) -> Dict[
     ratings = pd.read_csv(ratings_path)
     fields = ["groundedness", "empathy", "actionability", "safety"]
     human_fields = [f"human_{field}" for field in fields]
-    required = {"reply_id", *human_fields}
+    required = {"reply_id", "source_sha256", *human_fields}
     if required - set(ratings.columns):
         return {"status": "not_available", "reason": "ratings file is missing required columns"}
-    merged = judge_rows.merge(ratings[["reply_id", *human_fields]], on="reply_id", how="inner")
+    merged = judge_rows.merge(
+        ratings[["reply_id", "source_sha256", *human_fields]],
+        on="reply_id", how="inner", suffixes=("_judge", "_human"),
+    )
+    merged = merged[
+        merged["source_sha256_judge"] == merged["source_sha256_human"]
+    ]
     merged = merged.dropna(subset=human_fields)
     if merged.empty:
         return {"status": "not_available", "reason": "no completed ratings match judged reply IDs"}
+    if len(merged) < 40:
+        return {
+            "status": "not_available",
+            "reason": "fewer than 40 exact same-reply human ratings match judge outputs",
+            "matching_reply_count": len(merged),
+        }
     human = merged[human_fields].mean(axis=1).tolist()
     judged = merged[[f"judge_{field}" for field in fields]].mean(axis=1).tolist()
     result = ReplyQualityJudge.compute_human_agreement(human, judged)
@@ -108,6 +122,7 @@ def _same_reply_agreement(judge_rows: pd.DataFrame, ratings_path: Path) -> Dict[
 
 def run(args: argparse.Namespace) -> None:
     os.chdir(ROOT)
+    gold_hashes = verify_evaluation_manifest("data/golden/MANIFEST.json")
     gold = pd.read_csv("data/golden/golden_eval_set.csv")
     artifacts = build_learned_pipeline(
         "data/processed/amazonhelp_context_pairs.csv",
@@ -116,6 +131,7 @@ def run(args: argparse.Namespace) -> None:
         intent_cap_per_class=args.intent_cap_per_class,
         retrieval_size=args.retrieval_size,
         contrastive_pairs=args.contrastive_pairs,
+        escalation_knn=args.escalation_knn,
     )
     model = artifacts.model
     supervision = artifacts.supervision
@@ -186,11 +202,12 @@ def run(args: argparse.Namespace) -> None:
 
         started = time.time()
         classification = model.predict_with_confidence(text, model_text)
-        learned = model.predict_escalation(text)
-        reason_prediction = model.predict_reason(text)
+        current_embedding = classification["current_message_embedding"]
+        learned = model.predict_escalation(text, current_embedding)
+        reason_prediction = model.predict_reason(text, current_embedding)
         retrieval_query = model_text if classification["context_used"] else text
         exemplars = artifacts.retriever.retrieve_similar(
-            retrieval_query, intent_filter=classification["intent"], top_k=3
+            retrieval_query, intent_filter=classification["intent"], top_k=12
         )
         evidence_act = generator.select_act(exemplars, classification["intent"], False)
         decision = learned_escalator.evaluate(
@@ -213,7 +230,7 @@ def run(args: argparse.Namespace) -> None:
         target["esc_reasons"].append(decision.stated_reason)
         target["replies"].append(reply)
         target["acts"].append(act)
-        target["exemplars"].append(exemplars)
+        target["exemplars"].append(exemplars[:3])
         target["seconds"] += time.time() - started
         confidences.append(classification["confidence"])
         risk_scores.append(learned["risk_score"])
@@ -222,6 +239,8 @@ def run(args: argparse.Namespace) -> None:
         "run_metadata": {
             "gold_size": len(gold),
             "gold_label_audit": "data/golden/LABEL_AUDIT.md",
+            "gold_manifest": "data/golden/MANIFEST.json",
+            "gold_sha256": gold_hashes,
             "gold_ids_excluded_from_training_and_retrieval": True,
             "historical_context_coverage": round(artifacts.context_coverage, 6),
             "context_is_causally_prior_only": True,
@@ -241,11 +260,19 @@ def run(args: argparse.Namespace) -> None:
                 model.semantic_blend_nll_gain_, 6
             ),
             "intent_selected_c": model.intent_selected_c_,
-            "intent_training_cv_macro_f1": round(model.intent_cv_macro_f1_, 6),
+            "intent_training_cv_macro_f1": (
+                round(model.intent_cv_macro_f1_, 6)
+                if model.tune_intent_regularization else None
+            ),
             "escalation_selected_c": model.escalation_selected_c_,
             "escalation_selected_class_weight": model.escalation_selected_class_weight_,
             "escalation_training_cv_average_precision": round(
                 model.escalation_cv_average_precision_, 6
+            ),
+            "escalation_knn_blend_weight": round(model.escalation_knn_weight_, 6),
+            "escalation_knn_neighbor_count": model.escalation_knn_k_,
+            "escalation_knn_calibration_ap_gain": round(
+                model.escalation_knn_calibration_ap_gain_, 6
             ),
             "supervision": (
                 "reply-side weak labels plus conservative probabilistic abstention filling "
@@ -268,6 +295,18 @@ def run(args: argparse.Namespace) -> None:
         "systems": {
             name: _evaluate_system(evaluator, gold, data, args.bootstrap_iterations)
             for name, data in systems.items()
+        },
+        "paired_significance": {
+            "intent_proposed_vs_tfidf": evaluator.paired_mcnemar(
+                gold["gold_intent"].tolist(),
+                systems["Baseline 2: TF-IDF + keyword escalation + retrieve/replay"]["intent_preds"],
+                systems[PROPOSED]["intent_preds"],
+            ),
+            "escalation_proposed_vs_keyword": evaluator.paired_mcnemar(
+                gold["gold_escalate"].astype(bool).tolist(),
+                systems["Baseline 2: TF-IDF + keyword escalation + retrieve/replay"]["esc_preds"],
+                systems[PROPOSED]["esc_preds"],
+            ),
         },
         "temperature_scaling": {
             "intent_temperature": round(model.intent_temperature.temperature_, 6),
@@ -330,21 +369,42 @@ def run(args: argparse.Namespace) -> None:
     })
 
     judge_rows = []
+    judge_invalid_outputs = 0
     if args.judge_local:
         judge = ReplyQualityJudge(local_model=local_runtime)
         for index, row in predictions.head(args.judge_limit).iterrows():
             exemplars = systems[PROPOSED]["exemplars"][index]
-            score = judge.score_reply(
-                row["customer_text"], row["draft_reply"], row["predicted_intent"],
-                bool(row["predicted_escalate"]), row["resolution_act"], exemplars,
-            )
-            judge_rows.append({"reply_id": row["reply_id"], **{f"judge_{key}": score[key] for key in ("groundedness", "empathy", "actionability", "safety")}, "rationale": score["rationale"]})
+            try:
+                score = judge.score_reply(
+                    row["customer_text"], row["draft_reply"], row["predicted_intent"],
+                    bool(row["predicted_escalate"]), row["resolution_act"], exemplars,
+                )
+                judge_rows.append({
+                    "reply_id": row["reply_id"],
+                    "source_sha256": reply_source_hash(
+                        row["reply_id"], row["customer_text"], row["draft_reply"],
+                        row["resolution_act"],
+                    ),
+                    **{f"judge_{key}": score[key] for key in ("groundedness", "empathy", "actionability", "safety")},
+                    "schema_repaired": score["schema_repaired"],
+                    "rationale": score["rationale"],
+                })
+            except JudgeOutputError:
+                judge_invalid_outputs += 1
         judge_frame = pd.DataFrame(judge_rows)
         judge_frame.to_csv("results/local_judge_scores.csv", index=False)
         full_results["local_llm_judge"] = {
-            "status": "measured",
-            "sample_size": len(judge_frame),
-            "mean_overall": round(float(judge_frame[[f"judge_{x}" for x in ("groundedness", "empathy", "actionability", "safety")]].mean(axis=1).mean()), 3),
+            "status": "measured" if len(judge_frame) else "invalid",
+            "requested_sample_size": min(args.judge_limit, len(predictions)),
+            "valid_sample_size": len(judge_frame),
+            "invalid_output_count": judge_invalid_outputs,
+            "schema_repair_count": int(
+                judge_frame.get("schema_repaired", pd.Series(dtype=bool)).sum()
+            ),
+            "mean_overall": (
+                round(float(judge_frame[[f"judge_{x}" for x in ("groundedness", "empathy", "actionability", "safety")]].mean(axis=1).mean()), 3)
+                if len(judge_frame) else None
+            ),
             "model": local_runtime.model_name,
             "revision": local_runtime.revision,
         }
@@ -360,6 +420,12 @@ def run(args: argparse.Namespace) -> None:
     rating_template = predictions.head(args.judge_limit)[
         ["reply_id", "customer_text", "draft_reply", "resolution_act"]
     ].copy()
+    rating_template["source_sha256"] = rating_template.apply(
+        lambda row: reply_source_hash(
+            row["reply_id"], row["customer_text"], row["draft_reply"],
+            row["resolution_act"],
+        ), axis=1,
+    )
     for field in ("groundedness", "empathy", "actionability", "safety"):
         rating_template[f"human_{field}"] = ""
     rating_template["human_notes"] = ""
@@ -399,13 +465,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-zero-shot-local", action="store_true")
     parser.add_argument("--judge-limit", type=int, default=50)
     parser.add_argument("--human-ratings", default="data/evaluation/human_same_reply_ratings.csv")
-    parser.add_argument("--reviewed-labels", default="data/training/labels_for_human_review.csv")
+    parser.add_argument(
+        "--reviewed-labels", default="data/training/human_consensus_labels.csv"
+    )
     parser.add_argument("--intent-cap-per-class", type=int, default=1200)
     parser.add_argument("--retrieval-size", type=int, default=8000)
     parser.add_argument("--bootstrap-iterations", type=int, default=2000)
     parser.add_argument(
         "--contrastive-pairs", type=int, default=0,
         help="Experimental local contrastive ablation; disabled by default until reviewed labels exist",
+    )
+    parser.add_argument(
+        "--escalation-knn", action="store_true",
+        help="Experimental neighbor-risk blend; disabled after policy-gold degradation",
     )
     return parser.parse_args()
 

@@ -33,7 +33,7 @@ class PipelineArtifacts:
     cache_hit: bool = False
 
 
-PIPELINE_CACHE_VERSION = "context-probabilistic-v1"
+PIPELINE_CACHE_VERSION = "review-gated-contrastive-v2"
 
 
 def _pipeline_fingerprint(paths: list[Path], parameters: dict) -> str:
@@ -62,6 +62,7 @@ def build_learned_pipeline(
     intent_cap_per_class: int = 1200,
     retrieval_size: int = 8000,
     contrastive_pairs: int = 0,
+    escalation_knn: bool = False,
     contrastive_cache_dir: str = "models",
     pipeline_cache_dir: Optional[str] = "models/pipeline_cache",
     seed: int = 42,
@@ -81,6 +82,7 @@ def build_learned_pipeline(
             "intent_cap_per_class": intent_cap_per_class,
             "retrieval_size": retrieval_size,
             "contrastive_pairs": contrastive_pairs,
+            "escalation_knn": escalation_knn,
             "seed": seed,
         },
     )
@@ -130,6 +132,16 @@ def build_learned_pipeline(
     human_intent_count = int(
         (supervision["intent_label_source"] == "human_reviewed").sum()
     )
+    human_intent_rows = supervision[
+        supervision["intent_label_source"] == "human_reviewed"
+    ].copy()
+    if contrastive_pairs > 0:
+        represented = set(human_intent_rows["intent_label"].dropna().astype(str))
+        if human_intent_count < 48 or len(represented) != 6:
+            raise ValueError(
+                "Contrastive fine-tuning is gated until at least 48 independently "
+                "reviewed consensus labels cover all six intents"
+            )
 
     intent_train, intent_cal = train_test_split(
         intent_rows, test_size=0.20, random_state=seed, stratify=intent_rows["intent_label"]
@@ -150,6 +162,7 @@ def build_learned_pipeline(
             if contrastive_pairs > 0 else None
         ),
         enable_context_gate=human_intent_count >= 60,
+        enable_escalation_knn=escalation_knn,
     ).fit(
         intent_train["customer_text"].tolist(),
         intent_train["intent_label"].tolist(),
@@ -162,6 +175,8 @@ def build_learned_pipeline(
         reason_rows["customer_text"].tolist(),
         reason_rows["reason_label"].tolist(),
         intent_cal["model_text"].tolist() if human_intent_count >= 60 else None,
+        human_intent_rows["customer_text"].tolist() if contrastive_pairs > 0 else None,
+        human_intent_rows["intent_label"].tolist() if contrastive_pairs > 0 else None,
     )
 
     retrieval_frame = supervision.copy()

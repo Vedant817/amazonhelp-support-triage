@@ -38,17 +38,17 @@ class ProductionPolicyGuard:
     def __init__(self):
         # Whitelisted authoritative Amazon service endpoints
         self.allowed_domains = [
-            r"https?://(www\.)?amazon\.com/orders\b",
-            r"https?://(www\.)?amazon\.com/returns\b",
-            r"https?://(www\.)?amazon\.com/help\b",
-            r"https?://(www\.)?amazon\.com/gp/help\b",
-            r"https?://(www\.)?amazon\.com/your-account\b",
-            r"https?://(www\.)?amazon\.com/contact-us\b",
-            r"amazon\.com/orders\b",
-            r"amazon\.com/returns\b",
-            r"amazon\.com/help\b",
-            r"amzn\.to/[a-zA-Z0-9]+\b",
-            r"twitter\.com/messages/compose\b"
+            r"https?://(www\.)?amazon\.com/orders(?:[?#][^\s]*)?$",
+            r"https?://(www\.)?amazon\.com/returns(?:[?#][^\s]*)?$",
+            r"https?://(www\.)?amazon\.com/help(?:[?#][^\s]*)?$",
+            r"https?://(www\.)?amazon\.com/gp/help(?:[?#][^\s]*)?$",
+            r"https?://(www\.)?amazon\.com/your-account(?:[?#][^\s]*)?$",
+            r"https?://(www\.)?amazon\.com/contact-us(?:[?#][^\s]*)?$",
+            r"amazon\.com/orders(?:[?#][^\s]*)?$",
+            r"amazon\.com/returns(?:[?#][^\s]*)?$",
+            r"amazon\.com/help(?:[?#][^\s]*)?$",
+            r"amzn\.to/[a-zA-Z0-9]+$",
+            r"twitter\.com/messages/compose\?recipient_id=AmazonHelp$"
         ]
 
         # Dangerous hallucinated financial or operational commitments
@@ -64,7 +64,13 @@ class ProductionPolicyGuard:
         self.prohibited_requests = [
             (r"(tweet\s+(us\s+)?your\s+password)", "PROHIBITED_CREDENTIAL_REQUEST"),
             (r"(reply\s+with\s+your\s+card\s+number)", "PROHIBITED_FINANCIAL_CARD_REQUEST"),
-            (r"(send\s+your\s+cvv)", "PROHIBITED_CVV_REQUEST")
+            (r"(send\s+your\s+cvv)", "PROHIBITED_CVV_REQUEST"),
+            (
+                r"\b(?:provide|share|send|reply with|tell (?:me|us))\b.{0,35}"
+                r"\b(?:order (?:number|id)|phone number|email address)\b"
+                r"(?![^.!?]{0,45}\b(?:dm|direct message|private(?:ly| message)?)\b)",
+                "PROHIBITED_PUBLIC_PII_REQUEST",
+            ),
         ]
 
     def verify_and_sanitize(
@@ -113,7 +119,10 @@ class ProductionPolicyGuard:
         for pat, violation_code in self.prohibited_requests:
             if re.search(pat, sanitized, re.IGNORECASE):
                 violations.append(violation_code)
-                sanitized = "I apologize for any confusion. Please never share sensitive passwords or card numbers in public. Reach us safely at amazon.com/help."
+                sanitized = (
+                    "I apologize for any confusion. Please don't share account, order, "
+                    "or payment details publicly. Reach us safely at amazon.com/help."
+                )
                 adjustments.append(f"Overrode reply due to prohibited phrase ({violation_code})")
                 break
 
@@ -127,11 +136,18 @@ class ProductionPolicyGuard:
                 adjustments.append(f"Neutralized hallucinated commitment ({violation_code})")
 
         # 4. Strict URL Whitelist Check
-        urls = re.findall(r"(https?://\S+|www\.\S+|amazon\.com/\S+)", sanitized)
+        urls = re.findall(
+            r"(https?://\S+|www\.\S+|amazon\.com/\S+)",
+            sanitized,
+            flags=re.IGNORECASE,
+        )
         for url in urls:
             # Strip trailing punctuation if accidentally captured
             clean_url = url.rstrip(".,;!?:")
-            is_whitelisted = any(re.search(allowed, clean_url) for allowed in self.allowed_domains)
+            is_whitelisted = any(
+                re.fullmatch(allowed, clean_url, re.IGNORECASE)
+                for allowed in self.allowed_domains
+            )
             if not is_whitelisted:
                 violations.append("UNVERIFIED_EXTERNAL_URL")
                 sanitized = sanitized.replace(url, "amazon.com/help")

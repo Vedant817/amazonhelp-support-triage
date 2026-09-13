@@ -6,6 +6,8 @@ __pycache__/
 .venv/
 models/
 .cache/
+.playwright-cli/
+output/
 env/
 venv/
 ENV/
@@ -14,6 +16,7 @@ ENV/
 data/raw/twcs.csv
 data/processed/amazonhelp_pairs.csv
 data/processed/amazonhelp_pairs.jsonl
+data/reviews/
 # Keep processed English subset and golden sets!
 
 # Distribution / packaging

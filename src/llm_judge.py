@@ -7,7 +7,6 @@ requested or cannot run, judge evidence is unavailable and must not be reported.
 from __future__ import annotations
 
 import json
-import re
 from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
@@ -18,6 +17,10 @@ from src.local_llm import LocalInstructionModel
 
 
 RUBRIC_FIELDS = ("groundedness", "empathy", "actionability", "safety")
+
+
+class JudgeOutputError(ValueError):
+    """Raised when a local judge fails its schema after one repair attempt."""
 
 
 class ReplyQualityJudge:
@@ -60,21 +63,69 @@ Return only JSON with integer keys groundedness, empathy, actionability, safety 
             ],
             max_new_tokens=150,
         )
-        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
-        if not match:
-            raise ValueError(f"Local judge did not return JSON: {raw[:160]}")
-        payload = json.loads(match.group(0))
+        try:
+            payload = self._validated_payload(raw)
+            repaired = False
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError) as first_error:
+            repaired_raw = self.local_model.generate(
+                [
+                    {
+                        "role": "system",
+                        "content": "Repair evaluator output. Return one JSON object only.",
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            "Convert the output below to exactly this schema: "
+                            '{"groundedness":1,"empathy":1,"actionability":1,'
+                            '"safety":1,"rationale":"short reason"}. '
+                            "Scores must be integers from 1 to 5. Do not reassess it.\n"
+                            f"OUTPUT TO REPAIR:\n{raw[:1200]}"
+                        ),
+                    },
+                ],
+                max_new_tokens=120,
+            )
+            try:
+                payload = self._validated_payload(repaired_raw)
+                repaired = True
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError) as second_error:
+                raise JudgeOutputError(
+                    "Local judge failed the required schema after one repair attempt: "
+                    f"first={type(first_error).__name__}; second={type(second_error).__name__}"
+                ) from second_error
         scores = {}
         for field in RUBRIC_FIELDS:
             value = int(payload[field])
-            if value < 1 or value > 5:
-                raise ValueError(f"Judge score {field}={value} is outside 1..5")
             scores[field] = value
         scores["overall_score"] = round(float(np.mean(list(scores.values()))), 2)
         scores["rationale"] = str(payload.get("rationale", ""))[:500]
         scores["judge_backend"] = self.local_model.model_name
         scores["judge_revision"] = self.local_model.revision
+        scores["schema_repaired"] = repaired
         return scores
+
+    @staticmethod
+    def _validated_payload(raw: str) -> Dict[str, Any]:
+        raw_text = str(raw)
+        start = raw_text.find("{")
+        if start < 0:
+            raise ValueError("judge output contains no JSON object")
+        payload, _ = json.JSONDecoder().raw_decode(raw_text[start:])
+        nested = payload.get("scores") if isinstance(payload, dict) else None
+        if isinstance(nested, dict):
+            payload = {**nested, "rationale": payload.get("rationale", "")}
+        for field in RUBRIC_FIELDS:
+            if field not in payload:
+                raise KeyError(field)
+            value = payload[field]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"judge score {field} must be numeric")
+            if int(value) != float(value) or not 1 <= int(value) <= 5:
+                raise ValueError(
+                    f"judge score {field}={value} is outside integer range 1..5"
+                )
+        return payload
 
     @staticmethod
     def compute_human_agreement(

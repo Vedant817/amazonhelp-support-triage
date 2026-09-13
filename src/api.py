@@ -46,7 +46,7 @@ async def lifespan(app: FastAPI):
     artifacts = build_learned_pipeline(
         pairs_csv="data/processed/amazonhelp_context_pairs.csv",
         gold_csv="data/golden/golden_eval_set.csv",
-        reviewed_csv="data/training/labels_for_human_review.csv",
+        reviewed_csv="data/training/human_consensus_labels.csv",
         intent_cap_per_class=int(os.getenv("SUPPORT_INTENT_CAP_PER_CLASS", "1200")),
         retrieval_size=int(os.getenv("SUPPORT_RETRIEVAL_SIZE", "8000")),
         contrastive_pairs=int(os.getenv("SUPPORT_CONTRASTIVE_PAIRS", "0")),
@@ -162,14 +162,15 @@ def triage(req: TriageRequest):
     classification_ms = (time.perf_counter() - stage_started) * 1000.0
 
     stage_started = time.perf_counter()
-    learned_escalation = model.predict_escalation(req.text)
-    reason_prediction = model.predict_reason(req.text)
+    current_embedding = classification["current_message_embedding"]
+    learned_escalation = model.predict_escalation(req.text, current_embedding)
+    reason_prediction = model.predict_reason(req.text, current_embedding)
     risk_scoring_ms = (time.perf_counter() - stage_started) * 1000.0
 
     stage_started = time.perf_counter()
     exemplars = pipeline_state["retriever"].retrieve_similar(
         model_input if classification["context_used"] else req.text,
-        intent_filter=classification["intent"], top_k=3
+        intent_filter=classification["intent"], top_k=12
     )
     generator = pipeline_state["generator"]
     evidence_act = generator.select_act(exemplars, classification["intent"], False)
@@ -202,7 +203,7 @@ def triage(req: TriageRequest):
     resolution_act = generator.select_act(exemplars, classification["intent"], decision.should_escalate)
 
     stage_started = time.perf_counter()
-    raw_reply = generator.generate(
+    raw_reply, generation_metadata = generator.generate_with_metadata(
         req.text,
         classification["intent"],
         exemplars,
@@ -242,7 +243,7 @@ def triage(req: TriageRequest):
             dense_score=float(ex.get("dense_score", 0.0)),
             bm25_score=float(ex.get("bm25_score", 0.0)),
         )
-        for ex in exemplars
+        for ex in exemplars[:3]
     ]
     hard_gate_triggered = any(str(trigger).startswith("HARD_GATE") for trigger in decision.triggers)
     pipeline_trace = [
@@ -284,6 +285,8 @@ def triage(req: TriageRequest):
                 "risk_score": round(learned_escalation["risk_score"], 4),
                 "recall_threshold": round(learned_escalation["threshold"], 4),
                 "high_precision_threshold": round(model.high_precision_escalation_threshold_, 4),
+                "neighbor_blend_weight": round(model.escalation_knn_weight_, 4),
+                "neighbor_count": model.escalation_knn_k_,
             },
         ),
         PipelineStageResponse(
@@ -292,7 +295,8 @@ def triage(req: TriageRequest):
             duration_ms=round(retrieval_ms, 2),
             details={
                 "method": "BM25 + MiniLM RRF",
-                "neighbors_returned": len(evidence),
+                "candidate_pool_size": len(exemplars),
+                "neighbors_shown": len(evidence),
                 "evidence_resolution_act": evidence_act,
                 "top_rrf_score": evidence[0].rrf_score if evidence else None,
             },
@@ -316,7 +320,9 @@ def triage(req: TriageRequest):
             duration_ms=round(generation_ms, 2),
             details={
                 "mode": pipeline_state["generation_mode"],
-                "backend": QWEN_MODEL_ID if pipeline_state["generation_mode"] == "local" else "act-conditioned deterministic rewrite",
+                "configured_backend": QWEN_MODEL_ID if pipeline_state["generation_mode"] == "local" else "act-conditioned deterministic rewrite",
+                "actual_backend": generation_metadata["backend"],
+                "fallback_reason": generation_metadata["fallback_reason"],
                 "resolution_act": resolution_act,
             },
         ),

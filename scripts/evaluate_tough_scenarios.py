@@ -123,7 +123,7 @@ def main() -> int:
     artifacts = build_learned_pipeline(
         str(ROOT / "data/processed/amazonhelp_context_pairs.csv"),
         str(ROOT / "data/golden/golden_eval_set.csv"),
-        reviewed_csv=str(ROOT / "data/training/labels_for_human_review.csv"),
+        reviewed_csv=str(ROOT / "data/training/human_consensus_labels.csv"),
         contrastive_pairs=args.contrastive_pairs,
     )
     agent = AmazonSupportAgent(artifacts.model, artifacts.retriever)

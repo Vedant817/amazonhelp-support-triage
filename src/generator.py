@@ -119,19 +119,33 @@ class ProductionGroundedGenerator:
         act: str,
         exemplars: List[Dict[str, Any]],
         reason: str = "",
-    ) -> str:
+    ) -> tuple[str, Dict[str, Any]]:
         if self.local_model is None:
             self.local_model = LocalInstructionModel()
+        act_examples = [
+            ex for ex in exemplars
+            if (ex.get("resolution_act") or infer_resolution_act(ex.get("reply_text", ""))) == act
+        ]
         examples = "\n".join(
             f"Historical reply {idx + 1}: {strip_agent_pii(ex.get('reply_text', ''))}"
-            for idx, ex in enumerate(exemplars[:2])
+            for idx, ex in enumerate(act_examples[:2])
         ) or "No safe historical wording available."
+        act_instruction = {
+            "ASK_TRACKING_STATUS": "Ask what the latest tracking status shows and the original delivery date.",
+            "ASK_CARRIER": "Ask which carrier or courier handled the delivery.",
+            "DM_WITH_ORDER_ID": f"Direct the customer to a private DM at {self.dm_link}; do not ask for details publicly.",
+            "LINK_ORDERS": "Direct the customer to Your Orders at amazon.com/orders.",
+            "LINK_RETURNS": "Direct the customer to return options at amazon.com/returns.",
+            "TROUBLESHOOT_DEVICE": "Ask for the device model and a troubleshooting step already tried.",
+            "APOLOGIZE_WAIT": "Apologize for the wait and ask the customer to check the latest order status.",
+            "GENERAL_SUPPORT": "Ask for a little more non-sensitive detail about what happened.",
+        }[act]
         prompt = f"""Write one public @AmazonHelp reply.
 Customer: {customer_query}
 Intent: {intent}
-Required resolution act: {act}
+Required action: {act_instruction}
 Escalation reason: {reason or 'none'}
-Historical voice examples (style only):
+Historical voice examples (tone only; do not copy them):
 {examples}
 
 Rules: perform the required act; be empathetic and specific; maximum 240 characters before guardrails;
@@ -145,12 +159,91 @@ ask for private details only through DM. Output only the reply."""
             ],
             max_new_tokens=110,
         )
+        generated = re.sub(r"\s+", " ", str(generated)).strip()
+        if not generated:
+            return self._offline_rewrite(customer_query, intent, act, reason), {
+                "backend": "offline_act_template",
+                "fallback_reason": "empty_local_output",
+            }
+        if len(generated) > 280:
+            return self._offline_rewrite(customer_query, intent, act, reason), {
+                "backend": "offline_act_template",
+                "fallback_reason": "local_output_over_character_limit",
+            }
+        if re.search(
+            r"\b(?:provide|share|send|reply with|tell (?:me|us))\b.{0,35}"
+            r"\b(?:order (?:number|id)|phone number|email address|password|cvv|card number)\b",
+            generated,
+            re.IGNORECASE,
+        ) and not re.search(r"\b(?:dm|direct message|private(?:ly| message)?)\b", generated, re.IGNORECASE):
+            return self._offline_rewrite(customer_query, intent, act, reason), {
+                "backend": "offline_act_template",
+                "fallback_reason": "public_sensitive_detail_request",
+            }
         normalized = re.sub(r"\s+", " ", generated.lower()).strip()
-        for exemplar in exemplars[:2]:
+        for exemplar in act_examples[:2]:
             historical = re.sub(r"\s+", " ", strip_agent_pii(exemplar.get("reply_text", "")).lower()).strip()
             if historical and SequenceMatcher(None, normalized, historical).ratio() >= 0.90:
-                return self._offline_rewrite(customer_query, intent, act, reason)
-        return generated
+                return self._offline_rewrite(customer_query, intent, act, reason), {
+                    "backend": "offline_act_template",
+                    "fallback_reason": "near_verbatim_historical_reply",
+                }
+        if not self._realizes_act(generated, act):
+            return self._offline_rewrite(customer_query, intent, act, reason), {
+                "backend": "offline_act_template",
+                "fallback_reason": "required_act_not_realized",
+            }
+        from src.guardrails import ProductionPolicyGuard
+        candidate_check = ProductionPolicyGuard().verify_and_sanitize(
+            generated, customer_query, should_escalate=(act == "DM_WITH_ORDER_ID")
+        )
+        if not candidate_check.is_valid:
+            return self._offline_rewrite(customer_query, intent, act, reason), {
+                "backend": "offline_act_template",
+                "fallback_reason": "local_guardrail_violation:" + ",".join(
+                    candidate_check.violations
+                ),
+            }
+        return generated, {"backend": "local_qwen", "fallback_reason": None}
+
+    @staticmethod
+    def _realizes_act(reply: str, act: str) -> bool:
+        """Conservative lexical contract for the action chosen from retrieval evidence."""
+        text = reply.lower()
+        required_patterns = {
+            "ASK_TRACKING_STATUS": (r"track(?:ing)? status", r"latest tracking", r"tracking (?:show|update)"),
+            "ASK_CARRIER": (r"\bcarrier\b", r"\bcourier\b", r"delivery service"),
+            "DM_WITH_ORDER_ID": (r"\bdm\b", r"direct message", r"private message", r"messages/compose"),
+            "LINK_ORDERS": (r"amazon\.com/orders", r"your orders"),
+            "LINK_RETURNS": (r"amazon\.com/returns", r"return", r"replacement"),
+            "TROUBLESHOOT_DEVICE": (r"troubleshoot", r"restart", r"device model", r"steps? (?:you(?:'ve)?|already) tried"),
+            "APOLOGIZE_WAIT": (r"\bwait\b", r"delivery window", r"latest status", r"amazon\.com/orders"),
+            "GENERAL_SUPPORT": (r"more (?:detail|about)", r"what happened", r"right next step", r"how (?:we|i) can help"),
+        }
+        return any(re.search(pattern, text) for pattern in required_patterns.get(act, ()))
+
+    def generate_with_metadata(
+        self,
+        customer_query: str,
+        intent: str,
+        exemplars: List[Dict[str, Any]],
+        escalate_decision: Optional[Dict[str, Any]] = None,
+        policy_guidance: Optional[Dict[str, Any]] = None,
+    ) -> tuple[str, Dict[str, Any]]:
+        should_escalate = escalate_decision.get("should_escalate", False) if escalate_decision else False
+        reason = escalate_decision.get("stated_reason", "") if escalate_decision else ""
+        act = self.select_act(exemplars, intent, should_escalate)
+        if self.mode == "local":
+            reply, metadata = self._local_rewrite(
+                customer_query, intent, act, exemplars, reason
+            )
+        else:
+            reply = self._offline_rewrite(customer_query, intent, act, reason)
+            metadata = {
+                "backend": "offline_act_template",
+                "fallback_reason": "offline_mode",
+            }
+        return reply, {**metadata, "resolution_act": act}
 
     def generate(
         self,
@@ -163,10 +256,11 @@ ask for private details only through DM. Output only the reply."""
         """
         Generates a grounded, empathetic, policy-compliant reply under 280 characters.
         """
-        should_escalate = escalate_decision.get("should_escalate", False) if escalate_decision else False
-        reason = escalate_decision.get("stated_reason", "") if escalate_decision else ""
-        act = self.select_act(exemplars, intent, should_escalate)
-
-        if self.mode == "local":
-            return self._local_rewrite(customer_query, intent, act, exemplars, reason)
-        return self._offline_rewrite(customer_query, intent, act, reason)
+        reply, _ = self.generate_with_metadata(
+            customer_query,
+            intent,
+            exemplars,
+            escalate_decision,
+            policy_guidance,
+        )
+        return reply

@@ -8,6 +8,7 @@ ever touching the frozen test split.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from numbers import Real
 from typing import Any, Optional
@@ -35,6 +36,16 @@ VALID_INTENTS = {
     "PRODUCT_AND_TECHNICAL",
     "FEEDBACK_AND_GENERAL",
 }
+
+
+def training_review_source_hash(row: Any) -> str:
+    """Bind a human label to the exact historical pair shown to the reviewer."""
+    digest = hashlib.sha256()
+    for column in ("inbound_id", "conversation_context", "customer_text", "reply_text"):
+        value = row.get(column, "") if hasattr(row, "get") else ""
+        digest.update(str(value).encode("utf-8"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _parse_reviewed_escalation(value: Any) -> bool:
@@ -156,7 +167,9 @@ def build_reply_supervision(
                 frame.at[frame.index[index], "intent_label_source"] = "probabilistic_weak_label_model"
 
     if reviewed is not None and not reviewed.empty:
-        required = {"inbound_id", "reviewed_intent", "reviewed_escalate"}
+        required = {
+            "inbound_id", "source_sha256", "reviewed_intent", "reviewed_escalate"
+        }
         missing = required - set(reviewed.columns)
         if missing:
             raise ValueError(f"Reviewed label file is missing columns: {sorted(missing)}")
@@ -171,6 +184,11 @@ def build_reply_supervision(
             if inbound_id not in review_map.index:
                 continue
             row = review_map.loc[inbound_id]
+            expected_hash = training_review_source_hash(frame.loc[idx])
+            if str(row["source_sha256"]) != expected_hash:
+                raise ValueError(
+                    f"Reviewed source hash does not match current training row {inbound_id}"
+                )
             if pd.notna(row["reviewed_intent"]):
                 reviewed_intent = str(row["reviewed_intent"]).strip()
                 if reviewed_intent not in VALID_INTENTS:

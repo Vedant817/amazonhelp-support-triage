@@ -16,7 +16,7 @@ from scipy.sparse import csr_matrix, hstack
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold, cross_val_predict, cross_val_score
-from sklearn.metrics import f1_score
+from sklearn.metrics import average_precision_score, f1_score
 from sklearn.multiclass import OneVsRestClassifier
 from sklearn.pipeline import FeatureUnion
 
@@ -341,6 +341,7 @@ class DualHeadSupportModel:
         minimum_auxiliary_macro_f1_gain: float = 0.005,
         tune_intent_regularization: bool = False,
         tune_escalation_regularization: bool = True,
+        enable_escalation_knn: bool = False,
     ) -> None:
         self.encoder = encoder or MiniLMEncoder()
         self.intent_confidence_threshold = intent_confidence_threshold
@@ -353,6 +354,7 @@ class DualHeadSupportModel:
         self.minimum_auxiliary_macro_f1_gain = float(minimum_auxiliary_macro_f1_gain)
         self.tune_intent_regularization = bool(tune_intent_regularization)
         self.tune_escalation_regularization = bool(tune_escalation_regularization)
+        self.enable_escalation_knn = bool(enable_escalation_knn)
         self.intent_vectorizer = self._make_vectorizer()
         self.escalation_vectorizer = self._make_vectorizer()
         self.intent_head = OneVsRestClassifier(
@@ -397,6 +399,11 @@ class DualHeadSupportModel:
         self.escalation_selected_c_ = 0.5
         self.escalation_selected_class_weight_: Optional[str] = None
         self.escalation_cv_average_precision_ = 0.0
+        self.escalation_knn_embeddings_: Optional[np.ndarray] = None
+        self.escalation_knn_labels_: Optional[np.ndarray] = None
+        self.escalation_knn_k_ = 0
+        self.escalation_knn_weight_ = 0.0
+        self.escalation_knn_calibration_ap_gain_ = 0.0
 
     @staticmethod
     def _make_vectorizer() -> FeatureUnion:
@@ -457,11 +464,17 @@ class DualHeadSupportModel:
         reason_texts: Optional[Sequence[str]] = None,
         reason_labels: Optional[Sequence[str]] = None,
         cal_intent_context_texts: Optional[Sequence[str]] = None,
+        contrastive_texts: Optional[Sequence[str]] = None,
+        contrastive_labels: Optional[Sequence[str]] = None,
     ) -> "DualHeadSupportModel":
         if self.contrastive_pair_count > 0:
+            if not contrastive_texts or not contrastive_labels:
+                raise ValueError(
+                    "Contrastive fine-tuning requires independently reviewed labels"
+                )
             self.encoder.fine_tune_contrastive(
-                intent_texts,
-                intent_labels,
+                contrastive_texts,
+                contrastive_labels,
                 pair_count=self.contrastive_pair_count,
                 output_path=self.contrastive_output_path,
             )
@@ -528,6 +541,18 @@ class DualHeadSupportModel:
         cal_escalation_probs = _sigmoid(
             cal_escalation_logits / self.escalation_temperature.temperature_
         )
+        if self.enable_escalation_knn:
+            self.escalation_knn_embeddings_ = np.asarray(
+                escalation_embeddings, dtype=np.float32
+            )
+            self.escalation_knn_labels_ = np.asarray(
+                escalation_labels, dtype=np.float32
+            )
+            cal_escalation_probs = self._fit_escalation_knn_blend(
+                cal_escalation_embeddings,
+                cal_escalation_probs,
+                cal_escalation_labels,
+            )
         self.escalation_threshold_selection_ = select_recall_constrained_threshold(
             cal_escalation_labels,
             cal_escalation_probs,
@@ -612,6 +637,51 @@ class DualHeadSupportModel:
             random_state=42,
             C=self.escalation_selected_c_,
         )
+
+    def _escalation_knn_probabilities(
+        self, embeddings: np.ndarray, neighbor_count: int
+    ) -> np.ndarray:
+        if self.escalation_knn_embeddings_ is None or self.escalation_knn_labels_ is None:
+            raise RuntimeError("Escalation neighbor index is not fitted")
+        query = np.asarray(embeddings, dtype=np.float32)
+        similarities = query @ self.escalation_knn_embeddings_.T
+        k = min(max(int(neighbor_count), 1), similarities.shape[1])
+        indices = np.argpartition(similarities, -k, axis=1)[:, -k:]
+        selected_similarity = np.take_along_axis(similarities, indices, axis=1)
+        selected_labels = self.escalation_knn_labels_[indices]
+        shifted = (selected_similarity - selected_similarity.max(axis=1, keepdims=True)) / 0.07
+        weights = np.exp(np.clip(shifted, -30.0, 0.0))
+        return np.sum(weights * selected_labels, axis=1) / np.maximum(
+            np.sum(weights, axis=1), 1e-12
+        )
+
+    def _fit_escalation_knn_blend(
+        self,
+        calibration_embeddings: np.ndarray,
+        base_probabilities: np.ndarray,
+        calibration_labels: Sequence[bool],
+    ) -> np.ndarray:
+        """Admit a non-parametric risk view only after a material holdout AP gain."""
+        labels = np.asarray(calibration_labels, dtype=bool)
+        base = np.asarray(base_probabilities, dtype=float)
+        baseline = float(average_precision_score(labels, base))
+        best = (baseline, 0.0, 0, base)
+        for neighbor_count in (5, 11, 25, 51):
+            neighbor_probs = self._escalation_knn_probabilities(
+                calibration_embeddings, neighbor_count
+            )
+            for weight in np.arange(0.05, 0.51, 0.05):
+                blended = (1.0 - weight) * base + weight * neighbor_probs
+                score = float(average_precision_score(labels, blended))
+                candidate = (score, -float(weight), -neighbor_count)
+                if candidate > (best[0], -best[1], -best[2]):
+                    best = (score, float(weight), neighbor_count, blended)
+        self.escalation_knn_calibration_ap_gain_ = max(0.0, best[0] - baseline)
+        if self.escalation_knn_calibration_ap_gain_ >= self.minimum_auxiliary_macro_f1_gain:
+            self.escalation_knn_weight_ = best[1]
+            self.escalation_knn_k_ = best[2]
+            return np.asarray(best[3], dtype=float)
+        return base
 
     def _fit_semantic_blend(
         self,
@@ -779,6 +849,7 @@ class DualHeadSupportModel:
             "context_used": context_used,
             "current_message_confidence": current["confidence"],
             "context_confidence": context["confidence"] if context is not None else None,
+            "current_message_embedding": current["embedding"],
         }
 
     def predict_escalation(self, text: str, embedding: Optional[np.ndarray] = None) -> Dict[str, Any]:
@@ -790,6 +861,14 @@ class DualHeadSupportModel:
         features = self._hybrid_features(self.escalation_vectorizer, [text], dense)
         logit = float(self.escalation_head.decision_function(features)[0])
         probability = float(_sigmoid(np.array([logit / self.escalation_temperature.temperature_]))[0])
+        if self.escalation_knn_weight_ > 0.0:
+            neighbor_probability = float(
+                self._escalation_knn_probabilities(dense, self.escalation_knn_k_)[0]
+            )
+            probability = (
+                (1.0 - self.escalation_knn_weight_) * probability
+                + self.escalation_knn_weight_ * neighbor_probability
+            )
         return {
             "should_escalate": probability >= self.escalation_threshold_,
             "risk_score": probability,

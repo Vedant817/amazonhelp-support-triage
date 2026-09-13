@@ -7,6 +7,7 @@ Running:
     python main.py test                # Run complete unit & integration test suite
     python main.py benchmark           # Run the 200 Golden Evaluation benchmark
     python main.py stress              # Run the safety regression suite
+    python main.py review --port 8001  # Start the independent label-review desk
 """
 
 import sys
@@ -58,6 +59,14 @@ def run_test():
     print("\n[SUCCESS] All tests passed cleanly!\n")
 
 
+def run_review(host: str = "127.0.0.1", port: int = 8001):
+    """Start the local-only independent annotation interface."""
+    import uvicorn
+    print(f"Review desk: http://{host}:{port}/")
+    print("Predictions and gold labels are hidden from reviewers.")
+    uvicorn.run("src.review_app:app", host=host, port=port, reload=False)
+
+
 def run_stress():
     """Run the behavioral and adversarial safety suite."""
     print("\n" + "=" * 80)
@@ -75,6 +84,8 @@ def run_benchmark(
     judge_local: bool = False,
     include_zero_shot_local: bool = False,
     contrastive_pairs: int = 0,
+    escalation_knn: bool = False,
+    reviewed_labels: str = "data/training/human_consensus_labels.csv",
 ):
     """Run the uncontaminated 200 Golden Evaluation Set benchmark."""
     print("\n" + "=" * 80)
@@ -82,12 +93,15 @@ def run_benchmark(
     print("=" * 80 + "\n")
     script = os.path.join(REPO_ROOT, "scripts", "reproduce_headline.py")
     command = [sys.executable, script, "--generation-mode", generation_mode]
+    command.extend(["--reviewed-labels", reviewed_labels])
     if judge_local:
         command.append("--judge-local")
     if include_zero_shot_local:
         command.append("--include-zero-shot-local")
     if contrastive_pairs:
         command.extend(["--contrastive-pairs", str(contrastive_pairs)])
+    if escalation_knn:
+        command.append("--escalation-knn")
     ret = subprocess.call(command)
     if ret != 0:
         print("\n[ERROR] Benchmark failed!")
@@ -118,7 +132,7 @@ Examples:
         "command",
         nargs="?",
         default="serve",
-        choices=["serve", "benchmark", "stress", "test"],
+        choices=["serve", "benchmark", "stress", "test", "review"],
         help="Command to execute (default: serve)"
     )
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind for server (default: 127.0.0.1)")
@@ -130,6 +144,15 @@ Examples:
     parser.add_argument(
         "--contrastive-pairs", type=int, default=0,
         help="Experimental local contrastive intent-pair ablation",
+    )
+    parser.add_argument(
+        "--escalation-knn", action="store_true",
+        help="Run the experimental dense-neighbor escalation ablation",
+    )
+    parser.add_argument(
+        "--reviewed-labels",
+        default="data/training/human_consensus_labels.csv",
+        help="Adjudicated independent-review labels used for training",
     )
 
     args = parser.parse_args()
@@ -145,12 +168,16 @@ Examples:
         run_test()
     elif args.command == "stress":
         run_stress()
+    elif args.command == "review":
+        run_review(args.host, args.port)
     elif args.command == "benchmark":
         run_benchmark(
             args.generation_mode or "offline",
             args.judge_local,
             args.include_zero_shot_local,
             args.contrastive_pairs,
+            args.escalation_knn,
+            args.reviewed_labels,
         )
 
 

@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "frozen_after_label_audit": true,
+  "files": {
+    "golden_eval_set.csv": "272d9f4e41b7b0180c67fc850cb64fcc99d688bba504e0af426d1b707b4f60b2",
+    "golden_eval_set.jsonl": "413faf51aa26c5e4166c9428e0677740e81b35c51bf432c129cff9f738070483"
+  }
+}

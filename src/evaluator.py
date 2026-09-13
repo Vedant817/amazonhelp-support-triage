@@ -7,7 +7,8 @@ from the reply-quality headline evidence.
 import re
 import math
 import numpy as np
-from typing import List, Dict, Any, Tuple, Optional
+from scipy.stats import binomtest
+from typing import List, Dict, Any, Tuple, Optional, Sequence
 from collections import Counter
 from sklearn.metrics import (
     accuracy_score,
@@ -336,4 +337,27 @@ class SupportPipelineEvaluator:
             "cost_escalate": cost_escalate,
             "cost_error_leak": cost_error_leak,
             "cost_curve": curve
+        }
+    @staticmethod
+    def paired_mcnemar(
+        truth: Sequence[Any], predictions_a: Sequence[Any], predictions_b: Sequence[Any]
+    ) -> Dict[str, Any]:
+        """Exact paired test using only cases on which system correctness differs."""
+        expected = np.asarray(truth, dtype=object)
+        first = np.asarray(predictions_a, dtype=object)
+        second = np.asarray(predictions_b, dtype=object)
+        if expected.shape != first.shape or expected.shape != second.shape:
+            raise ValueError("Truth and paired predictions must have identical shapes")
+        first_only = int(np.sum((first == expected) & (second != expected)))
+        second_only = int(np.sum((first != expected) & (second == expected)))
+        discordant = first_only + second_only
+        p_value = (
+            float(binomtest(min(first_only, second_only), discordant, 0.5).pvalue)
+            if discordant else 1.0
+        )
+        return {
+            "a_correct_b_wrong": first_only,
+            "a_wrong_b_correct": second_only,
+            "discordant_count": discordant,
+            "exact_two_sided_p_value": round(p_value, 6),
         }

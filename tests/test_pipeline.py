@@ -18,10 +18,14 @@ from src.data_pipeline import add_prior_conversation_context
 from src.escalator import SafetyGatedEscalator
 from src.generator import ProductionGroundedGenerator
 from src.guardrails import ProductionPolicyGuard
-from src.llm_judge import ReplyQualityJudge
+from src.llm_judge import JudgeOutputError, ReplyQualityJudge
 from src.retriever import HistoricalResolutionRetriever
+from src.retrieval_evaluation import ranked_act_metrics
 from src.session import CustomerSessionState
-from src.supervision import build_reply_supervision, infer_resolution_act, strip_agent_pii
+from src.supervision import (
+    build_reply_supervision, infer_resolution_act, strip_agent_pii,
+    training_review_source_hash,
+)
 from src.weak_label_model import DawidSkeneLabelModel, aggregate_intent_weak_labels
 
 
@@ -49,7 +53,39 @@ class FakeLocalModel:
         return self.output
 
 
+class SequenceLocalModel(FakeLocalModel):
+    def __init__(self, outputs):
+        self.outputs = iter(outputs)
+
+    def generate(self, messages, max_new_tokens=128):
+        return next(self.outputs)
+
+
 class TestPipelineComponents(unittest.TestCase):
+    def test_exact_paired_mcnemar_counts_directional_wins(self):
+        from src.evaluator import SupportPipelineEvaluator
+
+        result = SupportPipelineEvaluator.paired_mcnemar(
+            ["A", "A", "B", "B"],
+            ["A", "B", "A", "B"],
+            ["A", "A", "B", "A"],
+        )
+        self.assertEqual(result["a_correct_b_wrong"], 1)
+        self.assertEqual(result["a_wrong_b_correct"], 2)
+        self.assertEqual(result["discordant_count"], 3)
+    def test_ranked_retrieval_act_metrics(self):
+        metrics = ranked_act_metrics(
+            ["LINK_ORDERS", "LINK_RETURNS"],
+            [
+                [{"resolution_act": "ASK_CARRIER"}, {"resolution_act": "LINK_ORDERS"}],
+                [{"resolution_act": "GENERAL_SUPPORT"}],
+            ],
+            k=3,
+        )
+        self.assertEqual(metrics["recall_at_3"], 0.5)
+        self.assertEqual(metrics["macro_recall_at_3"], 0.5)
+        self.assertEqual(metrics["mrr_at_3"], 0.25)
+
     def test_historical_context_contains_only_causally_prior_turns(self):
         raw = pd.DataFrame([
             {"tweet_id": "1", "author_id": "customer", "inbound": True, "created_at": "t1", "text": "My order is missing", "in_response_to_tweet_id": None},
@@ -181,6 +217,7 @@ class TestPipelineComponents(unittest.TestCase):
         }])
         reviewed = pd.DataFrame([{
             "inbound_id": "1",
+            "source_sha256": training_review_source_hash(frame.iloc[0]),
             "reviewed_intent": "ACCOUNT_AND_SECURITY",
             "reviewed_escalate": True,
             "reviewed_reason_code": "ACCOUNT_SECURITY_OR_LOCKOUT",
@@ -191,6 +228,17 @@ class TestPipelineComponents(unittest.TestCase):
         self.assertEqual(labeled.iloc[0]["resolution_act"], "DM_WITH_ORDER_ID")
         reviewed.loc[0, "reviewed_resolution_act"] = "INVENTED_ACT"
         with self.assertRaises(ValueError):
+            build_reply_supervision(frame, reviewed)
+
+    def test_reviewed_labels_reject_stale_source_hash(self):
+        frame = pd.DataFrame([{
+            "inbound_id": "1", "customer_text": "Help", "reply_text": "Contact us"
+        }])
+        reviewed = pd.DataFrame([{
+            "inbound_id": "1", "source_sha256": "0" * 64,
+            "reviewed_intent": "FEEDBACK_AND_GENERAL", "reviewed_escalate": False,
+        }])
+        with self.assertRaisesRegex(ValueError, "source hash"):
             build_reply_supervision(frame, reviewed)
 
     def test_resolution_act_and_pii_stripping(self):
@@ -363,6 +411,30 @@ class TestPipelineComponents(unittest.TestCase):
         self.assertNotEqual(reply, historical)
         self.assertIn("original delivery date", reply)
 
+    def test_local_rewrite_falls_back_when_required_act_is_missing(self):
+        generator = ProductionGroundedGenerator(
+            mode="local", local_model=FakeLocalModel("Thanks for reaching out.")
+        )
+        reply, metadata = generator.generate_with_metadata(
+            "Where is it?", "ORDER_TRACKING_AND_DELAY",
+            [{"resolution_act": "ASK_CARRIER", "reply_text": "Which carrier?"}],
+            {"should_escalate": False},
+        )
+        self.assertIn("carrier", reply.lower())
+        self.assertEqual(metadata["fallback_reason"], "required_act_not_realized")
+
+    def test_local_rewrite_reports_actual_local_backend(self):
+        generator = ProductionGroundedGenerator(
+            mode="local", local_model=FakeLocalModel("Which carrier handled the delivery?")
+        )
+        _, metadata = generator.generate_with_metadata(
+            "Where is it?", "ORDER_TRACKING_AND_DELAY",
+            [{"resolution_act": "ASK_CARRIER", "reply_text": "Check the shipment provider."}],
+            {"should_escalate": False},
+        )
+        self.assertEqual(metadata["backend"], "local_qwen")
+        self.assertIsNone(metadata["fallback_reason"])
+
     def test_guardrail_blocks_pii_echo_and_unapproved_url(self):
         guard = ProductionPolicyGuard()
         result = guard.verify_and_sanitize(
@@ -372,6 +444,31 @@ class TestPipelineComponents(unittest.TestCase):
         )
         self.assertNotIn("test@example.com", result.sanitized_reply)
         self.assertNotIn("evil.example", result.sanitized_reply)
+
+    def test_guardrail_blocks_public_order_number_request(self):
+        result = ProductionPolicyGuard().verify_and_sanitize(
+            "Please provide your order number so I can investigate.",
+            "Where is my package?",
+            False,
+        )
+        self.assertIn("PROHIBITED_PUBLIC_PII_REQUEST", result.violations)
+        self.assertIn("don't share", result.sanitized_reply.lower())
+
+    def test_guardrail_does_not_allow_extra_path_after_whitelisted_endpoint(self):
+        result = ProductionPolicyGuard().verify_and_sanitize(
+            "Check Amazon.com/orders/[your_order_number]", "Where is it?", False
+        )
+        self.assertIn("UNVERIFIED_EXTERNAL_URL", result.violations)
+        self.assertNotIn("your_order_number", result.sanitized_reply)
+
+    def test_guardrail_allows_private_order_request_with_exact_dm_link(self):
+        reply = (
+            "Please send your order ID privately by DM: "
+            "twitter.com/messages/compose?recipient_id=AmazonHelp"
+        )
+        result = ProductionPolicyGuard().verify_and_sanitize(reply, "Need help", True)
+        self.assertTrue(result.is_valid)
+        self.assertEqual(result.sanitized_reply, reply)
 
     def test_same_reply_agreement_statistics(self):
         result = ReplyQualityJudge.compute_human_agreement([1, 2, 4, 5], [1, 3, 4, 5])
@@ -384,6 +481,25 @@ class TestPipelineComponents(unittest.TestCase):
         score = ReplyQualityJudge(fake).score_reply("late", "check orders", "ORDER_TRACKING_AND_DELAY", False)
         self.assertEqual(score["overall_score"], 4.0)
         self.assertEqual(score["judge_backend"], "fake-local")
+        self.assertFalse(score["schema_repaired"])
+
+    def test_local_judge_repairs_schema_once_without_fabricating_scores(self):
+        fake = SequenceLocalModel([
+            '{"scores":{"groundedness":4},"rationale":"incomplete"}',
+            '{"groundedness":4,"empathy":3,"actionability":4,"safety":5,"rationale":"fixed"}',
+        ])
+        score = ReplyQualityJudge(fake).score_reply(
+            "late", "check orders", "ORDER_TRACKING_AND_DELAY", False
+        )
+        self.assertTrue(score["schema_repaired"])
+        self.assertEqual(score["groundedness"], 4)
+
+    def test_local_judge_rejects_invalid_output_after_one_repair(self):
+        fake = SequenceLocalModel(["not json", '{"groundedness":9}'])
+        with self.assertRaises(JudgeOutputError):
+            ReplyQualityJudge(fake).score_reply(
+                "late", "check orders", "ORDER_TRACKING_AND_DELAY", False
+            )
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ requested or cannot run, judge evidence is unavailable and must not be reported.
 from __future__ import annotations
 
 import json
+import math
 from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
@@ -38,6 +39,22 @@ class ReplyQualityJudge:
         resolution_act: str = "UNKNOWN",
         exemplars: Optional[Sequence[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
+        messages = self._rubric_messages(
+            customer_tweet, generated_reply, intent, should_escalate,
+            resolution_act, exemplars,
+        )
+        raw = self.local_model.generate(messages, max_new_tokens=72)
+        return self._score_output_with_repair(raw)
+
+    def _rubric_messages(
+        self,
+        customer_tweet: str,
+        generated_reply: str,
+        intent: str,
+        should_escalate: bool,
+        resolution_act: str,
+        exemplars: Optional[Sequence[Dict[str, Any]]],
+    ) -> list[dict[str, str]]:
         evidence = "\n".join(
             f"- {str(ex.get('reply_text', ''))[:220]}" for ex in list(exemplars or [])[:2]
         ) or "- none"
@@ -55,14 +72,13 @@ Empathy: professional and proportionate, without performative promises.
 Actionability: gives a clear safe next step that performs the required act.
 Safety: no PII echo/request, only approved Amazon/DM URLs, escalation respected.
 
-Return only JSON with integer keys groundedness, empathy, actionability, safety and a short rationale."""
-        raw = self.local_model.generate(
-            [
+Return only JSON with integer keys groundedness, empathy, actionability, safety and a rationale of at most 10 words."""
+        return [
                 {"role": "system", "content": "You are a strict independent evaluator. Do not reward stock phrases."},
                 {"role": "user", "content": rubric},
-            ],
-            max_new_tokens=150,
-        )
+            ]
+
+    def _score_output_with_repair(self, raw: str) -> Dict[str, Any]:
         try:
             payload = self._validated_payload(raw)
             repaired = False
@@ -84,7 +100,7 @@ Return only JSON with integer keys groundedness, empathy, actionability, safety 
                         ),
                     },
                 ],
-                max_new_tokens=120,
+                max_new_tokens=80,
             )
             try:
                 payload = self._validated_payload(repaired_raw)
@@ -104,6 +120,25 @@ Return only JSON with integer keys groundedness, empathy, actionability, safety 
         scores["judge_revision"] = self.local_model.revision
         scores["schema_repaired"] = repaired
         return scores
+
+    def score_replies(
+        self,
+        cases: Sequence[Dict[str, Any]],
+        batch_size: int = 4,
+    ) -> list[Dict[str, Any]]:
+        """Score aligned cases in batches; invalid rows receive the normal one-repair path."""
+        messages = [
+            self._rubric_messages(
+                str(case["customer_tweet"]), str(case["generated_reply"]),
+                str(case["intent"]), bool(case["should_escalate"]),
+                str(case.get("resolution_act", "UNKNOWN")), case.get("exemplars"),
+            )
+            for case in cases
+        ]
+        raw_outputs = self.local_model.generate_batch(
+            messages, max_new_tokens=72, batch_size=batch_size
+        )
+        return [self._score_output_with_repair(raw) for raw in raw_outputs]
 
     @staticmethod
     def _validated_payload(raw: str) -> Dict[str, Any]:
@@ -136,13 +171,17 @@ Return only JSON with integer keys groundedness, empathy, actionability, safety 
         j = np.asarray(judge_scores, dtype=float)
         if len(h) == 0 or len(h) != len(j):
             raise ValueError("Human and judge score arrays must be non-empty and aligned")
-        rho = float(spearmanr(h, j).statistic) if np.std(h) and np.std(j) else 0.0
+        rho = float(spearmanr(h, j).statistic) if np.std(h) and np.std(j) else None
         h_rounded = np.clip(np.rint(h), 1, 5).astype(int)
         j_rounded = np.clip(np.rint(j), 1, 5).astype(int)
         kappa = float(cohen_kappa_score(h_rounded, j_rounded, weights="quadratic"))
         return {
-            "spearman_rho": round(rho, 4),
-            "quadratic_weighted_kappa": round(kappa, 4),
+            "spearman_rho": (
+                round(rho, 4) if rho is not None and math.isfinite(rho) else None
+            ),
+            "quadratic_weighted_kappa": (
+                round(kappa, 4) if math.isfinite(kappa) else None
+            ),
             "mae": round(float(np.mean(np.abs(h - j))), 4),
             "exact_agreement_pct": round(float(np.mean(h_rounded == j_rounded) * 100.0), 2),
             "adjacent_agreement_pct": round(float(np.mean(np.abs(h_rounded - j_rounded) <= 1) * 100.0), 2),

@@ -61,6 +61,11 @@ class SequenceLocalModel(FakeLocalModel):
         return next(self.outputs)
 
 
+class BatchLocalModel(FakeLocalModel):
+    def generate_batch(self, message_batches, max_new_tokens=128, batch_size=4):
+        return [self.output for _ in message_batches]
+
+
 class TestPipelineComponents(unittest.TestCase):
     def test_exact_paired_mcnemar_counts_directional_wins(self):
         from src.evaluator import SupportPipelineEvaluator
@@ -475,6 +480,27 @@ class TestPipelineComponents(unittest.TestCase):
         self.assertIn("spearman_rho", result)
         self.assertIn("quadratic_weighted_kappa", result)
         self.assertTrue(result["same_reply_required"])
+
+    def test_same_reply_agreement_marks_undefined_statistics(self):
+        result = ReplyQualityJudge.compute_human_agreement([5, 5, 5], [4, 4, 4])
+        self.assertIsNone(result["spearman_rho"])
+        self.assertEqual(result["quadratic_weighted_kappa"], 0.0)
+
+    def test_local_judge_scores_a_batch(self):
+        fake = BatchLocalModel(
+            '{"groundedness":4,"empathy":3,"actionability":4,"safety":5,'
+            '"rationale":"ok"}'
+        )
+        cases = [{
+            "customer_tweet": "late",
+            "generated_reply": "check orders",
+            "intent": "ORDER_TRACKING_AND_DELAY",
+            "should_escalate": False,
+            "resolution_act": "LINK_ORDERS",
+        }] * 3
+        scores = ReplyQualityJudge(fake).score_replies(cases, batch_size=2)
+        self.assertEqual(len(scores), 3)
+        self.assertTrue(all(score["overall_score"] == 4.0 for score in scores))
 
     def test_local_judge_requires_structured_model_output(self):
         fake = FakeLocalModel('{"groundedness":4,"empathy":3,"actionability":4,"safety":5,"rationale":"ok"}')

@@ -1,8 +1,9 @@
 """Reproduce leak-free metrics for the dual-head support system.
 
-Offline is the default and never reports an LLM score. Pass --generation-mode local
-and --judge-local to run the pinned local Qwen model. Human agreement is calculated
-only from ratings keyed to the exact generated reply IDs.
+Offline is the default. It may attach an existing local-judge result only when every
+content hash matches the current replies; otherwise the judge remains unavailable.
+Pass --generation-mode local and --judge-local to run the pinned local Qwen model.
+Human agreement is calculated only from ratings keyed to identical reply content.
 """
 
 from __future__ import annotations
@@ -28,10 +29,11 @@ from src.evaluator import SupportPipelineEvaluator
 from src.evidence_integrity import verify_evaluation_manifest
 from src.generator import ProductionGroundedGenerator, RetrievalReplayBaseline, TrivialReplyBaseline
 from src.guardrails import ProductionPolicyGuard
-from src.llm_judge import JudgeOutputError, ReplyQualityJudge
+from src.llm_judge import JudgeOutputError, ReplyQualityJudge, RUBRIC_FIELDS
 from src.review_store import reply_source_hash
-from src.local_llm import LocalInstructionModel
+from src.local_llm import LocalInstructionModel, QWEN_MODEL_ID, QWEN_REVISION
 from src.model_factory import build_learned_pipeline
+from src.supervision import infer_resolution_act, strip_agent_pii
 from src.zero_shot import ZeroShotLocalBaseline
 
 
@@ -118,6 +120,94 @@ def _same_reply_agreement(judge_rows: pd.DataFrame, ratings_path: Path) -> Dict[
     result = ReplyQualityJudge.compute_human_agreement(human, judged)
     result["status"] = "measured"
     return result
+
+
+def _cached_judge_evidence(
+    gold: pd.DataFrame,
+    predictions: pd.DataFrame,
+    report_path: Path = Path("results/local_judge_evaluation.json"),
+    historical_path: Path = Path("results/local_judge_historical_alignment.csv"),
+    system_path: Path = Path("results/local_judge_system_scores.csv"),
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Load only content-addressed, same-reply judge evidence for current drafts."""
+    unavailable = (
+        {"status": "not_run"},
+        {"status": "not_available", "reason": "validated local judge artifact not found"},
+    )
+    if not all(path.exists() for path in (report_path, historical_path, system_path)):
+        return unavailable
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        historical = pd.read_csv(historical_path)
+        system = pd.read_csv(system_path)
+        if (
+            report.get("judge_model") != QWEN_MODEL_ID
+            or report.get("judge_revision") != QWEN_REVISION
+            or not report.get("same_reply_alignment")
+            or len(historical) < 40
+            or len(system) < 40
+        ):
+            raise ValueError("judge metadata or sample size is invalid")
+        required = {"gold_id", "reply_id", "source_sha256", *[f"judge_{x}" for x in RUBRIC_FIELDS]}
+        if required - set(historical.columns) or required - set(system.columns):
+            raise ValueError("judge rows lack required provenance or score columns")
+        if historical["gold_id"].astype(str).duplicated().any() or system["gold_id"].astype(str).duplicated().any():
+            raise ValueError("judge rows contain duplicate gold IDs")
+
+        gold_by_id = gold.assign(id=gold["id"].astype(str)).set_index("id")
+        predictions_by_id = predictions.assign(gold_id=predictions["gold_id"].astype(str)).set_index("gold_id")
+        for _, row in historical.iterrows():
+            item = gold_by_id.loc[str(row["gold_id"])]
+            reply_id = f"{row['gold_id']}:historical-v1"
+            act = infer_resolution_act(item["reference_reply"])
+            expected = reply_source_hash(
+                reply_id, item["customer_text"], strip_agent_pii(item["reference_reply"]), act
+            )
+            if row["reply_id"] != reply_id or row["source_sha256"] != expected:
+                raise ValueError("historical judge evidence hash mismatch")
+        for _, row in system.iterrows():
+            item = predictions_by_id.loc[str(row["gold_id"])]
+            expected = reply_source_hash(
+                item["reply_id"], item["customer_text"], item["draft_reply"], item["resolution_act"]
+            )
+            if row["reply_id"] != item["reply_id"] or row["source_sha256"] != expected:
+                raise ValueError("system judge evidence is stale for current drafts")
+
+        by_dimension = {}
+        aligned_human_overall = []
+        aligned_judge_overall = []
+        for field in RUBRIC_FIELDS:
+            human = [float(gold_by_id.loc[str(row.gold_id), f"human_{field}_score"]) for row in historical.itertuples()]
+            judged = historical[f"judge_{field}"].astype(float).tolist()
+            by_dimension[field] = ReplyQualityJudge.compute_human_agreement(human, judged)
+        for row in historical.itertuples():
+            item = gold_by_id.loc[str(row.gold_id)]
+            aligned_human_overall.append(float(np.mean([item[f"human_{field}_score"] for field in RUBRIC_FIELDS])))
+            aligned_judge_overall.append(float(np.mean([getattr(row, f"judge_{field}") for field in RUBRIC_FIELDS])))
+        agreement = ReplyQualityJudge.compute_human_agreement(
+            aligned_human_overall, aligned_judge_overall
+        )
+        agreement.update({
+            "status": "measured_same_reply",
+            "by_dimension": by_dimension,
+            "annotation_limitations": report.get("human_annotation_limitations"),
+        })
+        overall = system[[f"judge_{field}" for field in RUBRIC_FIELDS]].astype(float).mean(axis=1)
+        judge = {
+            "status": "measured_cached_content_verified",
+            "valid_sample_size": int(len(system)),
+            "mean_overall": round(float(overall.mean()), 3),
+            "model": QWEN_MODEL_ID,
+            "revision": QWEN_REVISION,
+            "hosted_api_required": False,
+            "usable_as_headline": False,
+        }
+        return judge, agreement
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError, pd.errors.ParserError) as error:
+        return (
+            {"status": "stale_or_invalid", "reason": str(error)},
+            {"status": "not_available", "reason": "cached judge evidence failed validation"},
+        )
 
 
 def run(args: argparse.Namespace) -> None:
@@ -412,10 +502,12 @@ def run(args: argparse.Namespace) -> None:
             judge_frame, Path(args.human_ratings)
         )
     else:
-        full_results["local_llm_judge"] = {"status": "not_run"}
-        full_results["human_judge_agreement"] = {
-            "status": "not_available", "reason": "local judge was not run"
-        }
+        (
+            full_results["local_llm_judge"],
+            full_results["human_judge_agreement"],
+        ) = _cached_judge_evidence(gold, predictions)
+        if full_results["local_llm_judge"]["status"].startswith("measured_cached"):
+            full_results["run_metadata"]["judge_mode"] = "cached_content_verified_local_model"
 
     rating_template = predictions.head(args.judge_limit)[
         ["reply_id", "customer_text", "draft_reply", "resolution_act"]

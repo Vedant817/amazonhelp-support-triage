@@ -7,6 +7,7 @@ Running:
     python main.py test                # Run complete unit & integration test suite
     python main.py benchmark           # Run the 200 Golden Evaluation benchmark
     python main.py stress              # Run the safety regression suite
+    python main.py judge-eval          # Run same-reply local judge validation
     python main.py review --port 8001  # Start the independent label-review desk
 """
 
@@ -79,6 +80,17 @@ def run_stress():
         sys.exit(ret)
 
 
+def run_judge_evaluation(limit: int = 40, batch_size: int = 4):
+    """Measure the pinned local judge against human scores on identical replies."""
+    script = os.path.join(REPO_ROOT, "scripts", "evaluate_judge_alignment.py")
+    ret = subprocess.call([
+        sys.executable, script, "--limit", str(limit), "--batch-size", str(batch_size)
+    ])
+    if ret != 0:
+        print("\n[ERROR] Judge evaluation did not produce the required valid sample.")
+        sys.exit(ret)
+
+
 def run_benchmark(
     generation_mode: str = "offline",
     judge_local: bool = False,
@@ -132,7 +144,7 @@ Examples:
         "command",
         nargs="?",
         default="serve",
-        choices=["serve", "benchmark", "stress", "test", "review"],
+        choices=["serve", "benchmark", "stress", "test", "review", "judge-eval"],
         help="Command to execute (default: serve)"
     )
     parser.add_argument("--host", default="127.0.0.1", help="Host to bind for server (default: 127.0.0.1)")
@@ -140,6 +152,8 @@ Examples:
     parser.add_argument("--reload", action="store_true", help="Enable auto-reload for development")
     parser.add_argument("--generation-mode", choices=["offline", "local"], default=None)
     parser.add_argument("--judge-local", action="store_true", help="Run the pinned local-model reply judge")
+    parser.add_argument("--judge-limit", type=int, default=40, help="Same-reply judge sample size")
+    parser.add_argument("--judge-batch-size", type=int, default=4, help="Local judge inference batch size")
     parser.add_argument("--include-zero-shot-local", action="store_true", help="Add the local Qwen zero-shot baseline")
     parser.add_argument(
         "--contrastive-pairs", type=int, default=0,
@@ -170,6 +184,8 @@ Examples:
         run_stress()
     elif args.command == "review":
         run_review(args.host, args.port)
+    elif args.command == "judge-eval":
+        run_judge_evaluation(args.judge_limit, args.judge_batch_size)
     elif args.command == "benchmark":
         run_benchmark(
             args.generation_mode or "offline",

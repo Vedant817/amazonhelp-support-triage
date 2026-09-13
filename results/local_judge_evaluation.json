@@ -1,0 +1,105 @@
+{
+  "judge_model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "judge_revision": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+  "hosted_api_required": false,
+  "sampling": "stratified across all six intents before deterministic remainder sampling",
+  "requested_sample_size": 40,
+  "human_annotation_source": "existing single-annotator scores on historical reference replies",
+  "human_annotation_limitations": "annotator identity and repeat-rating protocol are not recorded; safety scores have zero variance",
+  "same_reply_alignment": true,
+  "content_hashes_recorded": true,
+  "historical_valid_count": 40,
+  "historical_invalid_ids": [],
+  "agreement_status": "measured",
+  "human_judge_agreement": {
+    "overall": {
+      "spearman_rho": -0.1609,
+      "quadratic_weighted_kappa": 0.0,
+      "mae": 0.6062,
+      "exact_agreement_pct": 50.0,
+      "adjacent_agreement_pct": 100.0,
+      "sample_size": 40,
+      "same_reply_required": true
+    },
+    "by_dimension": {
+      "groundedness": {
+        "spearman_rho": 0.0632,
+        "quadratic_weighted_kappa": -0.0073,
+        "mae": 1.4,
+        "exact_agreement_pct": 2.5,
+        "adjacent_agreement_pct": 57.5,
+        "sample_size": 40,
+        "same_reply_required": true
+      },
+      "empathy": {
+        "spearman_rho": 0.1969,
+        "quadratic_weighted_kappa": 0.1532,
+        "mae": 0.375,
+        "exact_agreement_pct": 70.0,
+        "adjacent_agreement_pct": 92.5,
+        "sample_size": 40,
+        "same_reply_required": true
+      },
+      "actionability": {
+        "spearman_rho": -0.2215,
+        "quadratic_weighted_kappa": -0.01,
+        "mae": 1.825,
+        "exact_agreement_pct": 2.5,
+        "adjacent_agreement_pct": 15.0,
+        "sample_size": 40,
+        "same_reply_required": true
+      },
+      "safety": {
+        "spearman_rho": null,
+        "quadratic_weighted_kappa": 0.0,
+        "mae": 0.775,
+        "exact_agreement_pct": 55.0,
+        "adjacent_agreement_pct": 70.0,
+        "sample_size": 40,
+        "same_reply_required": true
+      }
+    }
+  },
+  "largest_same_reply_disagreements": [
+    {
+      "gold_id": "GOLD-171",
+      "human_overall": 3.75,
+      "judge_overall": 5.0,
+      "absolute_gap": 1.25
+    },
+    {
+      "gold_id": "GOLD-001",
+      "human_overall": 3.75,
+      "judge_overall": 4.75,
+      "absolute_gap": 1.0
+    },
+    {
+      "gold_id": "GOLD-013",
+      "human_overall": 3.75,
+      "judge_overall": 4.75,
+      "absolute_gap": 1.0
+    },
+    {
+      "gold_id": "GOLD-045",
+      "human_overall": 4.0,
+      "judge_overall": 5.0,
+      "absolute_gap": 1.0
+    },
+    {
+      "gold_id": "GOLD-091",
+      "human_overall": 3.75,
+      "judge_overall": 4.75,
+      "absolute_gap": 1.0
+    }
+  ],
+  "system_valid_count": 40,
+  "system_invalid_ids": [],
+  "system_judge_means": {
+    "groundedness": 4.575,
+    "empathy": 3.65,
+    "actionability": 4.8,
+    "safety": 4.025
+  },
+  "system_judge_overall_mean": 4.263,
+  "judge_score_usable_as_headline": false
+}

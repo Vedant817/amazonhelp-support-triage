@@ -39,7 +39,7 @@
     "escalation_train_size": 3476,
     "escalation_calibration_size": 870,
     "generation_mode": "offline",
-    "judge_mode": "not_run",
+    "judge_mode": "cached_content_verified_local_model",
     "zero_shot_local_baseline": "not_run"
   },
   "systems": {
@@ -186,7 +186,7 @@
         "twitter_length_compliance": 1.0,
         "no_pii_echo_rate": 1.0
       },
-      "mean_latency_ms": 0.01,
+      "mean_latency_ms": 0.0,
       "invalid_structured_outputs": 0
     },
     "Baseline 2: TF-IDF + keyword escalation + retrieve/replay": {
@@ -332,7 +332,7 @@
         "twitter_length_compliance": 1.0,
         "no_pii_echo_rate": 1.0
       },
-      "mean_latency_ms": 141.45,
+      "mean_latency_ms": 259.8,
       "invalid_structured_outputs": 0
     },
     "Proposed: MiniLM dual-head + safety gates + retrieve/rewrite": {
@@ -478,7 +478,7 @@
         "twitter_length_compliance": 1.0,
         "no_pii_echo_rate": 1.0
       },
-      "mean_latency_ms": 90.3,
+      "mean_latency_ms": 85.07,
       "invalid_structured_outputs": 0
     }
   },
@@ -900,10 +900,61 @@
     }
   },
   "local_llm_judge": {
-    "status": "not_run"
+    "status": "measured_cached_content_verified",
+    "valid_sample_size": 40,
+    "mean_overall": 4.263,
+    "model": "Qwen/Qwen2.5-1.5B-Instruct",
+    "revision": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+    "hosted_api_required": false,
+    "usable_as_headline": false
   },
   "human_judge_agreement": {
-    "status": "not_available",
-    "reason": "local judge was not run"
+    "spearman_rho": -0.1609,
+    "quadratic_weighted_kappa": 0.0,
+    "mae": 0.6062,
+    "exact_agreement_pct": 50.0,
+    "adjacent_agreement_pct": 100.0,
+    "sample_size": 40,
+    "same_reply_required": true,
+    "status": "measured_same_reply",
+    "by_dimension": {
+      "groundedness": {
+        "spearman_rho": 0.0632,
+        "quadratic_weighted_kappa": -0.0073,
+        "mae": 1.4,
+        "exact_agreement_pct": 2.5,
+        "adjacent_agreement_pct": 57.5,
+        "sample_size": 40,
+        "same_reply_required": true
+      },
+      "empathy": {
+        "spearman_rho": 0.1969,
+        "quadratic_weighted_kappa": 0.1532,
+        "mae": 0.375,
+        "exact_agreement_pct": 70.0,
+        "adjacent_agreement_pct": 92.5,
+        "sample_size": 40,
+        "same_reply_required": true
+      },
+      "actionability": {
+        "spearman_rho": -0.2215,
+        "quadratic_weighted_kappa": -0.01,
+        "mae": 1.825,
+        "exact_agreement_pct": 2.5,
+        "adjacent_agreement_pct": 15.0,
+        "sample_size": 40,
+        "same_reply_required": true
+      },
+      "safety": {
+        "spearman_rho": null,
+        "quadratic_weighted_kappa": 0.0,
+        "mae": 0.775,
+        "exact_agreement_pct": 55.0,
+        "adjacent_agreement_pct": 70.0,
+        "sample_size": 40,
+        "same_reply_required": true
+      }
+    },
+    "annotation_limitations": "annotator identity and repeat-rating protocol are not recorded; safety scores have zero variance"
   }
 }

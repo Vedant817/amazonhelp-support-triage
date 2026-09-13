@@ -27,6 +27,9 @@ class TestEvidenceArtifacts(unittest.TestCase):
         self.assertEqual(len(review), 400)
         self.assertTrue(set(review["inbound_id"].astype(str)).isdisjoint(set(gold["tweet_id"].astype(str))))
         self.assertEqual(int(review["reviewed_intent"].notna().sum()), 0)
+        self.assertIn("conversation_context", review.columns)
+        self.assertIn("prior_turn_count", review.columns)
+        self.assertGreater(float((review["prior_turn_count"] > 0).mean()), 0.0)
 
     def test_saved_results_have_row_level_evidence(self):
         with (ROOT / "results/headline_results.json").open(encoding="utf-8") as handle:
@@ -38,6 +41,11 @@ class TestEvidenceArtifacts(unittest.TestCase):
         self.assertIn("intent_calibration", results)
         self.assertIn("escalation_risk_score", predictions.columns)
         self.assertGreater(results["run_metadata"]["weak_intent_labels_pruned"], 0)
+        self.assertTrue(results["run_metadata"]["context_is_causally_prior_only"])
+        self.assertGreater(results["run_metadata"]["historical_context_coverage"], 0.0)
+        self.assertEqual(results["run_metadata"]["escalation_selected_c"], 0.25)
+        self.assertIn("model_input", predictions.columns)
+        self.assertIn("context_used", predictions.columns)
         zero_shot_status = results["run_metadata"]["zero_shot_local_baseline"]
         if zero_shot_status == "run":
             self.assertIn("Baseline 3: zero-shot local Qwen", results["systems"])

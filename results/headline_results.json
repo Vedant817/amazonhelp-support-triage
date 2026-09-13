@@ -3,6 +3,22 @@
     "gold_size": 200,
     "gold_label_audit": "data/golden/LABEL_AUDIT.md",
     "gold_ids_excluded_from_training_and_retrieval": true,
+    "historical_context_coverage": 0.506316,
+    "context_is_causally_prior_only": true,
+    "trained_pipeline_cache_hit": true,
+    "context_gate_confidence": 0.0,
+    "context_gate_margin": 1.0,
+    "context_gate_calibration_macro_f1_gain": 0.0,
+    "prototype_blend_weight": 0.0,
+    "prototype_temperature": 0.1,
+    "prototype_calibration_macro_f1_gain": 0.004055,
+    "semantic_blend_weight": 0.0,
+    "semantic_blend_calibration_nll_gain": 0.0,
+    "intent_selected_c": 1.0,
+    "intent_training_cv_macro_f1": 0.0,
+    "escalation_selected_c": 0.25,
+    "escalation_selected_class_weight": null,
+    "escalation_training_cv_average_precision": 0.611819,
     "supervision": "reply-side weak labels plus conservative probabilistic abstention filling and optional human-reviewed overrides",
     "human_reviewed_label_count": 0,
     "intent_train_size": 3900,
@@ -162,7 +178,7 @@
         "twitter_length_compliance": 1.0,
         "no_pii_echo_rate": 1.0
       },
-      "mean_latency_ms": 0.01,
+      "mean_latency_ms": 0.0,
       "invalid_structured_outputs": 0
     },
     "Baseline 2: TF-IDF + keyword escalation + retrieve/replay": {
@@ -308,7 +324,7 @@
         "twitter_length_compliance": 1.0,
         "no_pii_echo_rate": 1.0
       },
-      "mean_latency_ms": 63.2,
+      "mean_latency_ms": 164.85,
       "invalid_structured_outputs": 0
     },
     "Proposed: MiniLM dual-head + safety gates + retrieve/rewrite": {
@@ -421,16 +437,16 @@
       },
       "escalation_metrics": {
         "accuracy": 0.575,
-        "macro_f1": 0.4866,
-        "escalate_f1": 0.6996,
-        "escalate_precision": 0.5723,
-        "escalate_recall": 0.9,
-        "escalate_recall_one_sided_95_lower": 0.8399,
+        "macro_f1": 0.4813,
+        "escalate_f1": 0.7018,
+        "escalate_precision": 0.5714,
+        "escalate_recall": 0.9091,
+        "escalate_recall_one_sided_95_lower": 0.8507,
         "escalate_positive_count": 110,
-        "auto_handle_rate": 0.135,
-        "auto_handle_f1": 0.2735,
-        "auto_handle_precision": 0.5926,
-        "auto_handle_recall": 0.1778,
+        "auto_handle_rate": 0.125,
+        "auto_handle_f1": 0.2609,
+        "auto_handle_precision": 0.6,
+        "auto_handle_recall": 0.1667,
         "reason_exact_match": 0.47
       },
       "bootstrap_95_ci": {
@@ -440,13 +456,13 @@
           "iterations": 2000
         },
         "escalate_recall": {
-          "lower": 0.8393,
-          "upper": 0.9528,
+          "lower": 0.85,
+          "upper": 0.9588,
           "iterations": 2000
         },
         "escalate_precision": {
           "lower": 0.5,
-          "upper": 0.645,
+          "upper": 0.6457,
           "iterations": 2000
         }
       },
@@ -454,13 +470,13 @@
         "twitter_length_compliance": 1.0,
         "no_pii_echo_rate": 1.0
       },
-      "mean_latency_ms": 99.7,
+      "mean_latency_ms": 133.62,
       "invalid_structured_outputs": 0
     }
   },
   "temperature_scaling": {
     "intent_temperature": 1.257298,
-    "escalation_temperature": 0.867272,
+    "escalation_temperature": 0.756267,
     "calibration_source": "reply-labeled holdout; no gold labels"
   },
   "intent_calibration": {
@@ -706,144 +722,136 @@
     ]
   },
   "escalation_threshold": {
-    "threshold": 0.217065,
-    "high_precision_threshold": 0.643043,
+    "threshold": 0.204169,
+    "high_precision_threshold": 0.626766,
     "selection_target_recall": 0.85,
     "high_risk_selection_target_precision": 0.8,
     "selection_source": "reply-labeled holdout; no gold labels",
-    "calibration_observed_recall": 0.885449,
-    "calibration_recall_lower_bound": 0.852069,
+    "calibration_observed_recall": 0.894737,
+    "calibration_recall_lower_bound": 0.862337,
     "calibration_confidence_level": 0.95,
     "calibration_positive_count": 323,
     "recall_bound_target_met": true,
     "gold_cost_curve_diagnostic": {
       "optimal_threshold": 0.1,
-      "minimum_loss": 98.0,
+      "minimum_loss": 99.0,
       "cost_escalate": 1.0,
       "cost_error_leak": 10.0,
       "cost_curve": [
         {
           "threshold": 0.1,
-          "loss": 98.0,
-          "fp": 88,
+          "loss": 99.0,
+          "fp": 89,
           "fn": 1,
           "tp": 109,
-          "tn": 2
+          "tn": 1
         },
         {
           "threshold": 0.15,
-          "loss": 146.0,
-          "fp": 86,
-          "fn": 6,
-          "tp": 104,
-          "tn": 4
+          "loss": 133.0,
+          "fp": 83,
+          "fn": 5,
+          "tp": 105,
+          "tn": 7
         },
         {
           "threshold": 0.2,
-          "loss": 186.0,
+          "loss": 166.0,
           "fp": 76,
-          "fn": 11,
-          "tp": 99,
+          "fn": 9,
+          "tp": 101,
           "tn": 14
         },
         {
           "threshold": 0.25,
-          "loss": 257.0,
-          "fp": 67,
-          "fn": 19,
-          "tp": 91,
-          "tn": 23
+          "loss": 298.0,
+          "fp": 68,
+          "fn": 23,
+          "tp": 87,
+          "tn": 22
         },
         {
           "threshold": 0.3,
-          "loss": 359.0,
-          "fp": 59,
+          "loss": 361.0,
+          "fp": 61,
           "fn": 30,
           "tp": 80,
-          "tn": 31
+          "tn": 29
         },
         {
           "threshold": 0.35,
-          "loss": 483.0,
-          "fp": 53,
-          "fn": 43,
-          "tp": 67,
-          "tn": 37
+          "loss": 468.0,
+          "fp": 48,
+          "fn": 42,
+          "tp": 68,
+          "tn": 42
         },
         {
           "threshold": 0.4,
-          "loss": 512.0,
-          "fp": 42,
-          "fn": 47,
-          "tp": 63,
-          "tn": 48
+          "loss": 520.0,
+          "fp": 40,
+          "fn": 48,
+          "tp": 62,
+          "tn": 50
         },
         {
           "threshold": 0.45,
-          "loss": 597.0,
-          "fp": 37,
-          "fn": 56,
-          "tp": 54,
-          "tn": 53
+          "loss": 643.0,
+          "fp": 33,
+          "fn": 61,
+          "tp": 49,
+          "tn": 57
         },
         {
           "threshold": 0.5,
-          "loss": 696.0,
-          "fp": 26,
-          "fn": 67,
-          "tp": 43,
-          "tn": 64
+          "loss": 732.0,
+          "fp": 22,
+          "fn": 71,
+          "tp": 39,
+          "tn": 68
         },
         {
           "threshold": 0.55,
-          "loss": 746.0,
-          "fp": 16,
-          "fn": 73,
-          "tp": 37,
-          "tn": 74
+          "loss": 805.0,
+          "fp": 15,
+          "fn": 79,
+          "tp": 31,
+          "tn": 75
         },
         {
           "threshold": 0.6,
-          "loss": 842.0,
-          "fp": 12,
-          "fn": 83,
-          "tp": 27,
-          "tn": 78
+          "loss": 866.0,
+          "fp": 6,
+          "fn": 86,
+          "tp": 24,
+          "tn": 84
         },
         {
           "threshold": 0.65,
-          "loss": 867.0,
-          "fp": 7,
-          "fn": 86,
-          "tp": 24,
-          "tn": 83
+          "loss": 904.0,
+          "fp": 4,
+          "fn": 90,
+          "tp": 20,
+          "tn": 86
         },
         {
           "threshold": 0.7,
-          "loss": 913.0,
-          "fp": 3,
-          "fn": 91,
-          "tp": 19,
-          "tn": 87
+          "loss": 941.0,
+          "fp": 1,
+          "fn": 94,
+          "tp": 16,
+          "tn": 89
         },
         {
           "threshold": 0.75,
-          "loss": 951.0,
+          "loss": 1001.0,
           "fp": 1,
-          "fn": 95,
-          "tp": 15,
+          "fn": 100,
+          "tp": 10,
           "tn": 89
         },
         {
           "threshold": 0.8,
-          "loss": 1021.0,
-          "fp": 1,
-          "fn": 102,
-          "tp": 8,
-          "tn": 89
-        },
-        {
-          "threshold": 0.85,
           "loss": 1050.0,
           "fp": 0,
           "fn": 105,
@@ -851,11 +859,19 @@
           "tn": 90
         },
         {
-          "threshold": 0.9,
+          "threshold": 0.85,
           "loss": 1060.0,
           "fp": 0,
           "fn": 106,
           "tp": 4,
+          "tn": 90
+        },
+        {
+          "threshold": 0.9,
+          "loss": 1070.0,
+          "fp": 0,
+          "fn": 107,
+          "tp": 3,
           "tn": 90
         }
       ]

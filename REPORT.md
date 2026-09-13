@@ -11,7 +11,8 @@ current.
 
 The implementation is therefore a verified local prototype, not a production-ready
 agent. Its chief remaining dependency is independent review of the prepared 400 training
-examples. There are zero such reviewed labels in the current result.
+examples through the blind review application. There are zero such consensus labels in
+the current result.
 
 ## What is implemented
 
@@ -66,16 +67,24 @@ act may override a mid-range score; uncertainty and high-confidence risk still e
 ### Retrieve then rewrite
 
 The retriever combines BM25 with MiniLM cosine similarity using reciprocal-rank fusion.
+Production searches an intent-filtered pool of 12 candidates so rare, compatible acts
+are less likely to be hidden by the dominant general-support class; only the top three
+records are returned as visible evidence.
 It stores PII-stripped historical replies and one of eight resolution acts:
 
 `ASK_TRACKING_STATUS`, `ASK_CARRIER`, `DM_WITH_ORDER_ID`, `LINK_ORDERS`,
 `LINK_RETURNS`, `TROUBLESHOOT_DEVICE`, `APOLOGIZE_WAIT`, `GENERAL_SUPPORT`.
 
 An RRF-weighted, deterministic vote over intent-compatible acts controls the next step.
-In `local` mode, the act and two
-sanitized neighbors condition a pinned Qwen2.5-0.5B-Instruct prompt. In default `offline`
+In `local` mode, the act and up to two act-matched,
+sanitized neighbors condition a revision-pinned Qwen2.5-1.5B-Instruct prompt. In default `offline`
 mode, the same retrieved act selects a deterministic act-specific fallback. Both paths
-then pass through URL, PII, false-promise, and length guardrails.
+then pass through URL, PII, false-promise, and length guardrails. Local output is rejected
+before dispatch if it misses the act, copies a neighbor, requests sensitive data publicly,
+uses a non-exact approved URL, or exceeds 280 characters; the trace exposes the fallback.
+In the saved eight-act qualification, 3/8 local drafts were accepted and 5/8 used the
+safe fallback. All final outputs met the deterministic checks; this validates containment,
+not human-perceived reply quality.
 
 ### Reply evaluation
 
@@ -128,6 +137,16 @@ than a distribution-free safety guarantee.
 On the gold diagnostic, 10-bin quantile ECE is 0.0630 and MCE is 0.1558. These are
 descriptive test-set diagnostics, not calibration-fit inputs.
 
+Exact paired tests are also saved. Proposed intent corrects 20 TF-IDF errors while
+regressing on 10, but the exact two-sided McNemar p-value is 0.098737. Proposed routing
+corrects 67 keyword decisions while regressing on 56; the corresponding accuracy
+p-value is 0.367297. Neither supports a blanket superiority claim on n=200.
+
+The held-out retrieval diagnostic exposes severe act imbalance rather than hiding it.
+Top-3 macro act recall is 0.304 with a held-out reply-side weak-intent filter; the
+12-candidate pool reaches 0.701 macro recall. The latter is a candidate-coverage and
+upper-bound diagnostic, not end-to-end act accuracy.
+
 ## What the result proves—and does not
 
 It proves that, in this frozen checkout and audited gold set:
@@ -154,13 +173,13 @@ It does not prove:
 
 ## Next evidence gate
 
-Two independent reviewers should fill `reviewed_intent`, `reviewed_escalate`,
-`reviewed_reason_code`, and `reviewed_resolution_act` in
-`data/training/labels_for_human_review.csv`, resolve disagreements without consulting
-gold predictions, and rerun the benchmark. Only after those labels exist is SetFit-style
-encoder fine-tuning justified. Separately, reviewers should score the exact 50 replies in
-`results/human_rating_template.csv`; only those matching reply IDs may be compared with
-the local judge.
+Two independent reviewers should run `python main.py review --port 8001` under different
+reviewer IDs. The application hides weak labels and predictions and writes separate,
+source-hashed files under `data/reviews/`. `scripts/adjudicate_reviews.py` emits only
+exact, non-ambiguous consensus into `data/training/human_consensus_labels.csv`; disputed
+rows stay separate. Contrastive tuning cannot start until at least 48 consensus labels
+cover all six intents. Separately, the `/ratings` desk collects blind ratings on the exact
+50 drafts. Judge-human agreement remains unavailable until at least 40 source hashes match.
 
 ## Reproduction and verification
 
@@ -174,6 +193,14 @@ The first run trains and writes a fingerprinted cache; a second run must reprodu
 same metrics while reporting `trained_pipeline_cache_hit: true`. Rebuild historical
 context from the source dataset with
 `.\.venv\Scripts\python.exe scripts\build_conversation_context.py`.
+
+The gold CSV and JSONL hashes are frozen in `data/golden/MANIFEST.json` and verified
+before every benchmark. Retrieval and local generation diagnostics run with:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\evaluate_retrieval.py --queries 500
+.\.venv\Scripts\python.exe scripts\qualify_local_generator.py
+```
 
 The default offline generation path, local API lifecycle, label audit, safety checks,
 and row-level evidence are covered by the repository test suite. The slower local Qwen

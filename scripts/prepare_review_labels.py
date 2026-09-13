@@ -56,7 +56,14 @@ def main() -> None:
     parser.add_argument("--force", action="store_true", help="Replace an existing unreviewed sheet")
     args = parser.parse_args()
 
-    pairs = pd.read_csv(ROOT / "data" / "processed" / "amazonhelp_english_pairs.csv")
+    pairs = pd.read_csv(ROOT / "data" / "processed" / "amazonhelp_context_pairs.csv")
+    pairs["conversation_context"] = pairs["conversation_context"].fillna("")
+    pairs["model_text"] = pairs.apply(
+        lambda row: (
+            f"{row['conversation_context']}\nCURRENT CUSTOMER: {row['customer_text']}"
+            if row["conversation_context"] else str(row["customer_text"])
+        ), axis=1,
+    )
     gold = pd.read_csv(ROOT / "data" / "golden" / "golden_eval_set.csv")
     pairs = pairs[~pairs["inbound_id"].astype(str).isin(set(gold["tweet_id"].astype(str)))]
     labeled = build_reply_supervision(pairs)
@@ -71,7 +78,7 @@ def main() -> None:
             raise RuntimeError(f"{output} already exists; pass --force to replace the unreviewed sheet")
 
     encoder = MiniLMEncoder()
-    embeddings = encoder.encode(labeled["customer_text"].astype(str).tolist())
+    embeddings = encoder.encode(labeled["model_text"].astype(str).tolist())
     intent_probs, intent_classes = _out_of_fold_probabilities(
         embeddings, labeled["intent_label"], embeddings
     )
@@ -91,7 +98,7 @@ def main() -> None:
     sample["ambiguous"] = ""
     sample["review_notes"] = ""
     columns = [
-        "inbound_id", "customer_text", "reply_text", "resolution_act",
+        "inbound_id", "conversation_context", "prior_turn_count", "customer_text", "reply_text", "resolution_act",
         "intent_label", "escalate_label", "provisional_intent", "intent_uncertainty",
         "weak_label_suspicion", "route_margin", "model_weak_disagreement",
         "active_learning_score", "diversity_cluster", "reviewed_intent",

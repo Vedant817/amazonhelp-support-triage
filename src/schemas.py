@@ -69,6 +69,8 @@ class HealthResponse(BaseModel):
     brand: str
     model_version: str
     corpus_size: int
+    historical_context_coverage: float
+    trained_pipeline_cache_hit: bool
     intent_temperature: float
     escalation_temperature: float
     escalation_threshold: float

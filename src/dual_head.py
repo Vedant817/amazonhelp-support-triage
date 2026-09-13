@@ -15,7 +15,8 @@ from scipy.stats import beta
 from scipy.sparse import csr_matrix, hstack
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.model_selection import StratifiedKFold, cross_val_predict, cross_val_score
+from sklearn.metrics import f1_score
 from sklearn.multiclass import OneVsRestClassifier
 from sklearn.pipeline import FeatureUnion
 
@@ -86,6 +87,12 @@ class MiniLMEncoder:
         self.device = device
         self._model = None
         self.contrastive_pairs_seen_ = 0
+
+    def __getstate__(self):
+        """Keep generated pipeline caches small; reload pinned weights on demand."""
+        state = self.__dict__.copy()
+        state["_model"] = None
+        return state
 
     def _load(self):
         if self._model is None:
@@ -330,6 +337,10 @@ class DualHeadSupportModel:
         intent_noise_prune_fraction: float = 0.05,
         contrastive_pair_count: int = 0,
         contrastive_output_path: Optional[str] = None,
+        enable_context_gate: bool = False,
+        minimum_auxiliary_macro_f1_gain: float = 0.005,
+        tune_intent_regularization: bool = False,
+        tune_escalation_regularization: bool = True,
     ) -> None:
         self.encoder = encoder or MiniLMEncoder()
         self.intent_confidence_threshold = intent_confidence_threshold
@@ -338,6 +349,10 @@ class DualHeadSupportModel:
         self.intent_noise_prune_fraction = intent_noise_prune_fraction
         self.contrastive_pair_count = int(contrastive_pair_count)
         self.contrastive_output_path = contrastive_output_path
+        self.enable_context_gate = bool(enable_context_gate)
+        self.minimum_auxiliary_macro_f1_gain = float(minimum_auxiliary_macro_f1_gain)
+        self.tune_intent_regularization = bool(tune_intent_regularization)
+        self.tune_escalation_regularization = bool(tune_escalation_regularization)
         self.intent_vectorizer = self._make_vectorizer()
         self.escalation_vectorizer = self._make_vectorizer()
         self.intent_head = OneVsRestClassifier(
@@ -364,6 +379,24 @@ class DualHeadSupportModel:
         self.reason_head: Optional[LogisticRegression] = None
         self.reason_classes_: List[str] = []
         self.reason_training_count_ = 0
+        self.context_gate_confidence_ = 0.0
+        self.context_gate_margin_ = 1.0
+        self.context_gate_calibration_gain_ = 0.0
+        self.intent_prototypes_: Optional[np.ndarray] = None
+        self.prototype_temperature_ = 0.1
+        self.prototype_blend_weight_ = 0.0
+        self.prototype_calibration_gain_ = 0.0
+        self.semantic_head = LogisticRegression(
+            max_iter=2000, class_weight="balanced", random_state=42, C=2.0
+        )
+        self.semantic_temperature = TemperatureScaler()
+        self.semantic_blend_weight_ = 0.0
+        self.semantic_blend_nll_gain_ = 0.0
+        self.intent_selected_c_ = 1.0
+        self.intent_cv_macro_f1_ = 0.0
+        self.escalation_selected_c_ = 0.5
+        self.escalation_selected_class_weight_: Optional[str] = None
+        self.escalation_cv_average_precision_ = 0.0
 
     @staticmethod
     def _make_vectorizer() -> FeatureUnion:
@@ -423,6 +456,7 @@ class DualHeadSupportModel:
         cal_escalation_labels: Sequence[bool],
         reason_texts: Optional[Sequence[str]] = None,
         reason_labels: Optional[Sequence[str]] = None,
+        cal_intent_context_texts: Optional[Sequence[str]] = None,
     ) -> "DualHeadSupportModel":
         if self.contrastive_pair_count > 0:
             self.encoder.fine_tune_contrastive(
@@ -439,12 +473,23 @@ class DualHeadSupportModel:
         intent_features = self._hybrid_features(
             self.intent_vectorizer, intent_texts, intent_embeddings
         )
+        if self.tune_intent_regularization:
+            self._select_intent_regularization(
+                intent_features[intent_keep], np.asarray(intent_labels)[intent_keep]
+            )
         self.intent_head.fit(intent_features[intent_keep], np.asarray(intent_labels)[intent_keep])
+        self.semantic_head.fit(
+            intent_embeddings[intent_keep], np.asarray(intent_labels)[intent_keep]
+        )
 
         self.escalation_vectorizer.fit([str(text) for text in escalation_texts])
         escalation_features = self._hybrid_features(
             self.escalation_vectorizer, escalation_texts, escalation_embeddings
         )
+        if self.tune_escalation_regularization:
+            self._select_escalation_regularization(
+                escalation_features, np.asarray(escalation_labels, dtype=bool)
+            )
         self.escalation_head.fit(escalation_features, list(escalation_labels))
         self.classes_ = list(self.intent_head.classes_)
 
@@ -456,6 +501,23 @@ class DualHeadSupportModel:
         class_to_index = {label: idx for idx, label in enumerate(self.classes_)}
         numeric_labels = [class_to_index[label] for label in cal_intent_labels]
         self.intent_temperature.fit_multiclass(cal_intent_logits, numeric_labels)
+        cal_semantic_logits = self.semantic_head.decision_function(cal_intent_embeddings)
+        self.semantic_temperature.fit_multiclass(cal_semantic_logits, numeric_labels)
+        self._fit_semantic_blend(cal_intent_logits, cal_semantic_logits, numeric_labels)
+        self._fit_prototype_ensemble(
+            intent_embeddings[intent_keep],
+            np.asarray(intent_labels)[intent_keep],
+            cal_intent_embeddings,
+            cal_intent_labels,
+            cal_intent_logits,
+        )
+        if self.enable_context_gate and cal_intent_context_texts is not None:
+            self._fit_context_gate(
+                cal_intent_texts,
+                cal_intent_context_texts,
+                cal_intent_labels,
+                cal_intent_logits,
+            )
 
         cal_escalation_embeddings = self.encoder.encode(cal_escalation_texts)
         cal_escalation_features = self._hybrid_features(
@@ -489,22 +551,234 @@ class DualHeadSupportModel:
             self.reason_training_count_ = len(reason_labels)
         return self
 
-    def predict_with_confidence(self, text: str) -> Dict[str, Any]:
+    @staticmethod
+    def _intent_estimator(c_value: float) -> OneVsRestClassifier:
+        return OneVsRestClassifier(LogisticRegression(
+            max_iter=2000,
+            class_weight="balanced",
+            random_state=42,
+            C=c_value,
+            solver="liblinear",
+        ))
+
+    def _select_intent_regularization(self, features, labels: np.ndarray) -> None:
+        splitter = StratifiedKFold(n_splits=3, shuffle=True, random_state=17)
+        best = (-1.0, -1.0)
+        for c_value in (0.25, 0.5, 1.0, 2.0, 4.0):
+            score = float(np.mean(cross_val_score(
+                self._intent_estimator(c_value),
+                features,
+                labels,
+                cv=splitter,
+                scoring="f1_macro",
+                n_jobs=1,
+            )))
+            candidate = (score, -c_value)
+            if candidate > best:
+                best = candidate
+                self.intent_selected_c_ = c_value
+                self.intent_cv_macro_f1_ = score
+        self.intent_head = self._intent_estimator(self.intent_selected_c_)
+
+    def _select_escalation_regularization(self, features, labels: np.ndarray) -> None:
+        splitter = StratifiedKFold(n_splits=3, shuffle=True, random_state=17)
+        best = (-1.0, -1.0, "")
+        for class_weight in (None, "balanced"):
+            for c_value in (0.1, 0.25, 0.5, 1.0, 2.0):
+                estimator = LogisticRegression(
+                    max_iter=2000,
+                    class_weight=class_weight,
+                    random_state=42,
+                    C=c_value,
+                )
+                score = float(np.mean(cross_val_score(
+                    estimator,
+                    features,
+                    labels,
+                    cv=splitter,
+                    scoring="average_precision",
+                    n_jobs=1,
+                )))
+                # Prefer less regularization complexity and no reweighting on ties.
+                candidate = (score, -c_value, "1" if class_weight is None else "0")
+                if candidate > best:
+                    best = candidate
+                    self.escalation_selected_c_ = c_value
+                    self.escalation_selected_class_weight_ = class_weight
+                    self.escalation_cv_average_precision_ = score
+        self.escalation_head = LogisticRegression(
+            max_iter=2000,
+            class_weight=self.escalation_selected_class_weight_,
+            random_state=42,
+            C=self.escalation_selected_c_,
+        )
+
+    def _fit_semantic_blend(
+        self,
+        hybrid_logits: np.ndarray,
+        semantic_logits: np.ndarray,
+        numeric_labels: Sequence[int],
+    ) -> None:
+        hybrid = _softmax(np.asarray(hybrid_logits) / self.intent_temperature.temperature_)
+        semantic = _softmax(
+            np.asarray(semantic_logits) / self.semantic_temperature.temperature_
+        )
+        labels = np.asarray(numeric_labels, dtype=int)
+
+        def nll(weight: float) -> float:
+            probabilities = (1.0 - weight) * hybrid + weight * semantic
+            return float(-np.mean(np.log(np.clip(
+                probabilities[np.arange(len(labels)), labels], 1e-12, 1.0
+            ))))
+
+        baseline = nll(0.0)
+        result = minimize_scalar(nll, bounds=(0.0, 1.0), method="bounded")
+        gain = baseline - float(result.fun)
+        if gain > 1e-4:
+            self.semantic_blend_weight_ = float(result.x)
+            self.semantic_blend_nll_gain_ = gain
+
+    def _prototype_probabilities(
+        self, embeddings: np.ndarray, temperature: Optional[float] = None
+    ) -> np.ndarray:
+        if self.intent_prototypes_ is None:
+            raise RuntimeError("Intent prototypes are not fitted")
+        scale = temperature or self.prototype_temperature_
+        return _softmax(np.asarray(embeddings) @ self.intent_prototypes_.T / scale)
+
+    def _fit_prototype_ensemble(
+        self,
+        train_embeddings: np.ndarray,
+        train_labels: Sequence[str],
+        calibration_embeddings: np.ndarray,
+        calibration_labels: Sequence[str],
+        calibration_logits: np.ndarray,
+    ) -> None:
+        """Learn semantic class prototypes and a conservative blend on holdout data."""
+        labels = np.asarray(train_labels, dtype=object)
+        prototypes = []
+        for class_name in self.classes_:
+            centroid = np.mean(train_embeddings[labels == class_name], axis=0)
+            norm = np.linalg.norm(centroid)
+            prototypes.append(centroid / norm if norm else centroid)
+        self.intent_prototypes_ = np.asarray(prototypes, dtype=np.float32)
+        logistic = _softmax(
+            np.asarray(calibration_logits) / self.intent_temperature.temperature_
+        )
+        truth = np.asarray(calibration_labels, dtype=object)
+        class_values = np.asarray(self.classes_, dtype=object)
+        baseline_pred = class_values[np.argmax(logistic, axis=1)]
+        baseline = float(f1_score(truth, baseline_pred, average="macro", zero_division=0))
+        best = (baseline, 0.0, self.prototype_temperature_)
+        for temperature in (0.03, 0.05, 0.08, 0.1, 0.15, 0.2, 0.3):
+            prototype = self._prototype_probabilities(calibration_embeddings, temperature)
+            for weight in np.arange(0.05, 0.51, 0.05):
+                blended = (1.0 - weight) * logistic + weight * prototype
+                predicted = class_values[np.argmax(blended, axis=1)]
+                score = float(f1_score(truth, predicted, average="macro", zero_division=0))
+                candidate = (score, -float(weight), float(temperature))
+                if candidate > (best[0], -best[1], best[2]):
+                    best = (score, float(weight), float(temperature))
+        self.prototype_calibration_gain_ = max(0.0, best[0] - baseline)
+        if self.prototype_calibration_gain_ >= self.minimum_auxiliary_macro_f1_gain:
+            self.prototype_blend_weight_ = best[1]
+            self.prototype_temperature_ = best[2]
+
+    def _intent_view(self, text: str) -> Dict[str, Any]:
         embedding = self.encoder.encode([text])
         features = self._hybrid_features(self.intent_vectorizer, [text], embedding)
         logits = np.asarray(self.intent_head.decision_function(features)[0], dtype=float)
         probs = _softmax(logits / self.intent_temperature.temperature_)
+        if self.semantic_blend_weight_ > 0.0:
+            semantic_logits = self.semantic_head.decision_function(embedding)
+            semantic_probs = _softmax(
+                semantic_logits / self.semantic_temperature.temperature_
+            )[0]
+            probs = (
+                (1.0 - self.semantic_blend_weight_) * probs
+                + self.semantic_blend_weight_ * semantic_probs
+            )
+        if self.intent_prototypes_ is not None and self.prototype_blend_weight_ > 0.0:
+            prototype_probs = self._prototype_probabilities(embedding)[0]
+            probs = (
+                (1.0 - self.prototype_blend_weight_) * probs
+                + self.prototype_blend_weight_ * prototype_probs
+            )
         best_idx = int(np.argmax(probs))
         confidence = float(probs[best_idx])
         return {
             "intent": self.classes_[best_idx],
             "confidence": confidence,
-            "is_uncertain": confidence < self.intent_confidence_threshold,
-            "intent_resolution": "full_message",
             "all_probabilities": {label: float(probs[idx]) for idx, label in enumerate(self.classes_)},
             "prob_vector": probs,
             "logits": logits,
             "embedding": embedding[0],
+        }
+
+    def _fit_context_gate(
+        self,
+        current_texts: Sequence[str],
+        context_texts: Sequence[str],
+        labels: Sequence[str],
+        current_logits: np.ndarray,
+    ) -> None:
+        """Select a conservative dual-view gate on the intent calibration split."""
+        if len(current_texts) != len(context_texts):
+            raise ValueError("Current and contextual calibration inputs must align")
+        current_probs = _softmax(
+            np.asarray(current_logits) / self.intent_temperature.temperature_
+        )
+        context_embeddings = self.encoder.encode(context_texts)
+        context_features = self._hybrid_features(
+            self.intent_vectorizer, context_texts, context_embeddings
+        )
+        context_logits = self.intent_head.decision_function(context_features)
+        context_probs = _softmax(context_logits / self.intent_temperature.temperature_)
+        current_pred = np.asarray(self.classes_, dtype=object)[np.argmax(current_probs, axis=1)]
+        context_pred = np.asarray(self.classes_, dtype=object)[np.argmax(context_probs, axis=1)]
+        current_conf = np.max(current_probs, axis=1)
+        context_conf = np.max(context_probs, axis=1)
+        truth = np.asarray(labels, dtype=object)
+        baseline = float(f1_score(truth, current_pred, average="macro", zero_division=0))
+        best = (baseline, 0, 0.0, 1.0)
+        for confidence_cutoff in np.arange(0.35, 0.86, 0.05):
+            for margin in np.arange(0.0, 0.26, 0.05):
+                use_context = (
+                    (current_conf <= confidence_cutoff)
+                    & ((context_conf - current_conf) >= margin)
+                    & (np.asarray(current_texts, dtype=object) != np.asarray(context_texts, dtype=object))
+                )
+                predictions = np.where(use_context, context_pred, current_pred)
+                score = float(f1_score(truth, predictions, average="macro", zero_division=0))
+                candidate = (score, -int(use_context.sum()), confidence_cutoff, margin)
+                if candidate > best:
+                    best = candidate
+        self.context_gate_calibration_gain_ = max(0.0, best[0] - baseline)
+        self.context_gate_confidence_ = float(best[2])
+        self.context_gate_margin_ = float(best[3])
+
+    def predict_with_confidence(
+        self, text: str, context_text: Optional[str] = None
+    ) -> Dict[str, Any]:
+        current = self._intent_view(text)
+        chosen = current
+        context = None
+        context_used = False
+        if context_text and context_text != text and self.context_gate_confidence_ > 0.0:
+            context = self._intent_view(context_text)
+            context_used = (
+                current["confidence"] <= self.context_gate_confidence_
+                and context["confidence"] - current["confidence"] >= self.context_gate_margin_
+            )
+            if context_used:
+                chosen = context
+        return {
+            **chosen,
+            "is_uncertain": chosen["confidence"] < self.intent_confidence_threshold,
+            "intent_resolution": "causal_context" if context_used else "current_message",
+            "context_used": context_used,
+            "current_message_confidence": current["confidence"],
+            "context_confidence": context["confidence"] if context is not None else None,
         }
 
     def predict_escalation(self, text: str, embedding: Optional[np.ndarray] = None) -> Dict[str, Any]:

@@ -34,6 +34,7 @@ class TestSupportAPI(unittest.TestCase):
         self.assertGreater(data["weak_intent_labels_pruned"], 0)
         self.assertGreater(data["probabilistic_intent_label_count"], 0)
         self.assertEqual(data["human_reason_training_count"], 0)
+        self.assertGreater(data["historical_context_coverage"], 0.0)
         self.assertEqual(data["generation_backend"], "act-conditioned deterministic rewrite")
         self.assertFalse(data["hosted_api_required"])
 
@@ -67,6 +68,21 @@ class TestSupportAPI(unittest.TestCase):
         self.assertIn("HARD_GATE", data["escalation"]["triggers"][0])
         self.assertNotIn("victim@example.com", data["draft_reply"])
 
+    def test_session_history_reaches_the_learned_model_trace(self):
+        session_id = "context-test-session"
+        first = self.client.post(
+            "/api/v1/triage",
+            json={"text": "My package has not arrived", "session_id": session_id},
+        )
+        self.assertEqual(first.status_code, 200)
+        second = self.client.post(
+            "/api/v1/triage",
+            json={"text": "It now says delivered", "session_id": session_id},
+        )
+        self.assertEqual(second.status_code, 200)
+        details = second.json()["pipeline_trace"][0]["details"]
+        self.assertEqual(details["causal_prior_turns_used"], 1)
+
     def test_metrics_endpoint(self):
         response = self.client.get("/metrics")
         self.assertEqual(response.status_code, 200)
@@ -77,6 +93,8 @@ class TestSupportAPI(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn('fetch("/api/v1/health")', response.text)
         self.assertIn("pipeline_trace", response.text)
+        self.assertIn("historical_context_coverage", response.text)
+        self.assertIn("trained_pipeline_cache_hit", response.text)
         self.assertIn("retrieval_evidence", response.text)
         self.assertNotIn("cdn.tailwindcss.com", response.text)
         self.assertNotIn("bg-gradient", response.text)

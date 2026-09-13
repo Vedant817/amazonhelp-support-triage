@@ -125,11 +125,12 @@ def aggregate_intent_weak_labels(
     }
     sources = []
     for _, row in frame.iterrows():
+        customer_input = row.get("customer_text", "")
         emitted = [
             row.get("intent_label"),
             act_map.get(str(row.get("resolution_act", ""))),
-            _customer_issue_label(row.get("customer_text", "")),
-            _customer_request_label(row.get("customer_text", "")),
+            _customer_issue_label(customer_input),
+            _customer_request_label(customer_input),
         ]
         sources.append([class_index.get(label, ABSTAIN) for label in emitted])
     matrix = np.asarray(sources, dtype=int)
@@ -142,4 +143,3 @@ def aggregate_intent_weak_labels(
         for row, index in enumerate(best)
     ]
     return WeakLabelResult(probabilities, labels, confidence, votes)
-

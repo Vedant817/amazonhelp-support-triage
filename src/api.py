@@ -44,7 +44,7 @@ metrics_counters = {
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     artifacts = build_learned_pipeline(
-        pairs_csv="data/processed/amazonhelp_english_pairs.csv",
+        pairs_csv="data/processed/amazonhelp_context_pairs.csv",
         gold_csv="data/golden/golden_eval_set.csv",
         reviewed_csv="data/training/labels_for_human_review.csv",
         intent_cap_per_class=int(os.getenv("SUPPORT_INTENT_CAP_PER_CLASS", "1200")),
@@ -60,6 +60,8 @@ async def lifespan(app: FastAPI):
         guard=ProductionPolicyGuard(),
         session_tracker=CustomerSessionTracker(),
         corpus_size=len(artifacts.retriever.records),
+        historical_context_coverage=artifacts.context_coverage,
+        trained_pipeline_cache_hit=artifacts.cache_hit,
         probabilistic_intent_label_count=artifacts.probabilistic_intent_label_count,
         generation_mode=generation_mode,
     )
@@ -97,8 +99,10 @@ def health():
     return HealthResponse(
         status="healthy",
         brand="@AmazonHelp",
-        model_version="2.2.0-probabilistic-local-dual-head",
+        model_version="2.3.0-probabilistic-local-dual-head-context-ready",
         corpus_size=pipeline_state["corpus_size"],
+        historical_context_coverage=round(pipeline_state["historical_context_coverage"], 4),
+        trained_pipeline_cache_hit=pipeline_state["trained_pipeline_cache_hit"],
         intent_temperature=round(model.intent_temperature.temperature_, 4),
         escalation_temperature=round(model.escalation_temperature.temperature_, 4),
         escalation_threshold=round(model.escalation_threshold_, 4),
@@ -146,19 +150,26 @@ def confidence_lookup(req: ConfidenceRequest):
 def triage(req: TriageRequest):
     started = time.perf_counter()
     model = pipeline_state["model"]
+    session = (
+        pipeline_state["session_tracker"].get_or_create(req.session_id)
+        if req.session_id else None
+    )
+    model_input = session.compose_model_input(req.text) if session else req.text
+    prior_turns_used = min(len(session.turns), 2) if session else 0
 
     stage_started = time.perf_counter()
-    classification = model.predict_with_confidence(req.text)
+    classification = model.predict_with_confidence(req.text, model_input)
     classification_ms = (time.perf_counter() - stage_started) * 1000.0
 
     stage_started = time.perf_counter()
-    learned_escalation = model.predict_escalation(req.text, classification["embedding"])
-    reason_prediction = model.predict_reason(req.text, classification["embedding"])
+    learned_escalation = model.predict_escalation(req.text)
+    reason_prediction = model.predict_reason(req.text)
     risk_scoring_ms = (time.perf_counter() - stage_started) * 1000.0
 
     stage_started = time.perf_counter()
     exemplars = pipeline_state["retriever"].retrieve_similar(
-        req.text, intent_filter=classification["intent"], top_k=3
+        model_input if classification["context_used"] else req.text,
+        intent_filter=classification["intent"], top_k=3
     )
     generator = pipeline_state["generator"]
     evidence_act = generator.select_act(exemplars, classification["intent"], False)
@@ -177,9 +188,7 @@ def triage(req: TriageRequest):
         predicted_reason=(reason_prediction or {}).get("reason"),
     )
 
-    session = None
-    if req.session_id:
-        session = pipeline_state["session_tracker"].get_or_create(req.session_id)
+    if session is not None:
         friction = session.evaluate_multi_turn_friction(req.text)
         if friction["override_escalate"]:
             decision = EscalationDecision(
@@ -256,6 +265,15 @@ def triage(req: TriageRequest):
                 "confidence": round(classification["confidence"], 4),
                 "confidence_threshold": round(model.intent_confidence_threshold, 4),
                 "resolution_method": classification["intent_resolution"],
+                "causal_prior_turns_used": prior_turns_used,
+                "context_selected_by_calibrated_gate": classification["context_used"],
+                "current_message_confidence": round(classification["current_message_confidence"], 4),
+                "context_confidence": (
+                    round(classification["context_confidence"], 4)
+                    if classification["context_confidence"] is not None else None
+                ),
+                "context_gate_confidence": round(model.context_gate_confidence_, 4),
+                "context_gate_margin": round(model.context_gate_margin_, 4),
             },
         ),
         PipelineStageResponse(

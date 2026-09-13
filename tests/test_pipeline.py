@@ -14,11 +14,13 @@ from src.dual_head import (
     select_recall_constrained_threshold,
     select_recall_threshold,
 )
+from src.data_pipeline import add_prior_conversation_context
 from src.escalator import SafetyGatedEscalator
 from src.generator import ProductionGroundedGenerator
 from src.guardrails import ProductionPolicyGuard
 from src.llm_judge import ReplyQualityJudge
 from src.retriever import HistoricalResolutionRetriever
+from src.session import CustomerSessionState
 from src.supervision import build_reply_supervision, infer_resolution_act, strip_agent_pii
 from src.weak_label_model import DawidSkeneLabelModel, aggregate_intent_weak_labels
 
@@ -48,6 +50,33 @@ class FakeLocalModel:
 
 
 class TestPipelineComponents(unittest.TestCase):
+    def test_historical_context_contains_only_causally_prior_turns(self):
+        raw = pd.DataFrame([
+            {"tweet_id": "1", "author_id": "customer", "inbound": True, "created_at": "t1", "text": "My order is missing", "in_response_to_tweet_id": None},
+            {"tweet_id": "2", "author_id": "AmazonHelp", "inbound": False, "created_at": "t2", "text": "What does tracking show?", "in_response_to_tweet_id": "1"},
+            {"tweet_id": "3", "author_id": "customer", "inbound": True, "created_at": "t3", "text": "It says delivered", "in_response_to_tweet_id": "2"},
+            {"tweet_id": "4", "author_id": "AmazonHelp", "inbound": False, "created_at": "t4", "text": "Please DM us", "in_response_to_tweet_id": "3"},
+        ])
+        pairs = pd.DataFrame([{"inbound_id": "3", "customer_text": "It says delivered"}])
+        with TemporaryDirectory() as directory:
+            raw_path = Path(directory) / "raw.csv"
+            raw.to_csv(raw_path, index=False)
+            enriched = add_prior_conversation_context(pairs, str(raw_path), max_prior_turns=4, chunk_size=2)
+        context = enriched.iloc[0]["conversation_context"]
+        self.assertIn("My order is missing", context)
+        self.assertIn("What does tracking show?", context)
+        self.assertNotIn("It says delivered", context)
+        self.assertNotIn("Please DM us", context)
+        self.assertEqual(enriched.iloc[0]["prior_turn_count"], 2)
+
+    def test_live_session_builds_same_causal_model_input(self):
+        session = CustomerSessionState("thread-1")
+        session.add_turn("My package is late", "ORDER_TRACKING_AND_DELAY", False, "ROUTINE", "Check tracking")
+        model_input = session.compose_model_input("It now says delivered")
+        self.assertIn("CUSTOMER: My package is late", model_input)
+        self.assertIn("AGENT: Check tracking", model_input)
+        self.assertTrue(model_input.endswith("CURRENT CUSTOMER: It now says delivered"))
+
     def test_active_review_selection_is_balanced_and_preserves_uncertainty(self):
         frame = pd.DataFrame({
             "inbound_id": [str(i) for i in range(12)],

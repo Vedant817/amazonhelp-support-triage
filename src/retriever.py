@@ -99,6 +99,7 @@ class HistoricalResolutionRetriever:
 
         for idx, row in pairs_df.iterrows():
             cust_text = str(row.get("customer_text", "")).strip()
+            index_text = str(row.get("model_text", cust_text)).strip()
             reply_text = str(row.get("reply_text", "")).strip()
             intent = row.get("intent", "UNKNOWN")
 
@@ -111,7 +112,7 @@ class HistoricalResolutionRetriever:
                     "resolution_act": row.get("resolution_act", infer_resolution_act(reply_text)),
                     "reply_id": row.get("reply_id", "")
                 })
-                texts.append(cust_text)
+                texts.append(index_text)
 
         if texts:
             self.tfidf_matrix = self.vectorizer.fit_transform(texts)

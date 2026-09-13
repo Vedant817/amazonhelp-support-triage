@@ -177,7 +177,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       <div class="runtime-item"><span class="eyebrow">Reply backend</span><strong id="healthGenerator" class="runtime-value">Loading…</strong></div>
       <div class="runtime-item"><span class="eyebrow">Retrieval</span><strong id="healthRetriever" class="runtime-value">Loading…</strong></div>
       <div class="runtime-item"><span class="eyebrow">Calibration</span><strong id="healthCalibration" class="runtime-value mono">Loading…</strong></div>
-      <div class="runtime-item"><span class="eyebrow">Indexed conversations</span><strong id="healthCorpus" class="runtime-value mono">—</strong></div>
+      <div class="runtime-item"><span class="eyebrow">Historical corpus</span><strong id="healthCorpus" class="runtime-value mono">—</strong></div>
       <div class="runtime-item"><span class="eyebrow">Inference device</span><strong id="healthDevice" class="runtime-value mono">—</strong></div>
     </section>
 
@@ -296,14 +296,18 @@ DASHBOARD_HTML = r"""<!doctype html>
         if (!response.ok) throw new Error(`Health request returned ${response.status}`);
         const health = await response.json();
         byId("healthDot").className = "status-dot online";
-        setText("healthText", `${health.status} · ${health.generation_mode} generation · no hosted API`);
+        const apiMode = health.hosted_api_required ? "hosted API configured" : "no hosted API";
+        setText("healthText", `${health.status} · ${health.generation_mode} generation · ${apiMode}`);
         setText("healthEncoder", `${health.classification_features} · ${health.weak_intent_labels_pruned} noisy labels removed`);
         setText("healthGenerator", health.generation_model_revision
           ? `${health.generation_backend} @ ${health.generation_model_revision.slice(0, 8)}`
           : health.generation_backend);
         setText("healthRetriever", health.retrieval_method);
         setText("healthCalibration", `intent T=${health.intent_temperature} · escalation T=${health.escalation_temperature}`);
-        setText("healthCorpus", Number(health.corpus_size).toLocaleString());
+        const cacheState = health.trained_pipeline_cache_hit ? "cache loaded" : "fresh fit";
+        const contextState = `${pct(health.historical_context_coverage)} context`;
+        setText("healthCorpus", `${Number(health.corpus_size).toLocaleString()} · ${contextState} · ${cacheState}`);
+        byId("healthCorpus").title = `${health.model_version} · ${contextState} · ${cacheState}`;
         setText("healthDevice", health.inference_device);
       } catch (error) {
         byId("healthDot").className = "status-dot offline";

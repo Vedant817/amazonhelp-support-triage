@@ -45,6 +45,18 @@ class CustomerSessionState:
             r"\b(got\s+it|all\s+good|sorted|ok\s+cool)\b"
         ]
 
+    def compose_model_input(self, current_text: str, max_prior_turns: int = 2) -> str:
+        """Build the causal conversation prefix used by the learned pipeline."""
+        prior = self.turns[-max_prior_turns:] if max_prior_turns > 0 else []
+        lines: List[str] = []
+        for turn in prior:
+            lines.append(f"CUSTOMER: {turn.customer_text}")
+            lines.append(f"AGENT: {turn.dispatched_reply}")
+        if not lines:
+            return current_text
+        lines.append(f"CURRENT CUSTOMER: {current_text}")
+        return "\n".join(lines)
+
     def add_turn(
         self,
         customer_text: str,

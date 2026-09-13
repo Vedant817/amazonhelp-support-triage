@@ -46,7 +46,7 @@ def _pii_echo(customer: str, reply: str) -> bool:
 
 
 def _new_system() -> Dict[str, Any]:
-    return {"intent_preds": [], "esc_preds": [], "esc_reasons": [], "replies": [], "acts": [], "exemplars": [], "seconds": 0.0, "invalid_outputs": 0}
+    return {"intent_preds": [], "esc_preds": [], "esc_reasons": [], "replies": [], "acts": [], "exemplars": [], "context_used": [], "seconds": 0.0, "invalid_outputs": 0}
 
 
 def _evaluate_system(
@@ -110,7 +110,7 @@ def run(args: argparse.Namespace) -> None:
     os.chdir(ROOT)
     gold = pd.read_csv("data/golden/golden_eval_set.csv")
     artifacts = build_learned_pipeline(
-        "data/processed/amazonhelp_english_pairs.csv",
+        "data/processed/amazonhelp_context_pairs.csv",
         "data/golden/golden_eval_set.csv",
         reviewed_csv=args.reviewed_labels,
         intent_cap_per_class=args.intent_cap_per_class,
@@ -150,6 +150,7 @@ def run(args: argparse.Namespace) -> None:
 
     for _, row in gold.iterrows():
         text = row["customer_text"]
+        model_text = artifacts.context_by_id.get(str(row["tweet_id"]), text)
 
         started = time.time()
         intent = majority.predict([text])[0]
@@ -184,11 +185,12 @@ def run(args: argparse.Namespace) -> None:
             target["seconds"] += time.time() - started
 
         started = time.time()
-        classification = model.predict_with_confidence(text)
-        learned = model.predict_escalation(text, classification["embedding"])
-        reason_prediction = model.predict_reason(text, classification["embedding"])
+        classification = model.predict_with_confidence(text, model_text)
+        learned = model.predict_escalation(text)
+        reason_prediction = model.predict_reason(text)
+        retrieval_query = model_text if classification["context_used"] else text
         exemplars = artifacts.retriever.retrieve_similar(
-            text, intent_filter=classification["intent"], top_k=3
+            retrieval_query, intent_filter=classification["intent"], top_k=3
         )
         evidence_act = generator.select_act(exemplars, classification["intent"], False)
         decision = learned_escalator.evaluate(
@@ -206,6 +208,7 @@ def run(args: argparse.Namespace) -> None:
         reply = guard.verify_and_sanitize(raw, text, decision.should_escalate).sanitized_reply
         target = systems[PROPOSED]
         target["intent_preds"].append(classification["intent"])
+        target["context_used"].append(classification["context_used"])
         target["esc_preds"].append(decision.should_escalate)
         target["esc_reasons"].append(decision.stated_reason)
         target["replies"].append(reply)
@@ -220,6 +223,30 @@ def run(args: argparse.Namespace) -> None:
             "gold_size": len(gold),
             "gold_label_audit": "data/golden/LABEL_AUDIT.md",
             "gold_ids_excluded_from_training_and_retrieval": True,
+            "historical_context_coverage": round(artifacts.context_coverage, 6),
+            "context_is_causally_prior_only": True,
+            "trained_pipeline_cache_hit": artifacts.cache_hit,
+            "context_gate_confidence": round(model.context_gate_confidence_, 6),
+            "context_gate_margin": round(model.context_gate_margin_, 6),
+            "context_gate_calibration_macro_f1_gain": round(
+                model.context_gate_calibration_gain_, 6
+            ),
+            "prototype_blend_weight": round(model.prototype_blend_weight_, 6),
+            "prototype_temperature": round(model.prototype_temperature_, 6),
+            "prototype_calibration_macro_f1_gain": round(
+                model.prototype_calibration_gain_, 6
+            ),
+            "semantic_blend_weight": round(model.semantic_blend_weight_, 6),
+            "semantic_blend_calibration_nll_gain": round(
+                model.semantic_blend_nll_gain_, 6
+            ),
+            "intent_selected_c": model.intent_selected_c_,
+            "intent_training_cv_macro_f1": round(model.intent_cv_macro_f1_, 6),
+            "escalation_selected_c": model.escalation_selected_c_,
+            "escalation_selected_class_weight": model.escalation_selected_class_weight_,
+            "escalation_training_cv_average_precision": round(
+                model.escalation_cv_average_precision_, 6
+            ),
             "supervision": (
                 "reply-side weak labels plus conservative probabilistic abstention filling "
                 "and optional human-reviewed overrides"
@@ -285,9 +312,14 @@ def run(args: argparse.Namespace) -> None:
         "reply_id": [f"{item_id}:proposed-v2" for item_id in gold["id"]],
         "gold_id": gold["id"],
         "customer_text": gold["customer_text"],
+        "model_input": [
+            artifacts.context_by_id.get(str(tweet_id), text)
+            for tweet_id, text in zip(gold["tweet_id"], gold["customer_text"])
+        ],
         "gold_intent": gold["gold_intent"],
         "predicted_intent": systems[PROPOSED]["intent_preds"],
         "confidence": confidences,
+        "context_used": systems[PROPOSED]["context_used"],
         "escalation_risk_score": risk_scores,
         "gold_escalate": gold["gold_escalate"],
         "predicted_escalate": systems[PROPOSED]["esc_preds"],

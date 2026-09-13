@@ -31,11 +31,13 @@ class AmazonSupportAgent:
         self, customer_tweet: str, session: Optional[CustomerSessionState] = None
     ) -> Dict[str, Any]:
         started = time.time()
-        classification = self.model.predict_with_confidence(customer_tweet)
-        learned = self.model.predict_escalation(customer_tweet, classification["embedding"])
-        reason_prediction = self.model.predict_reason(customer_tweet, classification["embedding"])
+        model_input = session.compose_model_input(customer_tweet) if session else customer_tweet
+        classification = self.model.predict_with_confidence(customer_tweet, model_input)
+        learned = self.model.predict_escalation(customer_tweet)
+        reason_prediction = self.model.predict_reason(customer_tweet)
         exemplars = self.retriever.retrieve_similar(
-            customer_tweet, intent_filter=classification["intent"], top_k=3
+            model_input if classification["context_used"] else customer_tweet,
+            intent_filter=classification["intent"], top_k=3
         )
         evidence_act = self.generator.select_act(exemplars, classification["intent"], False)
         decision = self.escalator.evaluate(

@@ -3,7 +3,7 @@
 ## Executive result
 
 The rebuilt system fixes the largest safety failure but does not yet establish a strong
-intent model. On the audited 200-case gold set, escalation recall is 0.900 versus 0.309
+intent model. On the audited 200-case gold set, escalation recall is 0.909 versus 0.309
 for the keyword baseline. Intent macro-F1 is 0.781 versus 0.736, below the proposed
 0.90 target. These are the values written by
 `python main.py benchmark`; no other number is treated as
@@ -41,11 +41,22 @@ the final head is fitted. Separate regularized heads then learn:
 - the binary escalation decision.
 
 Each head has a separately fitted scalar temperature on a reply-labeled holdout. The
+escalation head's regularization is selected using three-fold average precision on its
+training fold; the saved run selects `C=0.25` without class reweighting. The
 primary escalation threshold maximizes precision subject to an exact one-sided 95%
 recall lower bound of at least 0.85; a second threshold identifies only high-precision
 learned transfers.
 Low intent confidence abstains into escalation. This is a coverage–accuracy tradeoff,
 not a conformal guarantee.
+
+The raw TWCS reply graph is also followed backwards to construct up to four causally
+prior customer/agent turns. The current inbound message and subsequent Amazon reply are
+excluded by construction. This context exists for 50.6% of processed pairs and is shown
+to reviewers and live sessions. A dual-view context gate, semantic-only head, and
+nearest-prototype blend are fitted as candidate branches, but only activate after a
+holdout improvement. In the saved run all three remain at zero weight: the prototype
+gain was 0.0041 macro-F1, below the fixed 0.005 floor, and there are no human-reviewed
+context labels. Thus context is available without silently degrading the scored model.
 
 Public PII, account takeover, legal threats, delivery disputes, severe damage, financial
 disputes, and prompt manipulation run through deterministic gates and cannot be vetoed.
@@ -81,8 +92,8 @@ plus quadratic weighted kappa.
 | Intent accuracy | 0.225 | 0.745 | 0.795 |
 | Intent macro-F1 | 0.061 | 0.736 | 0.781 |
 | Escalation accuracy | 0.550 | 0.520 | 0.575 |
-| Escalate recall | 1.000 | 0.309 | 0.900 |
-| Escalate precision | 0.550 | 0.630 | 0.572 |
+| Escalate recall | 1.000 | 0.309 | 0.909 |
+| Escalate precision | 0.550 | 0.630 | 0.571 |
 | Exact reason match | 0.000 | 0.000 | 0.470 |
 | Replies ≤280 characters | 1.000 | 1.000 | 1.000 |
 | No direct PII echo | 1.000 | 1.000 | 1.000 |
@@ -90,8 +101,8 @@ plus quadratic weighted kappa.
 Proposed-model 95% paired bootstrap intervals (2,000 iterations):
 
 - intent macro-F1: 0.719–0.839;
-- escalation recall: 0.839–0.953;
-- escalation precision: 0.500–0.645.
+- escalation recall: 0.850–0.959;
+- escalation precision: 0.500–0.646.
 
 Per-class proposed intent results:
 
@@ -105,13 +116,14 @@ Per-class proposed intent results:
 | Refund and return | 0.800 | 0.914 | 0.853 |
 
 Calibration was fitted on 975 weakly labeled intent examples and 870 reply-labeled
-escalation examples. The fitted temperatures are 1.257 for intent and 0.867 for
-escalation. The recall and high-precision thresholds are 0.2171 and 0.6430. Gold labels
+escalation examples. The fitted temperatures are 1.257 for intent and 0.756 for
+escalation. The recall and high-precision thresholds are 0.2042 and 0.6268. Gold labels
 were not used to choose them.
 
-On the escalation calibration split, observed recall is 0.8854 and its exact one-sided
-95% lower bound is 0.8521 over 323 positives. On gold, recall is 0.900 but its analogous
-lower bound is only 0.8399; therefore no gold safety guarantee is claimed.
+On the escalation calibration split, observed recall is 0.8947 and its exact one-sided
+95% lower bound is 0.8623 over 323 positives. On gold, recall is 0.9091 and its
+analogous lower confidence bound is 0.8507. This remains a test-set diagnostic rather
+than a distribution-free safety guarantee.
 
 On the gold diagnostic, 10-bin quantile ECE is 0.0630 and MCE is 0.1558. These are
 descriptive test-set diagnostics, not calibration-fit inputs.
@@ -125,6 +137,8 @@ It proves that, in this frozen checkout and audited gold set:
   recall region;
 - retrieved resolution acts change the generated next step;
 - exact reason codes are used;
+- causal context ingestion matches the live session format and cannot see future turns;
+- unsupported auxiliary branches are automatically left inactive;
 - output length and direct PII-echo checks pass all 200 cases;
 - uncertainty, prediction rows, and failures are saved for inspection.
 
@@ -155,6 +169,11 @@ The saved headline artifact was produced without an API key:
 ```powershell
 .\.venv\Scripts\python.exe main.py benchmark
 ```
+
+The first run trains and writes a fingerprinted cache; a second run must reproduce the
+same metrics while reporting `trained_pipeline_cache_hit: true`. Rebuild historical
+context from the source dataset with
+`.\.venv\Scripts\python.exe scripts\build_conversation_context.py`.
 
 The default offline generation path, local API lifecycle, label audit, safety checks,
 and row-level evidence are covered by the repository test suite. The slower local Qwen

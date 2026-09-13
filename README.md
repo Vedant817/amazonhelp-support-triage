@@ -11,12 +11,14 @@ The current system is:
    abstaining weak sources;
 3. MiniLM semantic features fused with word and character TF-IDF features;
 4. out-of-fold confidence filtering of the noisiest 5% of intent weak labels;
-5. separate intent and escalation heads with holdout temperature scaling;
+5. separate intent and escalation heads with holdout temperature scaling, with
+   escalation regularization chosen by training-only three-fold cross-validation;
 6. confidence abstention plus an exact-confidence-bound escalation threshold;
-7. BM25 + MiniLM retrieval fused with reciprocal-rank fusion;
-8. a resolution act extracted from historical replies;
-9. either local Qwen rewriting or deterministic act-conditioned offline rewriting;
-10. URL, PII, false-promise, and 280-character guardrails.
+7. causally reconstructed prior turns plus a validation-gated dual-view classifier;
+8. BM25 + MiniLM retrieval fused with reciprocal-rank fusion;
+9. a resolution act extracted from historical replies;
+10. either local Qwen rewriting or deterministic act-conditioned offline rewriting;
+11. URL, PII, false-promise, and 280-character guardrails.
 
 ## Verified status
 
@@ -28,18 +30,19 @@ run in this artifact. On the audited 200-case gold set:
 |---|---:|---:|---:|---:|
 | Majority + always escalate | 0.061 | 1.000 | 0.550 | 0.000 |
 | TF-IDF + keyword escalation + retrieve/replay | 0.736 | 0.309 | 0.630 | 0.000 |
-| Probabilistic hybrid dual-head + gates + retrieve/rewrite | **0.781** | **0.900** | 0.572 | **0.470** |
+| Probabilistic hybrid dual-head + gates + retrieve/rewrite | **0.781** | **0.909** | 0.571 | **0.470** |
 
 The proposed system's bootstrap 95% intervals are:
 
 - intent macro-F1: 0.719–0.839;
-- escalation recall: 0.839–0.953;
-- escalation precision: 0.500–0.645.
+- escalation recall: 0.850–0.959;
+- escalation precision: 0.500–0.646.
 
-The exact one-sided 95% lower bound for gold escalation recall is 0.8399, so the
-gold set still does not certify recall >=0.85. The independent reply-labeled calibration
-split does meet its selection constraint (lower bound 0.8521 over 323 positives), but
-that is historical channel-transfer supervision rather than final policy evidence.
+The exact one-sided 95% lower confidence bound for gold escalation recall is 0.8507.
+That is a post-selection test-set diagnostic, not a distribution-free guarantee. The
+independent reply-labeled calibration split meets its selection constraint (lower bound
+0.8623 over 323 positives), but that is historical channel-transfer supervision rather
+than final policy evidence.
 
 These results are materially safer than the keyword baseline on escalation recall, but
 they do **not** meet the intended intent-quality or escalation-precision targets. There
@@ -63,7 +66,15 @@ python -m venv .venv
 
 The first learned run downloads the pinned
 `sentence-transformers/all-MiniLM-L6-v2` revision. Model files use the normal Hugging
-Face cache and are not committed.
+Face cache and are not committed. The fitted pipeline is cached under
+`models/pipeline_cache/` using a fingerprint of the data, configuration, and relevant
+source files; changing any of them forces retraining.
+
+Rebuild the causal conversation artifact from the original TWCS data with:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\build_conversation_context.py
+```
 
 Regenerate the active-learning review batch only while its review fields are empty:
 
@@ -112,6 +123,8 @@ agreement score. First have reviewers complete the generated
 ## Label and leakage controls
 
 - The gold tweet IDs are removed before supervision and retrieval are built.
+- Historical context follows `in_response_to_tweet_id` backwards and contains only
+  already-observed turns. It covers 50.6% of the processed conversations.
 - High-precision intent weak labels are inferred from AmazonHelp's reply. A multiclass
   EM label model combines reply, resolution-act, and customer-side labeling functions
   only to fill reply-label abstentions at confidence >=0.75; it never overwrites reply labels.
@@ -120,7 +133,7 @@ agreement score. First have reviewers complete the generated
 - `scripts/audit_gold_labels.py` applies only four documented policy corrections; see
   `data/golden/LABEL_AUDIT.md`.
 - Independent reviewers can override weak labels and add reason/act labels by filling
-  the 400-row uncertainty-and-diversity review sheet.
+  the 400-row uncertainty-and-diversity review sheet, which now includes prior context.
 
 ## Evaluation contract
 
@@ -150,6 +163,13 @@ the single-parameter calibration method of
 [Guo et al. (2017)](https://proceedings.mlr.press/v70/guo17a.html).
 The weak-label filter is inspired by confident learning but is not claimed as a full
 implementation ([Northcutt et al., 2021](https://arxiv.org/abs/1911.00068)).
+
+The final escalation head uses `C=0.25`, selected by three-fold cross-validated
+average precision (0.6118) on the training fold only. Context, a semantic-only head,
+and a nearest-prototype ensemble are implemented as holdout-gated candidates. They are
+all assigned zero weight in the saved run: the prototype gain was only 0.0041 macro-F1,
+below the pre-set 0.005 materiality floor, and no human-reviewed context labels exist.
+This prevents complexity that did not validate from changing the scored path.
 
 The retrieve-then-rewrite design is inspired by retrieval-augmented generation, but is
 described by what it actually does rather than claimed as the exact RAG training method

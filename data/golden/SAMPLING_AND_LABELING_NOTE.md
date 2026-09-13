@@ -62,8 +62,10 @@ A critical requirement of customer support AI is deciding what can be safely aut
 1. **Deduplication & Hygiene**: All tweets were normalized, stripped of non-printable characters, and checked for pure English syntax.
 2. **Ambiguity Resolution**: Multi-intent tweets (e.g., "My package was delayed AND damaged") were labelled by primary root cause (`DAMAGED_OR_WRONG_ITEM`) while flagging escalation due to complexity.
 3. **Historical-response ratings**: The four score columns rate Amazon's original
-   historical replies. They are not treated as agreement evidence for generated system
-   drafts. Judge agreement requires separate human ratings joined to the exact generated
-   reply IDs in `results/human_rating_template.csv`.
+   historical replies. They may validate a judge only when the judge scores those exact
+   same replies; they are never represented as ratings of generated system drafts.
+   These are legacy single-annotator ratings whose annotator identity and repeat-rating
+   protocol were not recorded, and the safety column has no variance. Independent
+   system-draft ratings still use source-hashed reply IDs through the review desk.
 4. **Policy correction audit**: Four documented contradictions were corrected after the
    initial labeling pass. See `LABEL_AUDIT.md`; the counts above reflect that audited set.

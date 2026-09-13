@@ -52,9 +52,11 @@ queue is `data/training/labels_for_human_review.csv`; it is reviewed through the
 local review desk, not edited in place. Blank or single-reviewer rows are never treated
 as consensus labels.
 
-No LLM-judge score or judge–human agreement is claimed in the default run. Those fields
-are explicitly `not_run` / `not_available` unless the local judge runs and matching
-human scores exist for the same reply IDs.
+The pinned local judge was run on 40 stratified historical replies carrying the existing
+human ratings, so human and model evaluated identical text. Agreement is poor:
+Spearman rho is -0.161, quadratic weighted kappa is 0.000, and MAE is 0.606. Its 4.263
+mean on 40 system drafts is therefore saved but explicitly marked unusable as a headline
+metric. This negative validation is more trustworthy than reporting a flattering score.
 
 ## Install and run
 
@@ -136,19 +138,29 @@ saved eight-act CPU qualification, 3 local drafts were accepted and 5 safely fel
 all eight final outputs passed the act, guardrail, and 280-character checks. Treat local
 rewriting as an optional demo path, not as proven reply-quality improvement.
 
-Run the local generator, zero-shot local baseline, and local judge explicitly:
+Reproduce the 40-case same-reply judge validation without any API key:
+
+```powershell
+.\.venv\Scripts\python.exe main.py judge-eval --judge-limit 40 --judge-batch-size 8
+```
+
+It is resumable and writes content-addressed rows after every batch. The default
+benchmark reuses the result only when all sampled system-reply hashes still match the
+current drafts. On this CPU-only machine the measured run is slow; it is not part of
+the under-15-minute headline reproduction.
+
+Run the local generator and zero-shot local baseline explicitly:
 
 ```powershell
 .\.venv\Scripts\python.exe main.py benchmark `
   --generation-mode local `
-  --include-zero-shot-local `
-  --judge-local
+  --include-zero-shot-local
 ```
 
-This is substantially slower on CPU. The local-model benchmark does not invent a human
-agreement score. First have reviewers complete the generated
-`results/human_rating_template.csv`, save matching ratings at
-`data/evaluation/human_same_reply_ratings.csv`, and rerun.
+This is substantially slower on CPU. To validate the judge on generated replies rather
+than historical references, have reviewers complete the source-hashed drafts in
+`results/human_rating_template.csv`, save the matching ratings at
+`data/evaluation/human_same_reply_ratings.csv`, and rerun with `--judge-local`.
 
 ## API
 
@@ -186,6 +198,8 @@ bootstrap intervals, and reply safety invariants. The benchmark also writes:
 - `results/tough_scenario_results.csv` — row-level difficult-case routing evidence.
 - `results/retrieval_evaluation.json` — held-out, per-act retrieval diagnostics.
 - `results/local_generator_qualification.json` — real local generation acceptance and fallback evidence.
+- `results/local_judge_evaluation.json` — same-reply judge agreement, limitations, and largest disagreements.
+- `results/local_judge_historical_alignment.csv` and `results/local_judge_system_scores.csv` — content-addressed row evidence.
 
 ROUGE/BLEU are not treated as reply-quality metrics. Conformal risk guarantees, energy
 OOD, CRAG, and a keyword-based “LLM judge” are not part of the scored production path.
@@ -227,4 +241,4 @@ described by what it actually does rather than claimed as the exact RAG training
 ([Lewis et al., 2020](https://papers.nips.cc/paper/2020/hash/6b493230205f780e1bc26945df7481e5-Abstract.html)).
 The local rubric judge is G-Eval-style, not a reproduction of GPT-4 G-Eval
 ([Liu et al., 2023](https://aclanthology.org/2023.emnlp-main.153/)). Its score is not
-evidence until agreement is measured on the same replies.
+used as quality evidence because its measured same-reply agreement is poor.

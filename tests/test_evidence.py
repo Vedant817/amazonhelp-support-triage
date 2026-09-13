@@ -61,7 +61,28 @@ class TestEvidenceArtifacts(unittest.TestCase):
         else:
             self.assertEqual(zero_shot_status, "not_run")
             self.assertNotIn("Baseline 3: zero-shot local Qwen", results["systems"])
-        self.assertEqual(results["local_llm_judge"]["status"], "not_run")
+        judge_status = results["local_llm_judge"]["status"]
+        self.assertIn(judge_status, {"not_run", "measured_cached_content_verified"})
+        if judge_status == "measured_cached_content_verified":
+            self.assertGreaterEqual(results["local_llm_judge"]["valid_sample_size"], 40)
+            self.assertEqual(
+                results["human_judge_agreement"]["status"], "measured_same_reply"
+            )
+
+    def test_report_contains_mandatory_assignment_sections(self):
+        report = (ROOT / "REPORT.md").read_text(encoding="utf-8")
+        for heading in (
+            "## Problem framing: what good means",
+            "## Top five failure modes",
+            "## What is misleading about my headline number?",
+            "## What I would do with one more week",
+            "## Decision log",
+        ):
+            self.assertIn(heading, report)
+        decision_block = report.split("## Decision log", 1)[1].split("\n## ", 1)[0]
+        decisions = [line for line in decision_block.splitlines() if line[:1].isdigit()]
+        self.assertGreaterEqual(len(decisions), 10)
+        self.assertLessEqual(len(decisions), 15)
 
 
 if __name__ == "__main__":

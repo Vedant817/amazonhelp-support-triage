@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import hmac
 import json
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -115,6 +116,16 @@ def _write_cache_with_manifest(artifacts: "PipelineArtifacts", cache_file: Path)
 
 
 def _cap_per_class(frame: pd.DataFrame, label_column: str, cap: int, seed: int) -> pd.DataFrame:
+    """Subsample each class to at most ``cap`` rows.
+
+    Respects ``SUPPORT_INTENT_CAP_PER_CLASS`` so experiments do not require a
+    code change. The cap exists to bound training time on the dominant class;
+    it is not a modelling requirement, and lifting it lets the learner see the
+    full natural distribution.
+    """
+    import os as _os
+
+    cap = int(_os.getenv("SUPPORT_INTENT_CAP_PER_CLASS", str(cap)))
     return pd.concat(
         [group.sample(n=min(cap, len(group)), random_state=seed) for _, group in frame.groupby(label_column)],
         ignore_index=True,
@@ -122,7 +133,22 @@ def _cap_per_class(frame: pd.DataFrame, label_column: str, cap: int, seed: int) 
 
 
 def _balance_intent_classes(frame: pd.DataFrame, label_column: str, seed: int, max_ratio: float = 3.0) -> pd.DataFrame:
-    """Balance classes by downsampling majority and upsampling minority to max_ratio."""
+    """Balance classes by downsampling majority and upsampling minority to max_ratio.
+
+    ``max_ratio`` controls how far the smallest class is scaled up; every class
+    is resampled to ``smallest_count * max_ratio``. A larger value keeps more of
+    the dominant class's real data at the cost of more minority duplication.
+
+    ``max_ratio <= 0`` disables balancing entirely: the natural class
+    distribution is kept and the learner is left to compensate through
+    ``class_weight='balanced'``. Overridable with
+    ``SUPPORT_INTENT_BALANCE_RATIO`` for experiments.
+    """
+    import os as _os
+
+    max_ratio = float(_os.getenv("SUPPORT_INTENT_BALANCE_RATIO", str(max_ratio)))
+    if max_ratio <= 0:
+        return frame.reset_index(drop=True)
     counts = frame[label_column].value_counts()
     min_count = counts.min()
     target_min = int(min_count * max_ratio)
@@ -168,13 +194,13 @@ def build_learned_pipeline(
     fingerprint = _pipeline_fingerprint(
         fingerprint_paths,
         {
-            "intent_cap_per_class": intent_cap_per_class,
+            "intent_cap_per_class": os.getenv("SUPPORT_INTENT_CAP_PER_CLASS", str(intent_cap_per_class)),
             "retrieval_size": retrieval_size,
             "contrastive_pairs": 0,
             "escalation_knn": True,
             "context_gate": True,
             "balance_intent_classes": True,
-            "max_ratio": 3.0,
+            "max_ratio": os.getenv("SUPPORT_INTENT_BALANCE_RATIO", "3.0"),
             "confidence_penalty": 0.05,
             "runtime": _runtime_signature(),
             "seed": seed,

@@ -406,6 +406,12 @@ class DualHeadSupportModel:
         self.escalation_knn_k_ = 0
         self.escalation_knn_weight_ = 0.0
         self.escalation_knn_calibration_ap_gain_ = 0.0
+        # Deployment-prior re-weighting. Training balances every intent class so
+        # the fitted probabilities carry a uniform prior; real traffic does not.
+        # The strength is chosen on the held-out calibration split.
+        self.intent_natural_prior_: Optional[Dict[str, float]] = None
+        self.prior_correction_strength_ = 0.0
+        self.prior_correction_calibration_gain_ = 0.0
 
     @staticmethod
     def _make_vectorizer() -> FeatureUnion:
@@ -468,6 +474,7 @@ class DualHeadSupportModel:
         cal_intent_context_texts: Optional[Sequence[str]] = None,
         contrastive_texts: Optional[Sequence[str]] = None,
         contrastive_labels: Optional[Sequence[str]] = None,
+        intent_natural_prior: Optional[Dict[str, float]] = None,
     ) -> "DualHeadSupportModel":
         if self.contrastive_pair_count > 0:
             if not contrastive_texts or not contrastive_labels:
@@ -516,6 +523,10 @@ class DualHeadSupportModel:
         class_to_index = {label: idx for idx, label in enumerate(self.classes_)}
         numeric_labels = [class_to_index[label] for label in cal_intent_labels]
         self.intent_temperature.fit_multiclass(cal_intent_logits, numeric_labels)
+        # Deployment-prior re-weighting: training balances the classes, so the
+        # fitted probabilities carry a uniform prior. Real traffic does not.
+        self.intent_natural_prior_ = dict(intent_natural_prior) if intent_natural_prior else None
+        self._fit_prior_correction(cal_intent_logits, cal_intent_labels)
         # Apply confidence penalty to reduce overconfident wrong predictions
         self._fit_confidence_penalty(cal_intent_logits, numeric_labels)
         cal_semantic_logits = self.semantic_head.decision_function(cal_intent_embeddings)
@@ -642,6 +653,74 @@ class DualHeadSupportModel:
             return (1 - factor) * probs + factor * uniform
         uniform = np.ones_like(probs) / probs.shape[1]
         return (1 - factor) * probs + factor * uniform
+
+    def _prior_vector(self) -> Optional[np.ndarray]:
+        """Natural class prior aligned to ``self.classes_`` (None when unset)."""
+        if not self.intent_natural_prior_:
+            return None
+        values = np.asarray(
+            [float(self.intent_natural_prior_.get(name, 0.0)) for name in self.classes_],
+            dtype=float,
+        )
+        total = values.sum()
+        if total <= 0:
+            return None
+        return values / total
+
+    def _fit_prior_correction(self, cal_logits: np.ndarray, cal_labels: Sequence[str]) -> None:
+        """Choose how strongly to re-weight toward the deployment prior.
+
+        Training balances every intent class to a uniform prior, which maximises
+        minority recall but costs accuracy against real traffic where one class
+        dominates. Re-weighting ``p(y|x) * prior(y)**alpha`` restores the
+        deployment prior. ``alpha`` is selected on the held-out calibration
+        split, with a guard requiring macro-F1 not to regress materially, so the
+        change can only be accepted when it demonstrably helps.
+        """
+        prior = self._prior_vector()
+        if prior is None:
+            self.prior_correction_strength_ = 0.0
+            return
+
+        probs = _softmax(np.asarray(cal_logits, dtype=float) / self.intent_temperature.temperature_)
+        truth = np.asarray(cal_labels, dtype=object)
+        class_values = np.asarray(self.classes_, dtype=object)
+
+        def score(alpha: float):
+            if alpha <= 0:
+                adjusted = probs
+            else:
+                adjusted = probs * np.power(prior[np.newaxis, :], alpha)
+                adjusted = adjusted / np.clip(adjusted.sum(axis=1, keepdims=True), 1e-12, None)
+            predicted = class_values[np.argmax(adjusted, axis=1)]
+            accuracy = float(np.mean(predicted == truth))
+            macro_f1 = float(f1_score(truth, predicted, average="macro", zero_division=0))
+            return accuracy, macro_f1
+
+        base_accuracy, base_macro_f1 = score(0.0)
+        best_accuracy, best_alpha, best_macro_f1 = base_accuracy, 0.0, base_macro_f1
+        for alpha in (0.25, 0.5, 0.75, 1.0):
+            accuracy, macro_f1 = score(alpha)
+            # Accept only a material accuracy gain that does not wreck macro-F1.
+            if accuracy > best_accuracy + 0.002 and macro_f1 >= base_macro_f1 - 0.05:
+                best_accuracy, best_alpha, best_macro_f1 = accuracy, alpha, macro_f1
+
+        self.prior_correction_strength_ = float(best_alpha)
+        self.prior_correction_calibration_gain_ = max(0.0, best_accuracy - base_accuracy)
+
+    def _apply_prior_correction(self, probs: np.ndarray) -> np.ndarray:
+        """Re-weight a probability vector toward the deployment prior."""
+        alpha = self.prior_correction_strength_
+        prior = self._prior_vector() if alpha > 0 else None
+        if prior is None or alpha <= 0 or probs.shape[-1] != prior.shape[0]:
+            return probs
+        if probs.ndim == 1:
+            adjusted = probs * np.power(prior, alpha)
+            total = adjusted.sum()
+            return adjusted / total if total > 0 else probs
+        adjusted = probs * np.power(prior[np.newaxis, :], alpha)
+        totals = np.clip(adjusted.sum(axis=1, keepdims=True), 1e-12, None)
+        return adjusted / totals
 
     @staticmethod
     def _intent_estimator(c_value: float) -> OneVsRestClassifier:
@@ -905,7 +984,10 @@ class DualHeadSupportModel:
                     (1.0 - self.prototype_blend_weight_) * probs
                     + self.prototype_blend_weight_ * prototype_probs
                 )
-        
+
+        # Restore the deployment class prior (training is balanced to uniform).
+        probs = self._apply_prior_correction(probs)
+
         best_idx = int(np.argmax(probs))
         confidence = float(probs[best_idx])
         return {
@@ -936,6 +1018,10 @@ class DualHeadSupportModel:
         )
         context_logits = self.intent_head.decision_function(context_features)
         context_probs = _softmax(context_logits / self.intent_temperature.temperature_)
+        # Keep the gate consistent with inference-time probabilities, which run
+        # through the deployment-prior correction.
+        current_probs = self._apply_prior_correction(current_probs)
+        context_probs = self._apply_prior_correction(context_probs)
         current_pred = np.asarray(self.classes_, dtype=object)[np.argmax(current_probs, axis=1)]
         context_pred = np.asarray(self.classes_, dtype=object)[np.argmax(context_probs, axis=1)]
         current_conf = np.max(current_probs, axis=1)

@@ -254,6 +254,12 @@ def build_learned_pipeline(
     
     # Class balancing: upsample minority classes to reduce ORDER_TRACKING dominance
     intent_train = _balance_intent_classes(intent_train, "intent_label", seed, max_ratio=3.0)
+
+    # Deployment prior: the uncapped label distribution of the supervision corpus.
+    # Balanced training destroys this distribution, so it is recorded here and
+    # restored at decision time (fitted on the calibration split).
+    natural_prior_counts = supervision["intent_label"].dropna().value_counts(normalize=True)
+    intent_natural_prior = {str(label): float(value) for label, value in natural_prior_counts.items()}
     
     escalation_train, escalation_cal = train_test_split(
         escalation_rows,
@@ -290,6 +296,7 @@ def build_learned_pipeline(
         intent_cal["model_text"].tolist(),  # Always enable context gate
         contrastive_texts,
         contrastive_labels,
+        intent_natural_prior,
     )
 
     retrieval_frame = supervision.copy()

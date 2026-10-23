@@ -235,6 +235,14 @@ def main() -> int:
         "eval_rows": int(len(eval_frame)),
         "intent_labelled": len(y_true),
         "escalation_labelled": len(esc_true),
+        "model_state": {
+            "prior_correction_strength": float(getattr(model, "prior_correction_strength_", 0.0)),
+            "prior_correction_calibration_gain": float(getattr(model, "prior_correction_calibration_gain_", 0.0)),
+            "intent_temperature": float(model.intent_temperature.temperature_),
+            "escalation_temperature": float(model.escalation_temperature.temperature_),
+            "escalation_threshold": float(model.escalation_threshold_),
+            "intent_confidence_threshold": float(model.intent_confidence_threshold),
+        },
         "intent": intent_metrics,
         "intent_ci": intent_ci,
         "escalation": esc_metrics,
@@ -273,6 +281,13 @@ def main() -> int:
         print(f"  {key:<34s} {rendered}")
     print(f"  95% CI escalate recall             [{esc_ci['escalate_recall']['lower']:.4f}, {esc_ci['escalate_recall']['upper']:.4f}]")
     print(f"  95% CI escalate precision          [{esc_ci['escalate_precision']['lower']:.4f}, {esc_ci['escalate_precision']['upper']:.4f}]")
+
+    print("\n[model state]")
+    print(f"  prior correction alpha   {report['model_state']['prior_correction_strength']:.2f}")
+    print(f"  prior cal accuracy gain  {report['model_state']['prior_correction_calibration_gain']:.4f}")
+    print(f"  intent temperature       {report['model_state']['intent_temperature']:.4f}")
+    print(f"  escalation temperature   {report['model_state']['escalation_temperature']:.4f}")
+    print(f"  escalation threshold     {report['model_state']['escalation_threshold']:.4f}")
 
     print("\n[calibration]")
     print(f"  ECE                {ece['ece']:.4f}")

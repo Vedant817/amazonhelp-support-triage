@@ -219,7 +219,6 @@ def build_learned_pipeline(
     )
 
     intent_rows = supervision[supervision["intent_label"].notna()].copy()
-    intent_rows = _cap_per_class(intent_rows, "intent_label", intent_cap_per_class, seed)
     escalation_rows = supervision[supervision["escalate_label"].notna()].copy()
     escalation_rows["escalate_label"] = escalation_rows["escalate_label"].astype(bool)
     reason_rows = supervision[
@@ -248,16 +247,18 @@ def build_learned_pipeline(
         contrastive_texts = None
         contrastive_labels = None
 
-    intent_train, intent_cal = train_test_split(
+    # Split BEFORE capping/balancing so the calibration slice keeps the natural
+    # class prior. Temperature scaling and the deployment-prior correction are
+    # both fitted on this slice; a stratified-but-capped slice would describe a
+    # uniform world the service never sees, which is what made earlier
+    # calibration and prior estimates meaningless.
+    intent_train_raw, intent_cal = train_test_split(
         intent_rows, test_size=0.20, random_state=seed, stratify=intent_rows["intent_label"]
     )
-    
-    # Class balancing: upsample minority classes to reduce ORDER_TRACKING dominance
+    intent_train = _cap_per_class(intent_train_raw, "intent_label", intent_cap_per_class, seed)
     intent_train = _balance_intent_classes(intent_train, "intent_label", seed, max_ratio=3.0)
 
     # Deployment prior: the uncapped label distribution of the supervision corpus.
-    # Balanced training destroys this distribution, so it is recorded here and
-    # restored at decision time (fitted on the calibration split).
     natural_prior_counts = supervision["intent_label"].dropna().value_counts(normalize=True)
     intent_natural_prior = {str(label): float(value) for label, value in natural_prior_counts.items()}
     

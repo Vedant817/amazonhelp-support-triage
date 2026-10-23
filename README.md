@@ -101,6 +101,38 @@ smoke script is included for a running server:
 - `GET /metrics` exposes operational counters. These are observability, not quality evidence.
 - All model-backed endpoints return `503` while the pipeline is still warming up.
 
+## Security model
+
+The service is designed to run on loopback for a single local operator. That
+assumption is enforced rather than trusted:
+
+| Control | Default | Override |
+|---|---|---|
+| Bind address | `127.0.0.1` | `--host` on `main.py serve` |
+| CORS | same-origin only (no CORS headers) | `SUPPORT_ALLOWED_ORIGINS=http://host:port,...` |
+| Rate limit | 120 req/min per client, burst 30 | `SUPPORT_RATE_LIMIT_PER_MINUTE`, `SUPPORT_RATE_LIMIT_BURST` |
+| Max request body | 64 KiB (`413` above) | `SUPPORT_MAX_BODY_BYTES` |
+| Session IDs | `[A-Za-z0-9._:-]{1,80}` (`422` otherwise) | schema in `src/schemas.py` |
+| Pipeline cache | SHA-256 manifest verified before `joblib.load` | `SUPPORT_DISABLE_PIPELINE_CACHE=1` to always retrain |
+| Error bodies | generic `{"detail": "Internal server error."}` | server-side traceback only |
+
+Response headers on every route: `Content-Security-Policy` (`default-src 'none'`,
+`frame-ancestors 'none'`, inline styles/scripts only), `X-Content-Type-Options`,
+`X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Permissions-Policy`,
+`Cross-Origin-Opener-Policy`, `Cross-Origin-Resource-Policy`. API responses add
+`Cache-Control: no-store`.
+
+The serialized pipeline cache is the one place where untrusted bytes could lead to
+code execution; `src/model_factory.py` therefore refuses to deserialize anything
+without a matching `.sha256` manifest and treats mismatches as a cache miss.
+Never point the service at a cache directory another user can write to.
+
+Run the security regression suite with:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests/test_security.py -v
+```
+
 ## Method scope
 
 MiniLM maps text into 384-dimensional vectors suitable for semantic similarity

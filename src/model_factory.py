@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import hmac
 import json
 from pathlib import Path
 from typing import Optional
@@ -46,6 +47,71 @@ def _pipeline_fingerprint(paths: list[Path], parameters: dict) -> str:
             while chunk := handle.read(1024 * 1024):
                 digest.update(chunk)
     return digest.hexdigest()
+
+
+def _runtime_signature() -> str:
+    """Version string of the numerics stack that produced the embeddings.
+
+    A cached pipeline stores vectors produced by a specific torch /
+    sentence-transformers / scikit-learn combination. Changing any of those can
+    shift embeddings, so the runtime participates in the cache fingerprint and a
+    library upgrade forces a clean refit instead of silently mixing artifacts.
+    """
+    parts = []
+    for module_name in ("torch", "transformers", "sentence_transformers", "sklearn", "numpy", "scipy"):
+        try:
+            module = __import__(module_name)
+            parts.append(f"{module_name}={getattr(module, '__version__', 'unknown')}")
+        except Exception:
+            parts.append(f"{module_name}=missing")
+    return ";".join(parts)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _cache_is_trusted(cache_file: Path) -> bool:
+    """Verify a serialized cache before unpickling it.
+
+    ``joblib``/``pickle`` deserialization can execute arbitrary code, so a cache
+    file is only treated as trustworthy when *all* of the following hold:
+
+    1. Caching is not explicitly disabled via ``SUPPORT_DISABLE_PIPELINE_CACHE``.
+    2. The path is a regular file (not a symlink, device, or directory).
+    3. A sibling ``<file>.sha256`` manifest exists and matches the file digest.
+
+    Any failure is treated as a cache miss; the caller retrains from scratch and
+    rewrites both the artifact and its manifest.
+    """
+    import os as _os
+
+    if _os.getenv("SUPPORT_DISABLE_PIPELINE_CACHE", "").strip() in {"1", "true", "yes"}:
+        return False
+    try:
+        if cache_file.is_symlink() or not cache_file.is_file():
+            return False
+        manifest = cache_file.with_suffix(cache_file.suffix + ".sha256")
+        if not manifest.is_file() or manifest.is_symlink():
+            return False
+        expected = manifest.read_text(encoding="utf-8").strip().split()[0].lower()
+        actual = _file_sha256(cache_file)
+        return hmac.compare_digest(expected, actual)
+    except Exception:
+        return False
+
+
+def _write_cache_with_manifest(artifacts: "PipelineArtifacts", cache_file: Path) -> None:
+    """Persist the fitted pipeline and a digest manifest for later verification."""
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(artifacts, cache_file, compress=3)
+    digest = _file_sha256(cache_file)
+    manifest = cache_file.with_suffix(cache_file.suffix + ".sha256")
+    manifest.write_text(f"{digest}  {cache_file.name}\n", encoding="utf-8")
 
 
 def _cap_per_class(frame: pd.DataFrame, label_column: str, cap: int, seed: int) -> pd.DataFrame:
@@ -110,6 +176,7 @@ def build_learned_pipeline(
             "balance_intent_classes": True,
             "max_ratio": 3.0,
             "confidence_penalty": 0.05,
+            "runtime": _runtime_signature(),
             "seed": seed,
         },
     )
@@ -117,7 +184,8 @@ def build_learned_pipeline(
         Path(pipeline_cache_dir) / f"pipeline-{fingerprint[:16]}.joblib"
         if pipeline_cache_dir else None
     )
-    if cache_file and cache_file.exists():
+    cache_trusted = _cache_is_trusted(cache_file) if cache_file else False
+    if cache_trusted:
         artifacts = joblib.load(cache_file)
         artifacts.cache_hit = True
         return artifacts
@@ -248,6 +316,5 @@ def build_learned_pipeline(
         context_coverage=context_coverage,
     )
     if cache_file:
-        cache_file.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump(artifacts, cache_file, compress=3)
+        _write_cache_with_manifest(artifacts, cache_file)
     return artifacts

@@ -5,9 +5,19 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
+#: Session IDs are caller-supplied and used as in-memory dictionary keys, so they
+#: are constrained to a short, log-safe character set.
+SESSION_ID_PATTERN = r"^[A-Za-z0-9._:-]{1,80}$"
+
+
 class TriageRequest(BaseModel):
     text: str = Field(..., min_length=1, max_length=1000)
-    session_id: Optional[str] = None
+    session_id: Optional[str] = Field(
+        None,
+        max_length=80,
+        pattern=SESSION_ID_PATTERN,
+        description="Optional conversation key. Alphanumeric, dot, dash, underscore, colon.",
+    )
 
 
 class ConfidenceRequest(BaseModel):

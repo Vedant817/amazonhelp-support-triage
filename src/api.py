@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -10,7 +11,7 @@ from typing import Any, Dict
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from starlette import status as http_status
 
 from src.dashboard_html import DASHBOARD_HTML
@@ -28,6 +29,13 @@ from src.schemas import (
     RetrievalEvidence,
     TriageRequest,
     TriageResponse,
+)
+from src.security import (
+    MAX_BODY_BYTES,
+    TokenBucketRateLimiter,
+    apply_security_headers,
+    client_identifier,
+    resolve_allowed_origins,
 )
 from src.session import CustomerSessionTracker
 
@@ -71,16 +79,70 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="@AmazonHelp Support Agent API",
     description="Local MiniLM dual-head triage with hard safety gates and historical resolution-act grounding.",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
+# CORS is same-origin by default. A browser page on another origin gets no CORS
+# headers, so it cannot read responses or issue preflighted POSTs. An explicit
+# allowlist can be opted into for a separate front-end dev server.
+_allowed_origins = resolve_allowed_origins()
+if _allowed_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_allowed_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type"],
+        max_age=600,
+    )
+
+_rate_limiter = TokenBucketRateLimiter()
+
+
+@app.middleware("http")
+async def security_middleware(request, call_next):
+    """Enforce body-size caps, per-client throttling, and response hardening."""
+    # 1. Reject oversized bodies before they are buffered or parsed.
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MAX_BODY_BYTES:
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": f"Request body exceeds {MAX_BODY_BYTES} bytes."},
+                )
+        except ValueError:
+            return JSONResponse(
+                status_code=http_status.HTTP_400_BAD_REQUEST,
+                content={"detail": "Invalid Content-Length header."},
+            )
+
+    # 2. Throttle by socket peer (never by spoofable forwarded headers).
+    if not _rate_limiter.allow(client_identifier(request)):
+        return JSONResponse(
+            status_code=http_status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": "Rate limit exceeded. Slow down and retry shortly."},
+            headers={"Retry-After": "2"},
+        )
+
+    response = await call_next(request)
+
+    # 3. Harden every response.
+    apply_security_headers(response, api_route=request.url.path.startswith("/api/"))
+    return response
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request, exc):  # pragma: no cover - logging path
+    """Never leak stack traces or internal state to a caller."""
+    logging.getLogger("amazonhelp.api").exception(
+        "Unhandled error on %s %s", request.method, request.url.path
+    )
+    return JSONResponse(
+        status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": "Internal server error."},
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -99,6 +161,7 @@ def _require_pipeline() -> None:
 
 
 @app.get("/api/v1/health", response_model=HealthResponse)
+@app.get("/health", response_model=HealthResponse, include_in_schema=False)
 def health():
     _require_pipeline()
     model = pipeline_state["model"]

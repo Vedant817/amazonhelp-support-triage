@@ -8,8 +8,17 @@ fastapi==0.141.1
 uvicorn==0.52.4
 pydantic==2.13.5
 httpx==0.28.1
-torch==2.7.1
-transformers==4.53.2
-sentence-transformers==5.0.0
-datasets==4.0.0
+# Numerics / model runtime.
+# Security pins: these floors are the versions that carry the fixes for
+# PYSEC-2025-193..195, PYSEC-2026-1970, PYSEC-2026-2286 (torch) and
+# PYSEC-2025-211..218, PYSEC-2026-2288..2290, PYSEC-2026-3929/4174 (transformers),
+# PYSEC-2026-4164 (sentence-transformers), PYSEC-2026-3716 (datasets),
+# PYSEC-2026-4217 (fsspec). Re-audit with `python scripts_audit.py`.
+torch==2.14.1
+transformers==5.20.2
+sentence-transformers==6.2.0
+datasets==5.1.0
+fsspec==2026.7.0
+# No fixed release exists for PYSEC-2026-3804 at time of writing; accelerate is
+# only used for optional multi-device model loading and is not on any request path.
 accelerate==1.10.0

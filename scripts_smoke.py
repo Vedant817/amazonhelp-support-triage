@@ -114,6 +114,36 @@ def main() -> int:
     check("metrics returns 200", r.status_code == 200, f"status={r.status_code}")
     check("metrics has requests counter", "amazonhelp_requests_total" in r.text, "missing counter")
 
+    # 8. Security hardening
+    dash = client.get("/")
+    header_map = {k.lower(): v for k, v in dash.headers.items()}
+    check("nosniff header present", header_map.get("x-content-type-options") == "nosniff", header_map.get("x-content-type-options", "missing"))
+    check("frame protection present", header_map.get("x-frame-options") == "DENY", header_map.get("x-frame-options", "missing"))
+    check("referrer policy present", header_map.get("referrer-policy") == "no-referrer", header_map.get("referrer-policy", "missing"))
+    check("CSP present on dashboard", "default-src 'none'" in header_map.get("content-security-policy", ""), "csp missing")
+    check("CSP forbids remote frames", "frame-ancestors 'none'" in header_map.get("content-security-policy", ""), "frame-ancestors missing")
+
+    api_resp = client.get("/api/v1/health")
+    api_headers = {k.lower(): v for k, v in api_resp.headers.items()}
+    check("api responses are not cached", api_headers.get("cache-control") == "no-store", api_headers.get("cache-control", "missing"))
+
+    evil = client.get("/api/v1/health", headers={"Origin": "http://evil.example"})
+    evil_headers = {k.lower() for k in evil.headers.keys()}
+    check("no wildcard CORS header", "access-control-allow-origin" not in evil_headers, "CORS origin header leaked")
+
+    r = client.post(
+        "/api/v1/triage",
+        content=b"x" * (128 * 1024),
+        headers={"Content-Type": "application/json", "Content-Length": str(128 * 1024)},
+    )
+    check("oversized body rejected (413)", r.status_code == 413, f"status={r.status_code}")
+
+    r = client.post("/api/v1/triage", json={"text": "hello", "session_id": "bad space!"})
+    check("unsafe session id rejected (422)", r.status_code == 422, f"status={r.status_code}")
+
+    r = client.post("/api/v1/triage", json={"text": "hello", "session_id": "x" * 200})
+    check("overlong session id rejected (422)", r.status_code == 422, f"status={r.status_code}")
+
     client.close()
 
     print()

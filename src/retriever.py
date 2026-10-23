@@ -10,7 +10,6 @@ Includes zero-score protection against degenerate queries.
 import os
 import re
 import math
-import pickle
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Any, Optional
@@ -197,29 +196,3 @@ class HistoricalResolutionRetriever:
             results.append(rec)
 
         return results
-
-    def save_index(self, path: str):
-        with open(path, "wb") as f:
-            pickle.dump({
-                "vectorizer": self.vectorizer,
-                "records": self.records,
-                "tfidf_matrix": self.tfidf_matrix,
-                "dense_matrix": self.dense_matrix,
-                "bm25": self.bm25
-            }, f)
-
-    def load_index(self, path: str):
-        with open(path, "rb") as f:
-            data = pickle.load(f)
-            self.vectorizer = data["vectorizer"]
-            self.records = data["records"]
-            self.tfidf_matrix = data["tfidf_matrix"]
-            self.dense_matrix = data.get("dense_matrix")
-            self.bm25 = data.get("bm25", BM25Index())
-        if self.dense_matrix is not None and self.dense_encoder is None:
-            # Dense vectors are only meaningful when queries use the same pinned
-            # encoder. Rehydrate it explicitly instead of silently falling back
-            # to TF-IDF against a MiniLM matrix.
-            from src.dual_head import MiniLMEncoder
-            self.dense_encoder = MiniLMEncoder()
-        return self

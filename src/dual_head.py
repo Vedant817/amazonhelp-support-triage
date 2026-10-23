@@ -733,9 +733,17 @@ class DualHeadSupportModel:
         ))
 
     def _select_intent_regularization(self, features, labels: np.ndarray) -> None:
+        """Pick C by cross-validated macro-F1 over a wide grid.
+
+        The earlier grid stopped at C=4.0 while the optimum on this corpus sits
+        near C=30 (measured independently with a plain TF-IDF + logistic
+        regression recipe), so the search was in the wrong regime. Weak
+        supervision is noisy, which favours strong regularisation in theory, but
+        the measured macro-F1 keeps improving past C=4 on this data.
+        """
         splitter = StratifiedKFold(n_splits=3, shuffle=True, random_state=17)
         best = (-1.0, -1.0)
-        for c_value in (0.25, 0.5, 1.0, 2.0, 4.0):
+        for c_value in (0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0):
             score = float(np.mean(cross_val_score(
                 self._intent_estimator(c_value),
                 features,

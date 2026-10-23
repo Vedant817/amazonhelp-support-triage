@@ -242,6 +242,17 @@ def main() -> int:
             "escalation_temperature": float(model.escalation_temperature.temperature_),
             "escalation_threshold": float(model.escalation_threshold_),
             "intent_confidence_threshold": float(model.intent_confidence_threshold),
+            "intent_selected_c": float(getattr(model, "intent_selected_c_", 0.0)),
+            "intent_cv_macro_f1": float(getattr(model, "intent_cv_macro_f1_", 0.0)),
+            "semantic_blend_weight": float(getattr(model, "semantic_blend_weight_", 0.0)),
+            "prototype_blend_weight": float(getattr(model, "prototype_blend_weight_", 0.0)),
+            "ensemble_weights": [
+                float(getattr(model, "ensemble_hybrid_weight_", 1.0)),
+                float(getattr(model, "ensemble_semantic_weight_", 0.0)),
+                float(getattr(model, "ensemble_prototype_weight_", 0.0)),
+            ],
+            "context_gate_confidence": float(getattr(model, "context_gate_confidence_", 0.0)),
+            "intent_labels_pruned": int(getattr(model, "intent_pruned_count_", 0)),
         },
         "intent": intent_metrics,
         "intent_ci": intent_ci,
@@ -283,11 +294,19 @@ def main() -> int:
     print(f"  95% CI escalate precision          [{esc_ci['escalate_precision']['lower']:.4f}, {esc_ci['escalate_precision']['upper']:.4f}]")
 
     print("\n[model state]")
-    print(f"  prior correction alpha   {report['model_state']['prior_correction_strength']:.2f}")
-    print(f"  prior cal accuracy gain  {report['model_state']['prior_correction_calibration_gain']:.4f}")
-    print(f"  intent temperature       {report['model_state']['intent_temperature']:.4f}")
-    print(f"  escalation temperature   {report['model_state']['escalation_temperature']:.4f}")
-    print(f"  escalation threshold     {report['model_state']['escalation_threshold']:.4f}")
+    state = report["model_state"]
+    print(f"  prior correction alpha   {state['prior_correction_strength']:.2f}")
+    print(f"  prior cal accuracy gain  {state['prior_correction_calibration_gain']:.4f}")
+    print(f"  intent C (selected)      {state['intent_selected_c']:.2f}   cv macro-F1 {state['intent_cv_macro_f1']:.4f}")
+    print(f"  intent temperature       {state['intent_temperature']:.4f}")
+    print(f"  semantic blend weight    {state['semantic_blend_weight']:.4f}")
+    print(f"  prototype blend weight   {state['prototype_blend_weight']:.4f}")
+    print(f"  ensemble weights         hybrid={state['ensemble_weights'][0]:.2f} "
+          f"semantic={state['ensemble_weights'][1]:.2f} prototype={state['ensemble_weights'][2]:.2f}")
+    print(f"  context gate confidence  {state['context_gate_confidence']:.4f}")
+    print(f"  intent labels pruned     {state['intent_labels_pruned']}")
+    print(f"  escalation temperature   {state['escalation_temperature']:.4f}")
+    print(f"  escalation threshold     {state['escalation_threshold']:.4f}")
 
     print("\n[calibration]")
     print(f"  ECE                {ece['ece']:.4f}")

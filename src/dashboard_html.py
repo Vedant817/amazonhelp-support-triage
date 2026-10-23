@@ -885,9 +885,8 @@ DASHBOARD_HTML = r"""<!doctype html>
       container.replaceChildren();
       (stages || []).forEach((stage) => {
         const status = String(stage.status || "").toLowerCase();
-        const nodeClass = status === "complete" || status === "passed"
-          ? "ok" : status === "no_match"
-            ? "muted" : "warn";
+        const ok = status === "complete" || status === "passed" || status === "auto_handle";
+        const nodeClass = ok ? "ok" : status === "no_match" ? "muted" : "warn";
 
         const item = document.createElement("li");
         item.className = "trace-item";

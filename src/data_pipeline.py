@@ -222,16 +222,21 @@ def process_amazon_conversations(
                 
     pairs_df = pd.DataFrame(pairs)
     logger.info(f"Total valid conversation pairs generated: {len(pairs_df)}")
-    
-    os.makedirs(os.path.dirname(output_pairs_csv), exist_ok=True)
+
+    output_dir = os.path.dirname(output_pairs_csv)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
     pairs_df.to_csv(output_pairs_csv, index=False, quoting=csv.QUOTE_NONNUMERIC)
     logger.info(f"Saved CSV to {output_pairs_csv}")
-    
+
+    jsonl_dir = os.path.dirname(output_pairs_jsonl)
+    if jsonl_dir:
+        os.makedirs(jsonl_dir, exist_ok=True)
     with open(output_pairs_jsonl, "w", encoding="utf-8") as f:
         for p in pairs:
             f.write(json.dumps(p, ensure_ascii=False) + "\n")
     logger.info(f"Saved JSONL to {output_pairs_jsonl}")
-    
+
     return pairs_df
 
 if __name__ == "__main__":

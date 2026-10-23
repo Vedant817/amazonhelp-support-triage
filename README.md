@@ -47,6 +47,11 @@ Face cache and are not committed. The fitted pipeline is cached under
 `models/pipeline_cache/` using a fingerprint of the data, configuration, and relevant
 source files; changing any of them forces retraining.
 
+> **First-run note:** the initial fit performs MiniLM encoding, TF-IDF fitting, and
+> cross-validated regularization/model-selection searches. On a CPU-only machine this
+> can take 10–30 minutes. Every later start reuses the cache in seconds. Model-backed
+> endpoints return `503` until the fit completes.
+
 The API defaults to deterministic offline generation so it can be reproduced without
 loading a generative model. To use the pinned local Qwen model:
 

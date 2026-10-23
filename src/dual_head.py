@@ -723,10 +723,21 @@ class DualHeadSupportModel:
         return adjusted / totals
 
     @staticmethod
-    def _intent_estimator(c_value: float) -> OneVsRestClassifier:
+    def _intent_estimator(c_value: float, class_weight: Optional[str] = "balanced") -> OneVsRestClassifier:
+        """Intent estimator.
+
+        ``class_weight='balanced'`` (default) favours per-class performance and
+        therefore macro-F1, at the cost of raw accuracy on imbalanced traffic.
+        ``SUPPORT_INTENT_CLASS_WEIGHT=none`` disables the reweighting, which
+        raises majority-class recall and raw accuracy but lowers macro-F1.
+        """
+        import os as _os
+
+        requested = _os.getenv("SUPPORT_INTENT_CLASS_WEIGHT", class_weight or "balanced").strip().lower()
+        weight: Optional[str] = None if requested in {"none", "unweighted", "0", "false"} else "balanced"
         return OneVsRestClassifier(LogisticRegression(
             max_iter=2000,
-            class_weight="balanced",
+            class_weight=weight,
             random_state=42,
             C=c_value,
             solver="liblinear",

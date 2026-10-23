@@ -91,8 +91,9 @@ app = FastAPI(
 
 # Host-header validation blocks DNS-rebinding attacks, where a hostile domain
 # resolves to 127.0.0.1 and the browser then treats this service as same-origin.
+# Starlette normalises IPv6 hosts with brackets, so both forms are listed.
 # Extra hosts can be added through SUPPORT_ALLOWED_HOSTS.
-_allowed_hosts = ["127.0.0.1", "localhost", "::1", "testserver"]
+_allowed_hosts = ["127.0.0.1", "localhost", "[::1]", "::1", "testserver"]
 _extra_hosts = [h.strip() for h in os.getenv("SUPPORT_ALLOWED_HOSTS", "").split(",") if h.strip()]
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=_allowed_hosts + _extra_hosts)
 

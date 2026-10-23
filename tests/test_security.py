@@ -312,9 +312,18 @@ class TestApiMiddleware:
         assert response.status_code == 400
 
     def test_localhost_host_header_accepted(self, client):
-        for host in ("127.0.0.1", "localhost"):
+        for host in ("127.0.0.1", "localhost", "127.0.0.1:8080", "localhost:8080"):
             response = client.get("/api/v1/health", headers={"Host": host})
             assert response.status_code in (200, 503), f"failed for {host}"
+
+    def test_ipv6_loopback_host_header_accepted(self, client):
+        """Starlette normalises IPv6 hosts with brackets before comparison."""
+        response = client.get("/api/v1/health", headers={"Host": "[::1]:8000"})
+        assert response.status_code in (200, 503)
+
+    def test_nonstandard_port_host_accepted(self, client):
+        response = client.get("/api/v1/health", headers={"Host": "localhost:9999"})
+        assert response.status_code in (200, 503)
 
     def test_docs_enabled_by_default_for_local_use(self):
         from src import api as api_module

@@ -67,7 +67,7 @@ class SafetyGatedEscalator:
     def __init__(self, learned_threshold: float = 0.5):
         self.learned_threshold = learned_threshold
         self._email = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
-        self._phone = re.compile(r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b")
+        self._phone = re.compile(r"(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b")
         self._order_id = re.compile(r"\b\d{3}-\d{7}-\d{7}\b")
         self._payment = re.compile(r"\b(?:cvv|security code|card number|credit card|\d{4}[- ]\d{4}[- ]\d{4}[- ]\d{4})\b", re.I)
         self._takeover = re.compile(r"\b(?:hacked|account takeover|taken over|took over|unauthorized access|someone .* logged in|stolen account|phishing)\b", re.I)

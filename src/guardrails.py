@@ -106,19 +106,39 @@ class ProductionPolicyGuard:
             if order_id in draft_reply:
                 pii_redactions.append((order_id, "[order ID redacted]", "PII_ORDER_ID_ECHO_DETECTED", f"Redacted mirrored order ID {order_id}"))
 
-        # Check emails
+        # Check emails (case-insensitive: local parts are case-preserving but the
+        # domain is not, so a case variant must still be treated as an echo).
         email_pattern = r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
         customer_emails = re.findall(email_pattern, customer_text)
         for email in customer_emails:
-            if email in draft_reply:
-                pii_redactions.append((email, "[email protected]", "PII_ECHO_DETECTED", f"Redacted mirrored email {email}"))
+            for match in re.finditer(re.escape(email), draft_reply, re.IGNORECASE):
+                pii_redactions.append((match.group(0), "[email protected]", "PII_ECHO_DETECTED", f"Redacted mirrored email {email}"))
 
-        # Check phone numbers
-        phone_pattern = r"\b\d{3}[-.\s]??\d{3}[-.\s]??\d{4}\b"
-        customer_phones = re.findall(phone_pattern, customer_text)
-        for phone in customer_phones:
-            if phone in draft_reply:
-                pii_redactions.append((phone, "[phone redacted]", "PII_ECHO_DETECTED", f"Redacted mirrored phone {phone}"))
+        # Check phone numbers with format-normalised matching: the same number
+        # can appear as "555-123-4567", "555 123 4567", "+1 (555) 123-4567", and
+        # an exact-string comparison would let the dash/space variants through.
+        phone_pattern = r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b"
+        customer_phone_digits = set()
+        for phone in re.findall(phone_pattern, customer_text):
+            digits = re.sub(r"\D", "", phone)
+            if len(digits) >= 10:
+                customer_phone_digits.add(digits[-10:])
+        if customer_phone_digits:
+            draft_phone_candidates = re.findall(
+                r"\+?\d[\d\s\-().]{8,}\d", draft_reply
+            )
+            for candidate in draft_phone_candidates:
+                digits = re.sub(r"\D", "", candidate)
+                if len(digits) < 10:
+                    continue
+                # Match when the trailing 10 digits agree (drops any country code).
+                if digits[-10:] in customer_phone_digits:
+                    pii_redactions.append((
+                        candidate,
+                        "[phone redacted]",
+                        "PII_ECHO_DETECTED",
+                        f"Redacted mirrored phone {candidate.strip()}",
+                    ))
 
         # 2. Prohibited Agent Requests Check
         for pat, violation_code in self.prohibited_requests:

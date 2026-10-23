@@ -109,12 +109,12 @@ training through the leak-guard hook, so the numbers are genuinely held out.
 
 | Metric | Value |
 |---|---:|
-| Intent accuracy | 0.4586 |
-| Intent macro-F1 | 0.2659 |
-| Intent macro precision / recall | 0.2755 / 0.2962 |
+| Intent accuracy | 0.4690 |
+| Intent macro-F1 | 0.2660 |
+| Intent macro precision / recall | 0.2838 / 0.2953 |
 | Escalation recall (one-sided 95% lower bound) | 0.9375 (0.8463) |
 | Escalation precision | 0.3814 |
-| Expected calibration error (ECE / MCE) | 0.2851 / 0.5992 |
+| Expected calibration error (ECE / MCE) | 0.2352 / 0.6065 |
 | Guardrail pass rate | 1.0000 |
 | Guardrail PII violations | 0 |
 | Resolution-act realization | 1.0000 |
@@ -127,16 +127,27 @@ Context for those numbers:
   supervision signal, not ground truth.
 - **The review sample is stratified** (54.5% `ORDER_TRACKING_AND_DELAY`) while
   real traffic is ~68.7%. Reweighting per-class recall by the traffic prior
-  gives a deployment-representative accuracy of **0.5087**; the runner prints
+  gives a deployment-representative accuracy of **0.5277**; the runner prints
   both figures.
 - **The model is at the measured ceiling for this label set.** A plain
   TF-IDF + logistic-regression recipe reaches 0.8106 cross-validated accuracy on
-  these labels (`scripts_ceiling.py`); the fitted pipeline reaches 0.8102
+  these labels (`scripts_ceiling.py`); the fitted pipeline reaches 0.8069
   cross-validated macro-F1, so the remaining gap is supervision quality rather
   than model capacity.
 - **Escalation recall is the safety-critical metric** and is carried by the
   deterministic hard gates, which is why it stays at 0.94 while intent accuracy
-  is limited.
+  is limited by the labels.
+
+What moved the score from 0.31 to 0.47 accuracy (each change is measured, not
+assumed):
+
+| Change | Why |
+|---|---|
+| Fitted a deployment-prior correction on the calibration split | Balanced training produced a uniform prior; traffic is 69% one class |
+| Split before capping/balancing | The calibration slice was itself flattened, so the correction could not be selected |
+| Kept the natural class distribution for training | Balancing discarded ~80% of the dominant class's evidence |
+| Widened the C search to 32 | The optimum sits near C=8-30; the grid stopped at 4 |
+| Disabled class reweighting | Redundant once the prior is restored: +0.010 accuracy, -0.05 ECE for -0.0001 macro-F1 |
 
 Diagnostics used to reach these numbers:
 
@@ -152,9 +163,9 @@ separately):
 
 | Knob | Default | Effect |
 |---|---|---|
-| `SUPPORT_INTENT_BALANCE_RATIO` | `0.0` (natural) | `>0` re-balances classes; costs accuracy, helps minority recall |
+| `SUPPORT_INTENT_BALANCE_RATIO` | `0.0` (natural) | `>0` re-balances classes; measured to cost ~0.06 accuracy |
 | `SUPPORT_INTENT_CAP_PER_CLASS` | `20000` | Lower values truncate the dominant class's evidence |
-| `SUPPORT_INTENT_CLASS_WEIGHT` | `balanced` | `none` raises raw accuracy on imbalanced traffic, lowers macro-F1 |
+| `SUPPORT_INTENT_CLASS_WEIGHT` | `none` | `balanced` re-enables class reweighting |
 
 ## Security model
 

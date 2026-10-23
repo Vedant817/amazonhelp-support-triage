@@ -8,9 +8,10 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, PlainTextResponse
+from starlette import status as http_status
 
 from src.dashboard_html import DASHBOARD_HTML
 from src.escalator import EscalationDecision, SafetyGatedEscalator
@@ -47,7 +48,7 @@ async def lifespan(app: FastAPI):
         pairs_csv="data/processed/amazonhelp_context_pairs.csv",
         intent_cap_per_class=int(os.getenv("SUPPORT_INTENT_CAP_PER_CLASS", "1200")),
         retrieval_size=int(os.getenv("SUPPORT_RETRIEVAL_SIZE", "8000")),
-        contrastive_pairs=600,
+        contrastive_pairs=int(os.getenv("SUPPORT_CONTRASTIVE_PAIRS", "0")),
     )
     generation_mode = os.getenv("SUPPORT_GENERATION_MODE", "offline").lower()
     pipeline_state.update(
@@ -88,8 +89,18 @@ def serve_dashboard():
     return HTMLResponse(content=DASHBOARD_HTML)
 
 
+def _require_pipeline() -> None:
+    """Fail fast with a clear 503 while the model is still warming up."""
+    if "model" not in pipeline_state:
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Pipeline is still loading. Retry shortly.",
+        )
+
+
 @app.get("/api/v1/health", response_model=HealthResponse)
 def health():
+    _require_pipeline()
     model = pipeline_state["model"]
     threshold_selection = model.escalation_threshold_selection_
     encoder_device = getattr(getattr(model.encoder, "_model", None), "device", None)
@@ -133,6 +144,7 @@ def health():
 
 @app.post("/api/v1/confidence", response_model=ConfidenceResponse)
 def confidence_lookup(req: ConfidenceRequest):
+    _require_pipeline()
     model = pipeline_state["model"]
     result = model.predict_with_confidence(req.text)
     return ConfidenceResponse(
@@ -146,6 +158,7 @@ def confidence_lookup(req: ConfidenceRequest):
 
 @app.post("/api/v1/triage", response_model=TriageResponse)
 def triage(req: TriageRequest):
+    _require_pipeline()
     started = time.perf_counter()
     model = pipeline_state["model"]
     session = (
@@ -188,7 +201,9 @@ def triage(req: TriageRequest):
     )
 
     if session is not None:
-        friction = session.evaluate_multi_turn_friction(req.text)
+        friction = session.evaluate_multi_turn_friction(
+            req.text, current_intent=classification["intent"]
+        )
         if friction["override_escalate"]:
             decision = EscalationDecision(
                 True,

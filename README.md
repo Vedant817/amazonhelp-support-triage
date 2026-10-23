@@ -23,7 +23,7 @@ The current system is:
 
 ## Install and run
 
-Prerequisite: Python 3.10 or 3.11. The checked-in dependency versions are pinned in
+Prerequisite: Python 3.11 or 3.12. The checked-in dependency versions are pinned in
 `requirements.txt`. Windows PowerShell:
 
 ```powershell
@@ -54,11 +54,39 @@ loading a generative model. To use the pinned local Qwen model:
 .\.venv\Scripts\python.exe main.py serve --generation-mode local
 ```
 
+## Decision console (UI)
+
+Open <http://127.0.0.1:8000/> after starting the server. The console shows:
+
+- a live runtime strip (encoder, reply backend, retrieval, calibration, corpus, device);
+- a composed customer-message form with one-click demo cases and a `Ctrl` + `Enter` shortcut;
+- the decision banner (escalate vs auto-reply) with the exact routing reason code;
+- four headline metrics (confidence, risk, threshold, latency);
+- the guarded draft reply with a 280-character budget and copy-to-clipboard;
+- a measured six-stage execution trace and the full intent distribution;
+- retrieved historical evidence with RRF / dense / BM25 scores;
+- the pre-dispatch policy result and the complete raw API response.
+
 The dashboard reads its runtime model IDs, revisions, device, corpus size, generation
 backend, and calibration values from `/api/v1/health`. Each triage response includes
 the complete intent distribution and a measured six-stage execution trace covering
 classification, risk scoring, retrieval, routing policy fusion, generation, and
 pre-dispatch guardrails.
+
+## Tests
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-test.txt
+.\.venv\Scripts\python.exe -m pytest tests/ -v
+```
+
+The suite covers the safety gates, policy guardrails, retrieval, generation,
+dual-head calibration, and multi-turn session handling. A hostile end-to-end
+smoke script is included for a running server:
+
+```powershell
+.\.venv\Scripts\python.exe scripts_smoke.py http://127.0.0.1:8000
+```
 
 ## API
 
@@ -66,6 +94,7 @@ pre-dispatch guardrails.
 - `POST /api/v1/confidence` returns calibrated intent probabilities and the abstention decision.
 - `POST /api/v1/triage` returns intent, learned escalation risk, exact reason code, resolution act, PII-stripped retrieval evidence, guarded draft, and latency.
 - `GET /metrics` exposes operational counters. These are observability, not quality evidence.
+- All model-backed endpoints return `503` while the pipeline is still warming up.
 
 ## Method scope
 

@@ -312,6 +312,25 @@ def main() -> int:
     print(f"  ECE                {ece['ece']:.4f}")
     print(f"  MCE                {ece['mce']:.4f}")
 
+    print("\n[distribution-matched accuracy]")
+    print("  The review sample is stratified (54.5% ORDER_TRACKING) while real")
+    print("  traffic is ~68.7%. Reweighting per-class recall by the traffic prior")
+    print("  gives a deployment-representative estimate.")
+    cm = np.asarray(intent_metrics["confusion_matrix"], dtype=float)
+    row_totals = cm.sum(axis=1, keepdims=True)
+    per_class_recall = np.divide(cm.diagonal()[:, None], np.clip(row_totals, 1, None)).ravel()
+    # Traffic prior comes from the training corpus, not the stratified sample.
+    traffic_labels = train_pairs["reply_text"].fillna("").map(infer_reply_intent)
+    traffic_counts = traffic_labels.dropna().value_counts(normalize=True)
+    traffic_prior = np.asarray([float(traffic_counts.get(l, 0.0)) for l in labels])
+    if traffic_prior.sum() > 0:
+        traffic_prior = traffic_prior / traffic_prior.sum()
+    deployment_accuracy = float(np.sum(traffic_prior * per_class_recall))
+    print(f"  empirical accuracy (eval prior)     {intent_metrics['accuracy']:.4f}")
+    print(f"  deployment accuracy (traffic prior) {deployment_accuracy:.4f}")
+    report["deployment_accuracy"] = round(deployment_accuracy, 4)
+    report["per_class_recall"] = {l: round(float(r), 4) for l, r in zip(labels, per_class_recall)}
+
     print("\n[reply] safety and compliance")
     print(f"  guardrail pass     {reply_metrics['guardrail_pass_rate']:.4f}")
     print(f"  PII violations     {reply_metrics['pii_violation_count']}")

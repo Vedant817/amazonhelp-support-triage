@@ -55,7 +55,7 @@ metrics_counters = {
 async def lifespan(app: FastAPI):
     artifacts = build_learned_pipeline(
         pairs_csv="data/processed/amazonhelp_context_pairs.csv",
-        intent_cap_per_class=int(os.getenv("SUPPORT_INTENT_CAP_PER_CLASS", "1200")),
+        intent_cap_per_class=int(os.getenv("SUPPORT_INTENT_CAP_PER_CLASS", "20000")),
         retrieval_size=int(os.getenv("SUPPORT_RETRIEVAL_SIZE", "8000")),
         contrastive_pairs=int(os.getenv("SUPPORT_CONTRASTIVE_PAIRS", "0")),
     )

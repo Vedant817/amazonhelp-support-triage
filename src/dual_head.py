@@ -723,18 +723,21 @@ class DualHeadSupportModel:
         return adjusted / totals
 
     @staticmethod
-    def _intent_estimator(c_value: float, class_weight: Optional[str] = "balanced") -> OneVsRestClassifier:
+    def _intent_estimator(c_value: float, class_weight: Optional[str] = None) -> OneVsRestClassifier:
         """Intent estimator.
 
-        ``class_weight='balanced'`` (default) favours per-class performance and
-        therefore macro-F1, at the cost of raw accuracy on imbalanced traffic.
-        ``SUPPORT_INTENT_CLASS_WEIGHT=none`` disables the reweighting, which
-        raises majority-class recall and raw accuracy but lowers macro-F1.
+        Class reweighting defaults to **off**. With natural (unbalanced) training
+        and the calibrated deployment-prior correction, reweighting classes is a
+        second, redundant compensation for imbalance: measured held-out it
+        changed macro-F1 by 0.0001 while costing 0.0104 accuracy and 0.05 ECE.
+        Set ``SUPPORT_INTENT_CLASS_WEIGHT=balanced`` to re-enable it.
         """
         import os as _os
 
-        requested = _os.getenv("SUPPORT_INTENT_CLASS_WEIGHT", class_weight or "balanced").strip().lower()
-        weight: Optional[str] = None if requested in {"none", "unweighted", "0", "false"} else "balanced"
+        requested = _os.getenv(
+            "SUPPORT_INTENT_CLASS_WEIGHT", "none" if class_weight is None else class_weight
+        ).strip().lower()
+        weight: Optional[str] = "balanced" if requested in {"balanced", "1", "true", "yes"} else None
         return OneVsRestClassifier(LogisticRegression(
             max_iter=2000,
             class_weight=weight,

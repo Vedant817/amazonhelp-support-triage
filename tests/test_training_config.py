@@ -66,21 +66,21 @@ class TestPerClassCap:
 
 
 class TestIntentClassWeight:
-    def test_default_is_balanced(self):
+    def test_default_is_unweighted(self):
+        """Natural training + prior correction makes reweighting redundant."""
         estimator = DualHeadSupportModel._intent_estimator(1.0)
-        inner = estimator.estimator
-        assert inner.class_weight == "balanced"
-
-    @pytest.mark.parametrize("value", ["none", "NONE", "unweighted", "0", "false"])
-    def test_env_disables_reweighting(self, value):
-        with patch.dict(os.environ, {"SUPPORT_INTENT_CLASS_WEIGHT": value}):
-            estimator = DualHeadSupportModel._intent_estimator(1.0)
         assert estimator.estimator.class_weight is None
 
-    def test_unknown_value_falls_back_to_balanced(self):
-        with patch.dict(os.environ, {"SUPPORT_INTENT_CLASS_WEIGHT": "whatever"}):
+    @pytest.mark.parametrize("value", ["balanced", "BALANCED", "1", "true", "yes"])
+    def test_env_enables_reweighting(self, value):
+        with patch.dict(os.environ, {"SUPPORT_INTENT_CLASS_WEIGHT": value}):
             estimator = DualHeadSupportModel._intent_estimator(1.0)
         assert estimator.estimator.class_weight == "balanced"
+
+    def test_unknown_value_falls_back_to_unweighted(self):
+        with patch.dict(os.environ, {"SUPPORT_INTENT_CLASS_WEIGHT": "whatever"}):
+            estimator = DualHeadSupportModel._intent_estimator(1.0)
+        assert estimator.estimator.class_weight is None
 
     def test_c_value_is_respected(self):
         estimator = DualHeadSupportModel._intent_estimator(32.0)

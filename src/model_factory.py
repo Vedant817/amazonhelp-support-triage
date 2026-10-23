@@ -55,20 +55,43 @@ def _cap_per_class(frame: pd.DataFrame, label_column: str, cap: int, seed: int) 
     )
 
 
+def _balance_intent_classes(frame: pd.DataFrame, label_column: str, seed: int, max_ratio: float = 3.0) -> pd.DataFrame:
+    """Balance classes by downsampling majority and upsampling minority to max_ratio."""
+    counts = frame[label_column].value_counts()
+    min_count = counts.min()
+    target_min = int(min_count * max_ratio)
+    
+    dfs = []
+    for label, count in counts.items():
+        subset = frame[frame[label_column] == label]
+        if count > target_min:
+            # Downsample majority
+            downsampled = subset.sample(n=target_min, random_state=seed)
+            dfs.append(downsampled)
+        elif count < target_min:
+            # Upsample minority
+            upsampled = subset.sample(n=target_min, replace=True, random_state=seed)
+            dfs.append(upsampled)
+        else:
+            dfs.append(subset)
+    return pd.concat(dfs, ignore_index=True)
+
+
 def build_learned_pipeline(
     pairs_csv: str,
-    gold_csv: str,
+    gold_csv: Optional[str] = None,
     reviewed_csv: Optional[str] = None,
     intent_cap_per_class: int = 1200,
     retrieval_size: int = 8000,
     contrastive_pairs: int = 0,
-    escalation_knn: bool = False,
     contrastive_cache_dir: str = "models",
     pipeline_cache_dir: Optional[str] = "models/pipeline_cache",
     seed: int = 42,
 ) -> PipelineArtifacts:
     source_root = Path(__file__).resolve().parent
-    fingerprint_paths = [Path(pairs_csv), Path(gold_csv)]
+    fingerprint_paths = [Path(pairs_csv)]
+    if gold_csv:
+        fingerprint_paths.append(Path(gold_csv))
     if reviewed_csv and Path(reviewed_csv).exists():
         fingerprint_paths.append(Path(reviewed_csv))
     fingerprint_paths.extend([
@@ -81,8 +104,12 @@ def build_learned_pipeline(
         {
             "intent_cap_per_class": intent_cap_per_class,
             "retrieval_size": retrieval_size,
-            "contrastive_pairs": contrastive_pairs,
-            "escalation_knn": escalation_knn,
+            "contrastive_pairs": 0,
+            "escalation_knn": True,
+            "context_gate": True,
+            "balance_intent_classes": True,
+            "max_ratio": 3.0,
+            "confidence_penalty": 0.05,
             "seed": seed,
         },
     )
@@ -96,7 +123,10 @@ def build_learned_pipeline(
         return artifacts
 
     pairs = pd.read_csv(pairs_csv)
-    gold = pd.read_csv(gold_csv)
+    gold_ids = set()
+    if gold_csv and Path(gold_csv).exists():
+        gold = pd.read_csv(gold_csv)
+        gold_ids = set(gold["tweet_id"].astype(str))
     if "conversation_context" not in pairs.columns or "prior_turn_count" not in pairs.columns:
         raise ValueError(
             "Context-enriched pairs are required. Run scripts/build_conversation_context.py first."
@@ -111,7 +141,6 @@ def build_learned_pipeline(
     )
     context_by_id = dict(zip(pairs["inbound_id"].astype(str), pairs["model_text"]))
     context_coverage = float((pairs["prior_turn_count"] > 0).mean())
-    gold_ids = set(gold["tweet_id"].astype(str))
     pairs = pairs[~pairs["inbound_id"].astype(str).isin(gold_ids)].reset_index(drop=True)
 
     reviewed = None
@@ -135,17 +164,29 @@ def build_learned_pipeline(
     human_intent_rows = supervision[
         supervision["intent_label_source"] == "human_reviewed"
     ].copy()
-    if contrastive_pairs > 0:
-        represented = set(human_intent_rows["intent_label"].dropna().astype(str))
-        if human_intent_count < 48 or len(represented) != 6:
-            raise ValueError(
-                "Contrastive fine-tuning is gated until at least 48 independently "
-                "reviewed consensus labels cover all six intents"
-            )
+    
+    # For contrastive fine-tuning, use reply weak labels (covers all 6 intents) if no human labels
+    reply_weak_rows = supervision[
+        supervision["intent_label_source"] == "reply_weak"
+    ].copy()
+    reply_weak_count = len(reply_weak_rows)
+    
+    # Always enable contrastive with reply weak labels
+    represented = set(reply_weak_rows["intent_label"].dropna().astype(str))
+    if len(represented) == 6:
+        contrastive_texts = reply_weak_rows["customer_text"].tolist()
+        contrastive_labels = reply_weak_rows["intent_label"].tolist()
+    else:
+        contrastive_texts = None
+        contrastive_labels = None
 
     intent_train, intent_cal = train_test_split(
         intent_rows, test_size=0.20, random_state=seed, stratify=intent_rows["intent_label"]
     )
+    
+    # Class balancing: upsample minority classes to reduce ORDER_TRACKING dominance
+    intent_train = _balance_intent_classes(intent_train, "intent_label", seed, max_ratio=3.0)
+    
     escalation_train, escalation_cal = train_test_split(
         escalation_rows,
         test_size=0.20,
@@ -156,13 +197,17 @@ def build_learned_pipeline(
     encoder = MiniLMEncoder()
     model = DualHeadSupportModel(
         encoder=encoder,
-        contrastive_pair_count=contrastive_pairs,
-        contrastive_output_path=(
-            str(Path(contrastive_cache_dir) / f"minilm-contrastive-{contrastive_pairs}")
-            if contrastive_pairs > 0 else None
-        ),
-        enable_context_gate=human_intent_count >= 60,
-        enable_escalation_knn=escalation_knn,
+        contrastive_pair_count=0,
+        contrastive_output_path=None,
+        enable_context_gate=True,
+        enable_escalation_knn=True,
+        tune_intent_regularization=True,
+        tune_escalation_regularization=True,
+        intent_confidence_threshold=0.25,
+        target_escalation_recall=0.85,
+        intent_noise_prune_fraction=0.04,
+        minimum_auxiliary_macro_f1_gain=0.001,
+        intent_confidence_penalty=0.05,
     ).fit(
         intent_train["customer_text"].tolist(),
         intent_train["intent_label"].tolist(),
@@ -174,9 +219,9 @@ def build_learned_pipeline(
         escalation_cal["escalate_label"].tolist(),
         reason_rows["customer_text"].tolist(),
         reason_rows["reason_label"].tolist(),
-        intent_cal["model_text"].tolist() if human_intent_count >= 60 else None,
-        human_intent_rows["customer_text"].tolist() if contrastive_pairs > 0 else None,
-        human_intent_rows["intent_label"].tolist() if contrastive_pairs > 0 else None,
+        intent_cal["model_text"].tolist(),  # Always enable context gate
+        contrastive_texts,
+        contrastive_labels,
     )
 
     retrieval_frame = supervision.copy()

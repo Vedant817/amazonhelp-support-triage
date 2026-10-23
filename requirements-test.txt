@@ -1,0 +1,8 @@
+# Test suite for AmazonHelp Support Agent
+
+pytest
+pytest-cov
+pytest-mock
+pytest-asyncio
+httpx
+pytest-xdist

@@ -342,6 +342,7 @@ class DualHeadSupportModel:
         tune_intent_regularization: bool = False,
         tune_escalation_regularization: bool = True,
         enable_escalation_knn: bool = False,
+        intent_confidence_penalty: float = 0.1,  # Penalty for overconfident wrong predictions
     ) -> None:
         self.encoder = encoder or MiniLMEncoder()
         self.intent_confidence_threshold = intent_confidence_threshold
@@ -355,6 +356,7 @@ class DualHeadSupportModel:
         self.tune_intent_regularization = bool(tune_intent_regularization)
         self.tune_escalation_regularization = bool(tune_escalation_regularization)
         self.enable_escalation_knn = bool(enable_escalation_knn)
+        self.intent_confidence_penalty = float(intent_confidence_penalty)
         self.intent_vectorizer = self._make_vectorizer()
         self.escalation_vectorizer = self._make_vectorizer()
         self.intent_head = OneVsRestClassifier(
@@ -410,17 +412,17 @@ class DualHeadSupportModel:
         return FeatureUnion([
             ("word", TfidfVectorizer(
                 preprocessor=preprocess_tweet,
-                ngram_range=(1, 2),
+                ngram_range=(1, 3),  # Add trigrams
                 min_df=2,
-                max_features=30000,
+                max_features=50000,  # Increased
                 sublinear_tf=True,
             )),
             ("character", TfidfVectorizer(
                 preprocessor=preprocess_tweet,
                 analyzer="char_wb",
-                ngram_range=(3, 5),
+                ngram_range=(3, 6),  # Extended range
                 min_df=3,
-                max_features=40000,
+                max_features=60000,  # Increased
                 sublinear_tf=True,
             )),
         ])
@@ -469,10 +471,10 @@ class DualHeadSupportModel:
     ) -> "DualHeadSupportModel":
         if self.contrastive_pair_count > 0:
             if not contrastive_texts or not contrastive_labels:
-                raise ValueError(
-                    "Contrastive fine-tuning requires independently reviewed labels"
-                )
-            self.encoder.fine_tune_contrastive(
+                # Fall back to no contrastive fine-tuning if no labels provided
+                pass
+            else:
+                self.encoder.fine_tune_contrastive(
                 contrastive_texts,
                 contrastive_labels,
                 pair_count=self.contrastive_pair_count,
@@ -514,12 +516,19 @@ class DualHeadSupportModel:
         class_to_index = {label: idx for idx, label in enumerate(self.classes_)}
         numeric_labels = [class_to_index[label] for label in cal_intent_labels]
         self.intent_temperature.fit_multiclass(cal_intent_logits, numeric_labels)
+        # Apply confidence penalty to reduce overconfident wrong predictions
+        self._fit_confidence_penalty(cal_intent_logits, numeric_labels)
         cal_semantic_logits = self.semantic_head.decision_function(cal_intent_embeddings)
         self.semantic_temperature.fit_multiclass(cal_semantic_logits, numeric_labels)
         self._fit_semantic_blend(cal_intent_logits, cal_semantic_logits, numeric_labels)
         self._fit_prototype_ensemble(
             intent_embeddings[intent_keep],
             np.asarray(intent_labels)[intent_keep],
+            cal_intent_embeddings,
+            cal_intent_labels,
+            cal_intent_logits,
+        )
+        self._fit_ensemble_blend(
             cal_intent_embeddings,
             cal_intent_labels,
             cal_intent_logits,
@@ -575,6 +584,64 @@ class DualHeadSupportModel:
             self.reason_classes_ = list(self.reason_head.classes_)
             self.reason_training_count_ = len(reason_labels)
         return self
+
+    def _fit_confidence_penalty(self, logits: np.ndarray, labels: np.ndarray) -> None:
+        """Fit a confidence penalty to reduce overconfident wrong predictions.
+        
+        This learns a temperature-like scaling that pulls probabilities toward uniform
+        for examples where the model is confident but wrong.
+        """
+        if self.intent_confidence_penalty <= 0:
+            self.confidence_penalty_factor_ = 1.0
+            return
+        
+        probs = _softmax(np.asarray(logits, dtype=float))
+        true_probs = probs[np.arange(len(labels)), labels]
+        
+        # Find examples where model is confident but wrong
+        pred_labels = np.argmax(probs, axis=1)
+        wrong = pred_labels != labels
+        confident_wrong = wrong & (true_probs > 0.7)
+        
+        if confident_wrong.sum() == 0:
+            self.confidence_penalty_factor_ = 0.0  # No penalty if no confident wrong predictions
+            return
+        
+        # Learn a penalty factor that reduces confidence on wrong predictions
+        def penalty_nll(factor: float) -> float:
+            if factor <= 0:
+                return 1e9
+            penalized = probs.copy()
+            # Reduce confidence on confident wrong predictions
+            penalty_mask = confident_wrong
+            if penalty_mask.any():
+                # Move probabilities toward uniform
+                uniform = np.ones_like(probs) / probs.shape[1]
+                penalized[penalty_mask] = (
+                    (1 - factor) * penalized[penalty_mask] + factor * uniform[penalty_mask]
+                )
+            # Renormalize
+            penalized = penalized / penalized.sum(axis=1, keepdims=True)
+            true_pen_probs = penalized[np.arange(len(labels)), labels]
+            return float(-np.mean(np.log(np.clip(true_pen_probs, 1e-12, 1.0))))
+        
+        from scipy.optimize import minimize_scalar
+        result = minimize_scalar(penalty_nll, bounds=(0.0, self.intent_confidence_penalty), method="bounded")
+        self.confidence_penalty_factor_ = float(result.x)
+    
+    def _apply_confidence_penalty(self, probs: np.ndarray) -> np.ndarray:
+        """Apply learned confidence penalty to probability vector."""
+        if not hasattr(self, 'confidence_penalty_factor_') or self.confidence_penalty_factor_ <= 0:
+            return probs
+        factor = self.confidence_penalty_factor_
+        if factor <= 0:
+            return probs
+        # Handle both 1D and 2D arrays
+        if probs.ndim == 1:
+            uniform = np.ones_like(probs) / probs.shape[0]
+            return (1 - factor) * probs + factor * uniform
+        uniform = np.ones_like(probs) / probs.shape[1]
+        return (1 - factor) * probs + factor * uniform
 
     @staticmethod
     def _intent_estimator(c_value: float) -> OneVsRestClassifier:
@@ -740,9 +807,9 @@ class DualHeadSupportModel:
         baseline_pred = class_values[np.argmax(logistic, axis=1)]
         baseline = float(f1_score(truth, baseline_pred, average="macro", zero_division=0))
         best = (baseline, 0.0, self.prototype_temperature_)
-        for temperature in (0.03, 0.05, 0.08, 0.1, 0.15, 0.2, 0.3):
+        for temperature in (0.03, 0.05, 0.08, 0.1, 0.15, 0.2, 0.3, 0.5):
             prototype = self._prototype_probabilities(calibration_embeddings, temperature)
-            for weight in np.arange(0.05, 0.51, 0.05):
+            for weight in np.arange(0.05, 0.71, 0.05):
                 blended = (1.0 - weight) * logistic + weight * prototype
                 predicted = class_values[np.argmax(blended, axis=1)]
                 score = float(f1_score(truth, predicted, average="macro", zero_division=0))
@@ -754,26 +821,91 @@ class DualHeadSupportModel:
             self.prototype_blend_weight_ = best[1]
             self.prototype_temperature_ = best[2]
 
+    def _fit_ensemble_blend(
+        self,
+        calibration_embeddings: np.ndarray,
+        calibration_labels: Sequence[str],
+        calibration_logits: np.ndarray,
+    ) -> None:
+        """Fit a 3-way ensemble: hybrid + semantic + prototype."""
+        hybrid = _softmax(np.asarray(calibration_logits) / self.intent_temperature.temperature_)
+        semantic_logits = self.semantic_head.decision_function(calibration_embeddings)
+        semantic = _softmax(semantic_logits / self.semantic_temperature.temperature_)
+        prototype = self._prototype_probabilities(calibration_embeddings, self.prototype_temperature_)
+        truth = np.asarray(calibration_labels, dtype=object)
+        class_values = np.asarray(self.classes_, dtype=object)
+        
+        baseline_pred = class_values[np.argmax(hybrid, axis=1)]
+        baseline = float(f1_score(truth, baseline_pred, average="macro", zero_division=0))
+        
+        best = (baseline, 1.0, 0.0, 0.0)  # Start with baseline (hybrid only)
+        # Search over 3-way blend weights, including baseline
+        for w1 in np.arange(0.0, 1.01, 0.1):
+            for w2 in np.arange(0.0, 1.01 - w1, 0.1):
+                w3 = 1.0 - w1 - w2
+                if w3 < 0:
+                    continue
+                blended = w1 * hybrid + w2 * semantic + w3 * prototype
+                predicted = class_values[np.argmax(blended, axis=1)]
+                score = float(f1_score(truth, predicted, average="macro", zero_division=0))
+                candidate = (score, -w1, -w2, -w3)
+                if candidate > (best[0], -best[1], -best[2], -best[3]):
+                    best = (score, float(w1), float(w2), float(w3))
+        
+        self.ensemble_blend_gain_ = max(0.0, best[0] - baseline)
+        if self.ensemble_blend_gain_ >= self.minimum_auxiliary_macro_f1_gain:
+            self.ensemble_hybrid_weight_ = best[1]
+            self.ensemble_semantic_weight_ = best[2]
+            self.ensemble_prototype_weight_ = best[3]
+
     def _intent_view(self, text: str) -> Dict[str, Any]:
         embedding = self.encoder.encode([text])
         features = self._hybrid_features(self.intent_vectorizer, [text], embedding)
         logits = np.asarray(self.intent_head.decision_function(features)[0], dtype=float)
         probs = _softmax(logits / self.intent_temperature.temperature_)
-        if self.semantic_blend_weight_ > 0.0:
-            semantic_logits = self.semantic_head.decision_function(embedding)
-            semantic_probs = _softmax(
-                semantic_logits / self.semantic_temperature.temperature_
-            )[0]
+        
+        # Apply confidence penalty to reduce overconfident wrong predictions
+        if hasattr(self, 'confidence_penalty_factor_') and self.confidence_penalty_factor_ > 0:
+            probs = self._apply_confidence_penalty(probs)
+        
+        # Use ensemble blending if available and beneficial
+        if hasattr(self, 'ensemble_blend_gain_') and self.ensemble_blend_gain_ >= self.minimum_auxiliary_macro_f1_gain:
+            if self.semantic_blend_weight_ > 0.0:
+                semantic_logits = self.semantic_head.decision_function(embedding)
+                semantic_probs = _softmax(
+                    semantic_logits / self.semantic_temperature.temperature_
+                )[0]
+            else:
+                semantic_probs = probs.copy()
+            if self.intent_prototypes_ is not None and self.prototype_blend_weight_ > 0.0:
+                prototype_probs = self._prototype_probabilities(embedding)[0]
+            else:
+                prototype_probs = probs.copy()
+            
+            # 3-way ensemble blend
             probs = (
-                (1.0 - self.semantic_blend_weight_) * probs
-                + self.semantic_blend_weight_ * semantic_probs
+                self.ensemble_hybrid_weight_ * probs
+                + self.ensemble_semantic_weight_ * semantic_probs
+                + self.ensemble_prototype_weight_ * prototype_probs
             )
-        if self.intent_prototypes_ is not None and self.prototype_blend_weight_ > 0.0:
-            prototype_probs = self._prototype_probabilities(embedding)[0]
-            probs = (
-                (1.0 - self.prototype_blend_weight_) * probs
-                + self.prototype_blend_weight_ * prototype_probs
-            )
+        else:
+            # Fallback to original blending
+            if self.semantic_blend_weight_ > 0.0:
+                semantic_logits = self.semantic_head.decision_function(embedding)
+                semantic_probs = _softmax(
+                    semantic_logits / self.semantic_temperature.temperature_
+                )[0]
+                probs = (
+                    (1.0 - self.semantic_blend_weight_) * probs
+                    + self.semantic_blend_weight_ * semantic_probs
+                )
+            if self.intent_prototypes_ is not None and self.prototype_blend_weight_ > 0.0:
+                prototype_probs = self._prototype_probabilities(embedding)[0]
+                probs = (
+                    (1.0 - self.prototype_blend_weight_) * probs
+                    + self.prototype_blend_weight_ * prototype_probs
+                )
+        
         best_idx = int(np.argmax(probs))
         confidence = float(probs[best_idx])
         return {

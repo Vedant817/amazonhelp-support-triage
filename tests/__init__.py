@@ -1,3 +1,1 @@
-"""
-Test suite for @AmazonHelp support agent pipeline.
-"""
+# Test suite for AmazonHelp Support Agent

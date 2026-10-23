@@ -47,6 +47,7 @@ class ProductionPolicyGuard:
             r"amazon\.com/orders(?:[?#][^\s]*)?$",
             r"amazon\.com/returns(?:[?#][^\s]*)?$",
             r"amazon\.com/help(?:[?#][^\s]*)?$",
+            r"amazon\.com/gp/help(?:[?#][^\s]*)?$",
             r"amzn\.to/[a-zA-Z0-9]+$",
             r"twitter\.com/messages/compose\?recipient_id=AmazonHelp$"
         ]
@@ -87,62 +88,103 @@ class ProductionPolicyGuard:
         adjustments = []
         sanitized = draft_reply.strip()
 
+        # First pass: collect all violations on the original text
+        # We check against the original draft_reply and customer_text to find all violations
+        
+        # Track what needs to be redacted/replaced
+        pii_redactions = []  # (pattern, replacement, violation_code, adjustment_msg)
+        url_replacements = []  # (url, replacement, violation_code, adjustment_msg)
+        hallucination_fixes = []  # (pattern, replacement, violation_code, adjustment_msg)
+        prohibited_request_violation = None
+        char_limit_exceeded = False
+
         # 1. Zero-PII Public Echo Check
+        # Check Amazon 17-digit Order IDs first (most specific): ###-#######-#######
+        order_id_pattern = r"\b\d{3}-\d{7}-\d{7}\b"
+        customer_orders = re.findall(order_id_pattern, customer_text)
+        for order_id in customer_orders:
+            if order_id in draft_reply:
+                pii_redactions.append((order_id, "[order ID redacted]", "PII_ORDER_ID_ECHO_DETECTED", f"Redacted mirrored order ID {order_id}"))
+
         # Check emails
-        email_pattern = r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"
+        email_pattern = r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
         customer_emails = re.findall(email_pattern, customer_text)
         for email in customer_emails:
-            if email in sanitized:
-                sanitized = sanitized.replace(email, "[email protected]")
-                violations.append("PII_ECHO_DETECTED")
-                adjustments.append(f"Redacted mirrored email {email}")
+            if email in draft_reply:
+                pii_redactions.append((email, "[email protected]", "PII_ECHO_DETECTED", f"Redacted mirrored email {email}"))
 
         # Check phone numbers
         phone_pattern = r"\b\d{3}[-.\s]??\d{3}[-.\s]??\d{4}\b"
         customer_phones = re.findall(phone_pattern, customer_text)
         for phone in customer_phones:
-            if phone in sanitized:
-                sanitized = sanitized.replace(phone, "[phone redacted]")
-                violations.append("PII_ECHO_DETECTED")
-                adjustments.append(f"Redacted mirrored phone {phone}")
-
-        # Check Amazon 17-digit Order IDs: ###-#######-#######
-        order_id_pattern = r"\b\d{3}-\d{7}-\d{7}\b"
-        customer_orders = re.findall(order_id_pattern, customer_text)
-        for order_id in customer_orders:
-            if order_id in sanitized:
-                sanitized = sanitized.replace(order_id, "[order ID redacted]")
-                violations.append("PII_ORDER_ID_ECHO_DETECTED")
-                adjustments.append(f"Redacted mirrored order ID {order_id}")
+            if phone in draft_reply:
+                pii_redactions.append((phone, "[phone redacted]", "PII_ECHO_DETECTED", f"Redacted mirrored phone {phone}"))
 
         # 2. Prohibited Agent Requests Check
         for pat, violation_code in self.prohibited_requests:
-            if re.search(pat, sanitized, re.IGNORECASE):
-                violations.append(violation_code)
-                sanitized = (
-                    "I apologize for any confusion. Please don't share account, order, "
-                    "or payment details publicly. Reach us safely at amazon.com/help."
-                )
-                adjustments.append(f"Overrode reply due to prohibited phrase ({violation_code})")
+            if re.search(pat, draft_reply, re.IGNORECASE):
+                prohibited_request_violation = violation_code
                 break
 
         # 3. False Financial / Operational Commitment Check
         for pat, violation_code in self.hallucinated_commitments:
-            if re.search(pat, sanitized, re.IGNORECASE):
-                violations.append(violation_code)
+            if re.search(pat, draft_reply, re.IGNORECASE):
                 # Clean, grammatically correct replacement
                 replacement = "You can review refund and order eligibility directly at amazon.com/orders"
-                sanitized = re.sub(pat, replacement, sanitized, flags=re.IGNORECASE)
-                adjustments.append(f"Neutralized hallucinated commitment ({violation_code})")
+                hallucination_fixes.append((pat, replacement, violation_code, f"Neutralized hallucinated commitment ({violation_code})"))
 
         # 4. Strict URL Whitelist Check
         urls = re.findall(
-            r"(https?://\S+|www\.\S+|amazon\.com/\S+)",
+            r"(https?://\S+|www\.\S+|[a-zA-Z0-9.-]+\.[a-z]{2,}(?:/\S*)?)",
+            draft_reply,
+            flags=re.IGNORECASE,
+        )
+        for url in urls:
+            clean_url = url.rstrip(".,;!?:")
+            is_whitelisted = any(
+                re.fullmatch(allowed, clean_url, re.IGNORECASE)
+                for allowed in self.allowed_domains
+            )
+            if not is_whitelisted:
+                url_replacements.append((url, "amazon.com/help", "UNVERIFIED_EXTERNAL_URL", f"Replaced unverified link {url} with verified amazon.com/help"))
+
+        # 5. Twitter 280-Character Budget Enforcement (with URL preservation)
+        if len(draft_reply) > 280:
+            char_limit_exceeded = True
+
+        # Now apply all fixes
+        sanitized = draft_reply.strip()
+        
+        # Apply PII redactions
+        for pattern, replacement, violation_code, adjustment_msg in pii_redactions:
+            if pattern in sanitized:
+                sanitized = sanitized.replace(pattern, replacement)
+                violations.append(violation_code)
+                adjustments.append(adjustment_msg)
+
+        # 2. Prohibited Agent Requests Check
+        if prohibited_request_violation:
+            violations.append(prohibited_request_violation)
+            sanitized = (
+                "I apologize for any confusion. Please don't share account, order, "
+                "or payment details publicly. Reach us safely at amazon.com/help."
+            )
+            adjustments.append(f"Overrode reply due to prohibited phrase ({prohibited_request_violation})")
+
+        # 3. False Financial / Operational Commitment Check
+        for pat, replacement, violation_code, adjustment_msg in hallucination_fixes:
+            if re.search(pat, sanitized, re.IGNORECASE):
+                violations.append(violation_code)
+                sanitized = re.sub(pat, replacement, sanitized, flags=re.IGNORECASE)
+                adjustments.append(adjustment_msg)
+
+        # 4. Strict URL Whitelist Check
+        urls = re.findall(
+            r"(https?://\S+|www\.\S+|[a-zA-Z0-9.-]+\.[a-z]{2,}(?:/\S*)?)",
             sanitized,
             flags=re.IGNORECASE,
         )
         for url in urls:
-            # Strip trailing punctuation if accidentally captured
             clean_url = url.rstrip(".,;!?:")
             is_whitelisted = any(
                 re.fullmatch(allowed, clean_url, re.IGNORECASE)
@@ -156,9 +198,7 @@ class ProductionPolicyGuard:
         # 5. Twitter 280-Character Budget Enforcement (with URL preservation)
         if len(sanitized) > 280:
             violations.append("TWITTER_CHARACTER_LIMIT_EXCEEDED")
-            # Ensure we do not truncate inside a URL
             trimmed = sanitized[:275]
-            # If last word is partial URL, chop before it
             last_space = trimmed.rfind(" ")
             if last_space > 180:
                 sanitized = trimmed[:last_space].strip() + "..."

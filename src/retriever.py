@@ -159,8 +159,7 @@ class HistoricalResolutionRetriever:
         candidate_ids = set(range(len(self.records)))
         if intent_filter and intent_filter != "UNKNOWN":
             filtered = {i for i in candidate_ids if self.records[i].get("intent") == intent_filter}
-            if len(filtered) >= k:
-                candidate_ids = filtered
+            candidate_ids = filtered
 
         # 3. Restrict ranking to positive score documents (Top-50 pool per modality)
         pos_tfidf = [i for i in candidate_ids if dense_scores[i] > 0.0]

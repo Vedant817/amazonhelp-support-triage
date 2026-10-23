@@ -67,9 +67,10 @@ class SafetyGatedEscalator:
     def __init__(self, learned_threshold: float = 0.5):
         self.learned_threshold = learned_threshold
         self._email = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+        self._phone = re.compile(r"\b\d{3}[-.\s]?\d{3}[-.\s]?\d{4}\b")
         self._order_id = re.compile(r"\b\d{3}-\d{7}-\d{7}\b")
         self._payment = re.compile(r"\b(?:cvv|security code|card number|credit card|\d{4}[- ]\d{4}[- ]\d{4}[- ]\d{4})\b", re.I)
-        self._takeover = re.compile(r"\b(?:hacked|account takeover|taken over|unauthorized access|someone .* logged in|stolen account|phishing)\b", re.I)
+        self._takeover = re.compile(r"\b(?:hacked|account takeover|taken over|took over|unauthorized access|someone .* logged in|stolen account|phishing)\b", re.I)
         self._legal = re.compile(r"\b(?:lawyer|attorney|sue|legal action|small claims|ombudsman|trading standards|consumer protection|bbb)\b", re.I)
         self._delivery_dispute = re.compile(
             r"\b(?:marked|says?|shows?)\s+delivered\b.*\b(?:missing|never (?:arrived|received)|not (?:here|received)|wrong (?:house|address)|neighbor)\b|"
@@ -99,7 +100,7 @@ class SafetyGatedEscalator:
         )
 
     def hard_gate(self, text: str) -> Optional[EscalationDecision]:
-        if self._payment.search(text) or self._email.search(text) or self._order_id.search(text):
+        if self._payment.search(text) or self._email.search(text) or self._order_id.search(text) or self._phone.search(text):
             return EscalationDecision(True, "PII_PUBLIC_DEFLECTION_TO_PRIVATE_CHANNEL", 1.0, ["HARD_GATE_PUBLIC_PII"])
         if self._takeover.search(text):
             return EscalationDecision(True, "ACCOUNT_SECURITY_OR_LOCKOUT", 1.0, ["HARD_GATE_ACCOUNT_TAKEOVER"])

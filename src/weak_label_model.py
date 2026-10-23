@@ -84,11 +84,12 @@ class DawidSkeneLabelModel:
 def _customer_issue_label(text: str) -> Optional[str]:
     value = str(text or "").lower()
     patterns = (
-        ("ACCOUNT_AND_SECURITY", r"\b(?:hacked|phishing|password|login|log in|sign in|otp|2fa|verification code|account locked)\b"),
-        ("DAMAGED_OR_WRONG_ITEM", r"\b(?:damaged|broken|defective|wrong item|empty box|missing (?:piece|part|contents))\b"),
-        ("REFUND_AND_RETURN", r"\b(?:refund|return|money back|charged twice|double charged|overcharged)\b"),
-        ("ORDER_TRACKING_AND_DELAY", r"\b(?:tracking|delivery|delivered|shipment|shipping|carrier|courier|package|late|not arrived)\b"),
-        ("PRODUCT_AND_TECHNICAL", r"\b(?:kindle|fire tv|firestick|alexa|echo|prime video|device|bluetooth|wi-?fi|app|website)\b"),
+        ("ACCOUNT_AND_SECURITY", r"\b(?:hacked|phishing|password|login|log in|sign in|otp|2fa|verification code|account locked|suspended|blocked|unauthorized access|credential|2 factor|two factor|reset.*password)\b"),
+        ("DAMAGED_OR_WRONG_ITEM", r"\b(?:damaged|broken|defective|wrong item|empty box|missing (?:piece|part|contents)|not what i ordered|incorrect item|different item|cracked|shattered|wrong.*product|wrong.*item)\b"),
+        ("REFUND_AND_RETURN", r"\b(?:refund|return|money back|charged twice|double charged|overcharged|cancel.*order|chargeback|dispute.*charge|replacement|exchange)\b"),
+        ("ORDER_TRACKING_AND_DELAY", r"\b(?:tracking|delivery|delivered|shipment|shipping|carrier|courier|package|late|not arrived|where.*order|when.*arrive|ship.*date|out for delivery|estimated delivery|prime.*delivery|next day|two day|delayed|stuck|lost|missing.*package|failed delivery)\b"),
+        ("PRODUCT_AND_TECHNICAL", r"\b(?:kindle|fire tv|firestick|alexa|echo|prime video|device|bluetooth|wi-?fi|app|website|screen|frozen|not working|setup|connect|wifi|update|firmware|reset|reboot|battery|charge|error|crash|bug|glitch|compatible)\b"),
+        ("FEEDBACK_AND_GENERAL", r"\b(?:complaint|feedback|suggestion|praise|thank you|terrible|worst|awful|horrible|disappointed|frustrated|angry|furious|unacceptable|ridiculous|pathetic|useless|worst.*service|never.*again)\b"),
     )
     matches = [label for label, pattern in patterns if re.search(pattern, value)]
     return matches[0] if len(matches) == 1 else None
@@ -104,6 +105,34 @@ def _customer_request_label(text: str) -> Optional[str]:
         r"\b(?:late|broken|wrong|refund|hacked|terrible|worst)\b", value
     ):
         return "FEEDBACK_AND_GENERAL"
+    if re.search(r"\b(?:help|assist|support)\b.{0,20}\b(?:account|login|password|security)\b", value):
+        return "ACCOUNT_AND_SECURITY"
+    if re.search(r"\b(?:help|fix|troubleshoot|setup|configure)\b.{0,20}\b(?:kindle|fire|alexa|echo|device|app|prime video|firestick)\b", value):
+        return "PRODUCT_AND_TECHNICAL"
+    if re.search(r"\b(?:replace|exchange|wrong.*item|wrong.*product)\b", value):
+        return "DAMAGED_OR_WRONG_ITEM"
+    return None
+
+
+def _customer_sentiment_label(text: str) -> Optional[str]:
+    """Use sentiment + issue keywords to infer intent for ambiguous cases."""
+    value = str(text or "").lower()
+    negative = re.search(r"\b(?:angry|furious|frustrat|disappoint|upset|unhappy|unacceptable|ridiculous|pathetic|useless|worst|terrible|awful|horrible|never.*again|fed up|done with)\b", value)
+    positive = re.search(r"\b(?:thank|great|excellent|amazing|wonderful|love|happy|satisfied|pleased|impressed)\b", value)
+    
+    if positive and not negative:
+        return "FEEDBACK_AND_GENERAL"
+    if negative:
+        if re.search(r"\b(?:delivery|package|ship|arrive|carrier|courier|tracking)\b", value):
+            return "ORDER_TRACKING_AND_DELAY"
+        if re.search(r"\b(?:refund|return|money|charge|charged|billing)\b", value):
+            return "REFUND_AND_RETURN"
+        if re.search(r"\b(?:broken|damaged|wrong|defect|cracked|shattered)\b", value):
+            return "DAMAGED_OR_WRONG_ITEM"
+        if re.search(r"\b(?:account|login|password|access|credential|locked|suspended)\b", value):
+            return "ACCOUNT_AND_SECURITY"
+        if re.search(r"\b(?:device|kindle|fire|alexa|echo|app|screen|battery|firmware)\b", value):
+            return "PRODUCT_AND_TECHNICAL"
     return None
 
 
@@ -122,15 +151,20 @@ def aggregate_intent_weak_labels(
         "APOLOGIZE_WAIT": "ORDER_TRACKING_AND_DELAY",
         "LINK_RETURNS": "REFUND_AND_RETURN",
         "TROUBLESHOOT_DEVICE": "PRODUCT_AND_TECHNICAL",
+        "DM_WITH_ORDER_ID": "ACCOUNT_AND_SECURITY",
+        "GENERAL_SUPPORT": "FEEDBACK_AND_GENERAL",
     }
     sources = []
     for _, row in frame.iterrows():
         customer_input = row.get("customer_text", "")
+        # Use reply_weak as primary (covers all 6 classes), then customer-side LFs
         emitted = [
-            row.get("intent_label"),
+            row.get("intent_label"),  # reply_weak - high precision, covers all classes
             act_map.get(str(row.get("resolution_act", ""))),
             _customer_issue_label(customer_input),
             _customer_request_label(customer_input),
+            _customer_sentiment_label(customer_input),
+            _customer_urgency_label(customer_input),
         ]
         sources.append([class_index.get(label, ABSTAIN) for label in emitted])
     matrix = np.asarray(sources, dtype=int)
@@ -143,3 +177,21 @@ def aggregate_intent_weak_labels(
         for row, index in enumerate(best)
     ]
     return WeakLabelResult(probabilities, labels, confidence, votes)
+
+
+def _customer_urgency_label(text: str) -> Optional[str]:
+    """Detect urgency signals that correlate with specific intents."""
+    value = str(text or "").lower()
+    # High urgency + delivery = tracking dispute
+    if re.search(r"\b(?:urgent|asap|immediately|right now|emergency|critical)\b", value):
+        if re.search(r"\b(?:delivery|package|ship|arrive|carrier)\b", value):
+            return "ORDER_TRACKING_AND_DELAY"
+        if re.search(r"\b(?:refund|money|charge)\b", value):
+            return "REFUND_AND_RETURN"
+        if re.search(r"\b(?:hacked|security|locked)\b", value):
+            return "ACCOUNT_AND_SECURITY"
+    # Polite/patient = likely general feedback or routine tracking
+    if re.search(r"\b(?:please|kindly|would you|could you|when you have time)\b", value):
+        if re.search(r"\b(?:thank|appreciate)\b", value):
+            return "FEEDBACK_AND_GENERAL"
+    return None

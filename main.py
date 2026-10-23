@@ -36,6 +36,12 @@ def run_serve(
     print(f"  Health:           http://{host}:{port}/api/v1/health")
     print(f"  Metrics:          http://{host}:{port}/metrics")
     print(f"  Generation mode:  {active_mode}")
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        print("=" * 80)
+        print("  WARNING: binding beyond loopback exposes an unauthenticated API")
+        print("           to the network. Add a reverse proxy with authentication")
+        print("           and TLS, and set SUPPORT_ALLOWED_ORIGINS/HOSTS explicitly.")
+        print("=" * 80)
     print("=" * 80 + "\n")
     uvicorn.run("src.api:app", host=host, port=port, reload=reload)
 

@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from starlette import status as http_status
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from src.dashboard_html import DASHBOARD_HTML
 from src.escalator import EscalationDecision, SafetyGatedEscalator
@@ -76,12 +77,24 @@ async def lifespan(app: FastAPI):
     pipeline_state.clear()
 
 
+_docs_enabled = os.getenv("SUPPORT_ENABLE_DOCS", "1").strip().lower() not in {"0", "false", "no", "off"}
+
 app = FastAPI(
     title="@AmazonHelp Support Agent API",
     description="Local MiniLM dual-head triage with hard safety gates and historical resolution-act grounding.",
     version="2.1.0",
     lifespan=lifespan,
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
+    openapi_url="/openapi.json" if _docs_enabled else None,
 )
+
+# Host-header validation blocks DNS-rebinding attacks, where a hostile domain
+# resolves to 127.0.0.1 and the browser then treats this service as same-origin.
+# Extra hosts can be added through SUPPORT_ALLOWED_HOSTS.
+_allowed_hosts = ["127.0.0.1", "localhost", "::1", "testserver"]
+_extra_hosts = [h.strip() for h in os.getenv("SUPPORT_ALLOWED_HOSTS", "").split(",") if h.strip()]
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=_allowed_hosts + _extra_hosts)
 
 # CORS is same-origin by default. A browser page on another origin gets no CORS
 # headers, so it cannot read responses or issue preflighted POSTs. An explicit

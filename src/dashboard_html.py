@@ -878,6 +878,8 @@ DASHBOARD_HTML = r"""<!doctype html>
     }
 
     /* ---------- Trace ---------- */
+    // Static markup only. All API-derived strings are rendered with textContent
+    // so untrusted content can never be parsed as HTML.
     const CHECK = `<svg viewBox="0 0 24 24" aria-hidden="true"><polyline points="20 6 9 17 4 12"/></svg>`;
 
     function renderTrace(stages) {
@@ -986,10 +988,17 @@ DASHBOARD_HTML = r"""<!doctype html>
 
         const scores = document.createElement("span");
         scores.className = "evidence-scores";
-        scores.innerHTML =
-          `<span><b>RRF</b> ${Number(record.rrf_score || 0).toFixed(4)}</span>` +
-          `<span><b>DENSE</b> ${Number(record.dense_score || 0).toFixed(3)}</span>` +
-          `<span><b>BM25</b> ${Number(record.bm25_score || 0).toFixed(2)}</span>`;
+        [
+          ["RRF", Number(record.rrf_score || 0).toFixed(4)],
+          ["DENSE", Number(record.dense_score || 0).toFixed(3)],
+          ["BM25", Number(record.bm25_score || 0).toFixed(2)],
+        ].forEach(([name, value]) => {
+          const chip = document.createElement("span");
+          const strong = document.createElement("b");
+          strong.textContent = name;
+          chip.append(strong, document.createTextNode(" " + value));
+          scores.appendChild(chip);
+        });
 
         head.append(rank, scores);
 

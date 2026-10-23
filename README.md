@@ -109,11 +109,13 @@ assumption is enforced rather than trusted:
 | Control | Default | Override |
 |---|---|---|
 | Bind address | `127.0.0.1` | `--host` on `main.py serve` |
+| Host header (DNS-rebinding guard) | `127.0.0.1`, `localhost`, `::1` | `SUPPORT_ALLOWED_HOSTS=host1,host2` |
 | CORS | same-origin only (no CORS headers) | `SUPPORT_ALLOWED_ORIGINS=http://host:port,...` |
 | Rate limit | 120 req/min per client, burst 30 | `SUPPORT_RATE_LIMIT_PER_MINUTE`, `SUPPORT_RATE_LIMIT_BURST` |
 | Max request body | 64 KiB (`413` above) | `SUPPORT_MAX_BODY_BYTES` |
 | Session IDs | `[A-Za-z0-9._:-]{1,80}` (`422` otherwise) | schema in `src/schemas.py` |
 | Pipeline cache | SHA-256 manifest verified before `joblib.load` | `SUPPORT_DISABLE_PIPELINE_CACHE=1` to always retrain |
+| API explorer (`/docs`) | enabled for local use | `SUPPORT_ENABLE_DOCS=0` to disable |
 | Error bodies | generic `{"detail": "Internal server error."}` | server-side traceback only |
 
 Response headers on every route: `Content-Security-Policy` (`default-src 'none'`,

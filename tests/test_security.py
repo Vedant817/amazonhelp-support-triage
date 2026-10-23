@@ -305,3 +305,18 @@ class TestApiMiddleware:
         """Without an allowlist, no Access-Control-Allow-Origin may be emitted."""
         response = client.get("/api/v1/health", headers={"Origin": "http://evil.test"})
         assert "access-control-allow-origin" not in {k.lower() for k in response.headers}
+
+    def test_untrusted_host_header_rejected(self, client):
+        """DNS-rebinding guard: a foreign Host header is refused."""
+        response = client.get("/api/v1/health", headers={"Host": "evil.example.com"})
+        assert response.status_code == 400
+
+    def test_localhost_host_header_accepted(self, client):
+        for host in ("127.0.0.1", "localhost"):
+            response = client.get("/api/v1/health", headers={"Host": host})
+            assert response.status_code in (200, 503), f"failed for {host}"
+
+    def test_docs_enabled_by_default_for_local_use(self):
+        from src import api as api_module
+        assert api_module.app.docs_url == "/docs"
+        assert api_module.app.openapi_url == "/openapi.json"

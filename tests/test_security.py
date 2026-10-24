@@ -29,8 +29,14 @@ from src.model_factory import _cache_is_trusted, _write_cache_with_manifest, _fi
 # ---------------------------------------------------------------------------
 
 class TestTokenBucketRateLimiter:
+    # Refill rate is per_minute/60 tokens per second, so per_minute=1 makes the
+    # bucket effectively non-refilling over the microseconds these tests take.
+    # With per_minute=60 a one-second stall (loaded machine, cold import) refills
+    # a whole token and the assertions silently stop testing exhaustion.
+    NON_REFILLING = 1
+
     def test_burst_then_block(self):
-        limiter = TokenBucketRateLimiter(per_minute=60, burst=3)
+        limiter = TokenBucketRateLimiter(per_minute=self.NON_REFILLING, burst=3)
         assert limiter.allow("a") is True
         assert limiter.allow("a") is True
         assert limiter.allow("a") is True
@@ -44,7 +50,7 @@ class TestTokenBucketRateLimiter:
         assert limiter.allow("a") is True
 
     def test_clients_are_isolated(self):
-        limiter = TokenBucketRateLimiter(per_minute=60, burst=1)
+        limiter = TokenBucketRateLimiter(per_minute=self.NON_REFILLING, burst=1)
         assert limiter.allow("a") is True
         assert limiter.allow("b") is True  # independent bucket
         assert limiter.allow("a") is False
@@ -290,14 +296,25 @@ class TestApiMiddleware:
 
     def test_rate_limit_returns_429(self, client):
         from src import api as api_module
+
         original = api_module._rate_limiter
-        api_module._rate_limiter = TokenBucketRateLimiter(per_minute=60, burst=2)
+        # A refill rate of one token per *minute* keeps this deterministic under
+        # load. At per_minute=60 the bucket refills one token per second, so a
+        # slow machine (or a busy CPU) refills between requests and the test
+        # passes for the wrong reason - it failed exactly that way while two
+        # model-training jobs saturated the cores.
+        api_module._rate_limiter = TokenBucketRateLimiter(per_minute=1, burst=2)
         try:
             codes = [
                 client.get("/api/v1/health").status_code
                 for _ in range(5)
             ]
-            assert 429 in codes
+            # The limiter admits `burst` requests and refuses the rest. What the
+            # admitted requests return is not this test's concern: /health answers
+            # 503 until the pipeline finishes warming.
+            assert codes.count(429) >= 3
+            assert codes[:2] == [codes[0], codes[0]]
+            assert codes[0] != 429
         finally:
             api_module._rate_limiter = original
 

@@ -412,6 +412,13 @@ class DualHeadSupportModel:
         self.intent_natural_prior_: Optional[Dict[str, float]] = None
         self.prior_correction_strength_ = 0.0
         self.prior_correction_calibration_gain_ = 0.0
+        # Bootstrap-aggregated intent heads. A single logistic-regression fit is
+        # high-variance on sparse TF-IDF features; averaging several bootstrap
+        # fits lowers variance on unseen text. Admitted only if the calibration
+        # split shows a material gain.
+        self.intent_bagging_heads_: List[OneVsRestClassifier] = []
+        self.intent_bagging_gain_ = 0.0
+        self.intent_bagging_accepted_ = False
 
     @staticmethod
     def _make_vectorizer() -> FeatureUnion:
@@ -543,6 +550,13 @@ class DualHeadSupportModel:
             cal_intent_embeddings,
             cal_intent_labels,
             cal_intent_logits,
+        )
+        # Bootstrap-aggregate the intent head to cut variance on unseen text.
+        self._fit_intent_bagging(
+            intent_features[intent_keep],
+            np.asarray(intent_labels)[intent_keep],
+            cal_intent_features,
+            cal_intent_labels,
         )
         if self.enable_context_gate and cal_intent_context_texts is not None:
             self._fit_context_gate(
@@ -721,6 +735,65 @@ class DualHeadSupportModel:
         adjusted = probs * np.power(prior[np.newaxis, :], alpha)
         totals = np.clip(adjusted.sum(axis=1, keepdims=True), 1e-12, None)
         return adjusted / totals
+
+    def _fit_intent_bagging(
+        self,
+        features,
+        labels: Sequence[str],
+        cal_features,
+        cal_labels: Sequence[str],
+        n_models: int = 4,
+        seed: int = 42,
+    ) -> None:
+        """Bootstrap-aggregate the intent head, admitted only on a material gain.
+
+        A single logistic regression on sparse TF-IDF features is high variance:
+        small changes in the training sample move the decision boundary. Fitting
+        several bootstrap resamples and averaging their probabilities reduces
+        that variance, which is what generalisation to unseen text depends on.
+
+        The ensemble is only kept when the held-out calibration split improves
+        by more than 0.002 accuracy without losing more than 0.02 macro-F1, so it
+        cannot silently trade away minority performance.
+        """
+        labels_arr = np.asarray(labels, dtype=object)
+        rng = np.random.default_rng(seed)
+        heads: List[OneVsRestClassifier] = []
+        for _ in range(max(1, int(n_models))):
+            indices = rng.integers(0, len(labels_arr), size=len(labels_arr))
+            if len(np.unique(labels_arr[indices])) < 2:
+                continue
+            estimator = self._intent_estimator(self.intent_selected_c_)
+            estimator.fit(features[indices], labels_arr[indices])
+            heads.append(estimator)
+        if not heads:
+            return
+
+        temperature = self.intent_temperature.temperature_
+        truth = np.asarray(cal_labels, dtype=object)
+        class_values = np.asarray(self.classes_, dtype=object)
+
+        base_probs = self._apply_prior_correction(
+            _softmax(np.asarray(self.intent_head.decision_function(cal_features)) / temperature)
+        )
+        ensemble_inputs = [base_probs]
+        for head in heads:
+            ensemble_inputs.append(
+                _softmax(np.asarray(head.decision_function(cal_features)) / temperature)
+            )
+        bagged_probs = self._apply_prior_correction(np.mean(ensemble_inputs, axis=0))
+
+        base_pred = class_values[np.argmax(base_probs, axis=1)]
+        bagged_pred = class_values[np.argmax(bagged_probs, axis=1)]
+        base_accuracy = float(np.mean(base_pred == truth))
+        bagged_accuracy = float(np.mean(bagged_pred == truth))
+        base_macro_f1 = float(f1_score(truth, base_pred, average="macro", zero_division=0))
+        bagged_macro_f1 = float(f1_score(truth, bagged_pred, average="macro", zero_division=0))
+
+        self.intent_bagging_gain_ = bagged_accuracy - base_accuracy
+        if bagged_accuracy > base_accuracy + 0.002 and bagged_macro_f1 >= base_macro_f1 - 0.02:
+            self.intent_bagging_heads_ = heads
+            self.intent_bagging_accepted_ = True
 
     @staticmethod
     def _intent_estimator(c_value: float, class_weight: Optional[str] = None) -> OneVsRestClassifier:
@@ -1007,7 +1080,17 @@ class DualHeadSupportModel:
                     + self.prototype_blend_weight_ * prototype_probs
                 )
 
-        # Restore the deployment class prior (training is balanced to uniform).
+        # Average in bootstrap-aggregated heads (admitted on a calibration gain).
+        if self.intent_bagging_accepted_ and self.intent_bagging_heads_:
+            temperature = self.intent_temperature.temperature_
+            ensemble_inputs = [probs]
+            for head in self.intent_bagging_heads_:
+                ensemble_inputs.append(
+                    _softmax(np.asarray(head.decision_function(features)) / temperature)[0]
+                )
+            probs = np.mean(ensemble_inputs, axis=0)
+
+        # Restore the deployment class prior (training balances to uniform).
         probs = self._apply_prior_correction(probs)
 
         best_idx = int(np.argmax(probs))

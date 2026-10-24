@@ -46,13 +46,34 @@ HOLDOUT_IDS = "models/_eval_holdout_ids.csv"
 REPORT_JSON = "models/_score_matrix.json"
 
 
-def _write_holdout_file() -> int:
+def _write_holdout_file(eval_ids) -> int:
     """Materialise the evaluation inbound_ids as a leak-guard file."""
-    frame = pd.read_csv(EVAL_CSV)
-    ids = frame["inbound_id"].astype(str)
+    ids = [str(value) for value in eval_ids]
     Path(HOLDOUT_IDS).parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame({"tweet_id": ids}).to_csv(HOLDOUT_IDS, index=False)
     return len(ids)
+
+
+def _build_random_holdout(seed: int, fraction: float) -> pd.DataFrame:
+    """Draw a deployment-representative random stratified holdout.
+
+    The checked-in review set is an *active-learning* sample: it deliberately
+    contains the highest-uncertainty rows in the corpus, so scoring on it
+    measures worst-case behaviour rather than expected traffic performance.
+    This draws a plain stratified random sample instead, labelled with the same
+    reply-side supervision.
+    """
+    pairs = pd.read_csv(PAIRS_CSV)
+    pairs["intent_label"] = pairs["reply_text"].fillna("").map(infer_reply_intent)
+    pairs["escalate_label"] = pairs["reply_text"].fillna("").map(infer_reply_escalation)
+    labelled = pairs[pairs["intent_label"].notna()].copy()
+    parts = [
+        group.sample(frac=fraction, random_state=seed)
+        for _, group in labelled.groupby("intent_label", sort=True)
+    ]
+    sample = pd.concat(parts, ignore_index=True)
+    sample["reviewed_reason_code"] = None
+    return sample
 
 
 def _confusion_table(cm: list[list[int]], labels: list[str]) -> str:
@@ -68,10 +89,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--in-sample", action="store_true",
                         help="Reuse the served pipeline instead of retraining without the eval rows")
+    parser.add_argument("--holdout", choices=["review", "random"], default="review",
+                        help="review = active-learning hard cases (worst case); "
+                             "random = stratified traffic sample (expected case)")
+    parser.add_argument("--random-fraction", type=float, default=0.15,
+                        help="Fraction of labelled rows to hold out in random mode")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    eval_frame = pd.read_csv(EVAL_CSV)
+    if args.holdout == "random":
+        eval_frame = _build_random_holdout(args.seed, args.random_fraction)
+        protocol_label = "random traffic holdout (deployment-representative)"
+    else:
+        eval_frame = pd.read_csv(EVAL_CSV)
+        protocol_label = "active-learning review sample (hardest cases)"
     print(f"Evaluation set: {EVAL_CSV} ({len(eval_frame)} rows, weak labels)")
 
     started = time.time()
@@ -79,8 +110,9 @@ def main() -> int:
         print("Mode: IN-SAMPLE (evaluation rows were part of training) — optimistic")
         artifacts = build_learned_pipeline(pairs_csv=PAIRS_CSV)
     else:
-        count = _write_holdout_file()
+        count = _write_holdout_file(eval_frame["inbound_id"])
         print(f"Mode: HELD-OUT ({count} rows excluded from training)")
+        print(f"Holdout: {protocol_label}")
         artifacts = build_learned_pipeline(pairs_csv=PAIRS_CSV, gold_csv=HOLDOUT_IDS)
     print(f"Pipeline ready in {time.time() - started:.1f}s (cache_hit={artifacts.cache_hit})")
 

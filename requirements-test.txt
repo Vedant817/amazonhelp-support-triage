@@ -6,3 +6,7 @@ pytest-mock
 pytest-asyncio
 httpx
 pytest-xdist
+
+# Dependency advisory scanning, used by scripts_audit.py. Without this the audit
+# script fails with "No module named pip_audit".
+pip-audit

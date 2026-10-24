@@ -16,9 +16,14 @@ Exercises the real HTTP surface exactly like a hostile user:
 
 import sys
 import json
+from pathlib import Path
 import httpx
 
-BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8000"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from scripts_verify_common import base_url_from_argv, exit_if_unreachable
+
+BASE = base_url_from_argv()
 FAILURES = []
 
 
@@ -30,6 +35,7 @@ def check(name: str, condition: bool, detail: str = ""):
 
 
 def main() -> int:
+    exit_if_unreachable(BASE)
     client = httpx.Client(base_url=BASE, timeout=60.0)
 
     # 1. Dashboard

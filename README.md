@@ -158,6 +158,16 @@ roughly 29 accuracy points.
   everything — so the *ordering* has decayed, and the fix is retraining or new
   features. Anyone reaching for a threshold change here would be fixing the
   wrong thing.
+- **Recency weighting was tried and does not earn its place.**
+  `SUPPORT_ESCALATION_RECENCY_HALFLIFE_DAYS` weights older rows down
+  geometrically. At a 14-day half-life on the temporal holdout it moves escalation
+  recall 0.768 → 0.786 and precision 0.197 → 0.188, i.e. one extra true positive
+  out of 56, while auto-handle recall falls 0.443 → 0.395 and escalation macro-F1
+  regresses. Intent metrics are bit-identical, which at least confirms the knob is
+  surgical. Ranking at a fixed 0.85 floor does improve slightly (lift 1.23× →
+  1.29×), so the direction is right, but a single configuration is not evidence
+  and the served operating point does not improve. Left **off by default**;
+  enabling it needs a sweep over half-lives, not an argument.
 - **The learned escalation score is modestly informative, not decisive.** Its
   lift over the base rate is 1.4–1.6× on same-period traffic and 1.1–1.3× under
   drift. The deterministic hard gates carry the safety property; the head mostly
@@ -224,8 +234,43 @@ separately):
 | `SUPPORT_INTENT_BALANCE_RATIO` | `0.0` (natural) | `>0` re-balances classes; measured to cost ~0.06 accuracy |
 | `SUPPORT_INTENT_CAP_PER_CLASS` | `20000` | Lower values truncate the dominant class's evidence |
 | `SUPPORT_INTENT_CLASS_WEIGHT` | `none` | `balanced` re-enables class reweighting |
-| `SUPPORT_USE_PROBABILISTIC_LABELS` | `1` | Include model-generated intent labels in supervision (see below) |
+| `SUPPORT_USE_PROBABILISTIC_LABELS` | `0` (excluded) | `1` pools model-generated intent labels into supervision (see below) |
+| `SUPPORT_ESCALATION_RECENCY_HALFLIFE_DAYS` | unset (uniform) | Weight older escalation rows down geometrically; targets drift |
+| `SUPPORT_ADJUDICATED_LABELS` | `data/training/labels_human_adjudicated.csv` | Human labels to merge; empty value opts out |
 | `SUPPORT_DISABLE_PIPELINE_CACHE` | unset | `1` forces a retrain instead of loading the cache |
+
+### Human labels
+
+The intent targets are extracted from historical agent replies by rule, so they
+encode what the agent did while the model only sees what the customer wrote. That
+mismatch is the dominant term in the remaining error and no amount of modelling
+removes it — human labels do.
+
+```powershell
+# 1. Draw a stratified sample; one blank sheet per annotator
+.\.venv\Scripts\python.exe scripts_label_workflow.py sample --annotators alice,bob --per-class 60
+
+# 2. Annotators fill reviewed_intent / reviewed_escalate (blank = abstain)
+#    in data/annotations/<name>.csv
+
+# 3. Combine, measure agreement, write the file the pipeline reads
+.\.venv\Scripts\python.exe scripts_label_workflow.py adjudicate `
+    data/annotations/alice.csv data/annotations/bob.csv
+```
+
+`adjudicate` reports Cohen's kappa per dimension and gates at **0.61**
+("substantial" on the conventional scale). A dimension that fails is left blank
+rather than written, and the exit code is non-zero — low-agreement labels are
+worse than no labels, because they look like ground truth while encoding
+disagreement. Kappa rather than raw agreement matters here: with one intent
+covering ~69% of traffic, two annotators who both always answer
+`ORDER_TRACKING_AND_DELAY` agree 69% of the time while carrying no information.
+
+The output is picked up automatically on the next fit and participates in the
+cache fingerprint, so adding labels invalidates the cached pipeline instead of
+being silently ignored. Every row carries the `source_sha256` that binds the label
+to the exact conversation shown, and a mismatch aborts the fit — labels cannot
+drift onto a different conversation after the corpus changes.
 
 ### Evaluation protocols
 

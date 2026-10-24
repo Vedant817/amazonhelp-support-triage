@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import pandas as pd
+
 
 def _get(report: Dict[str, Any], path: str) -> Optional[float]:
     """Look up a dotted path, accepting numeric segments as list indices."""
@@ -127,7 +129,57 @@ def main() -> int:
         bagging = (report.get("model_state") or {}).get("intent_bagging") or {}
         print(f"  {side:<22s} {'intent_bagging':<18s} accepted={bagging.get('accepted')} "
               f"heads={bagging.get('heads')}")
+
+    _paired_test(first_path, second_path, label_a, label_b)
     return 0
+
+
+def _paired_test(
+    first_path: Path, second_path: Path, label_a: str, label_b: str
+) -> None:
+    """Run McNemar on the two runs' per-row predictions when both exist.
+
+    Two configurations scored on the same rows must be compared as paired data.
+    Marginal confidence intervals can overlap heavily while the paired test is
+    decisive, because most rows are easy and both get them right — those rows
+    carry no information about which system is better.
+    """
+    rows_a = first_path.with_name(first_path.name + ".rows.csv")
+    rows_b = second_path.with_name(second_path.name + ".rows.csv")
+    print()
+    print("  Paired significance (McNemar, exact)")
+    if not rows_a.exists() or not rows_b.exists():
+        missing = [str(path) for path in (rows_a, rows_b) if not path.exists()]
+        print(f"  skipped: no per-row predictions for {', '.join(missing)}")
+        return
+    frame_a = pd.read_csv(rows_a)
+    frame_b = pd.read_csv(rows_b)
+    if len(frame_a) != len(frame_b):
+        print(f"  skipped: different row counts ({len(frame_a)} vs {len(frame_b)})")
+        return
+    shared = frame_a.merge(
+        frame_b, on="inbound_id", suffixes=("_a", "_b"), how="inner"
+    )
+    if shared.empty:
+        print("  skipped: no shared inbound_id between the two runs")
+        return
+    from src.evaluator import SupportPipelineEvaluator
+
+    result = SupportPipelineEvaluator.paired_mcnemar(
+        shared["intent_true_a"].tolist(),
+        shared["intent_pred_a"].tolist(),
+        shared["intent_pred_b"].tolist(),
+    )
+    print(f"  rows compared                  {len(shared)}")
+    print(f"  {label_a} right, {label_b} wrong   {result['a_correct_b_wrong']}")
+    print(f"  {label_a} wrong, {label_b} right   {result['a_wrong_b_correct']}")
+    print(f"  discordant pairs               {result['discordant_count']}")
+    print(f"  exact two-sided p-value        {result['exact_two_sided_p_value']}")
+    if result["exact_two_sided_p_value"] < 0.05:
+        winner = label_b if result["a_wrong_b_correct"] > result["a_correct_b_wrong"] else label_a
+        print(f"  verdict: {winner} is better, and the difference is not attributable to chance")
+    else:
+        print("  verdict: no significant difference; the two agree aside from noise")
 
 
 if __name__ == "__main__":

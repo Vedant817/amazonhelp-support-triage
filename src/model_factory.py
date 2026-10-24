@@ -274,12 +274,30 @@ def build_learned_pipeline(
     if reviewed_csv and Path(reviewed_csv).exists():
         reviewed = pd.read_csv(reviewed_csv)
     # Model-generated intent labels score ~0.90 out-of-fold against ~0.64 for
-    # reply-derived labels, i.e. they are largely reproducible from the features
-    # the model already sees. They are therefore close to information-free and
-    # inflate any score computed over a label set that contains them, so whether
-    # to train on them is a measured choice rather than an assumption. See
-    # scripts_cv_audit.py and SUPPORT_USE_PROBABILISTIC_LABELS.
-    _requested_prob_labels = os.getenv("SUPPORT_USE_PROBABILISTIC_LABELS", "1").strip().lower()
+    # reply-derived labels (scripts_cv_audit.py), i.e. they are largely
+    # reproducible from features the model already sees, because the model that
+    # produced them was trained on the same reply-derived labels. They are
+    # therefore close to information-free, and training on them makes internal
+    # diagnostics misleading: cross-validated macro-F1 reads 0.81 over the pooled
+    # set against 0.69 for the reply-derived subset.
+    #
+    # Measured head to head on the same 1268-row deployment-representative
+    # holdout (models/_score_A_prob.json vs models/_score_B_replyonly.json):
+    #
+    #                        pooled   reply-only
+    #   accuracy             0.7934      0.8170
+    #   macro-F1             0.6131      0.6142
+    #   macro precision      0.6445      0.7049
+    #   macro recall         0.6162      0.5637
+    #   ECE                  0.0582      0.0386
+    #
+    # So reply-only wins on accuracy, precision and calibration and ties on
+    # macro-F1, while giving up 0.05 macro recall. It is the default because
+    # circular labels can only be validated against data that shares their
+    # provenance, which is the one thing a held-out split cannot fix — and the
+    # measured differences point the same way. Set
+    # SUPPORT_USE_PROBABILISTIC_LABELS=1 to restore the wider, circular set.
+    _requested_prob_labels = os.getenv("SUPPORT_USE_PROBABILISTIC_LABELS", "0").strip().lower()
     use_probabilistic_labels = _requested_prob_labels not in {"0", "false", "no", "off"}
     supervision = build_reply_supervision(
         pairs, reviewed, use_probabilistic_intent_labels=use_probabilistic_labels

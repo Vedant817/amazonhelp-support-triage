@@ -158,6 +158,32 @@ def _write_report(path: str, report: dict) -> None:
     Path(path).write_text(json.dumps(report, indent=2), encoding="utf-8")
 
 
+def _write_row_predictions(path: str, eval_frame, rows: dict) -> Optional[str]:
+    """Persist per-row predictions next to the report.
+
+    Comparing two configurations needs a paired test, not two independent
+    confidence intervals: the same rows are scored by both, so the disagreement
+    pattern carries far more information than the marginal accuracies. Without
+    per-row output there is nothing to pair, which is why an earlier comparison
+    of two label configurations could only report that the intervals overlapped.
+    """
+    try:
+        frame = pd.DataFrame({
+            "inbound_id": eval_frame["inbound_id"].astype(str).tolist()[:len(rows["intent_true"])],
+            "intent_true": rows["intent_true"],
+            "intent_pred": rows["intent_pred"],
+            "confidence": rows["confidence"],
+            "escalate_true": rows["esc_true"],
+            "escalate_pred": rows["esc_pred"],
+            "escalation_risk": rows["esc_risk"],
+        })
+    except (KeyError, ValueError):
+        return None
+    destination = Path(f"{path}.rows.csv")
+    frame.to_csv(destination, index=False)
+    return str(destination)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--in-sample", action="store_true",
@@ -493,6 +519,9 @@ def main() -> int:
     report["evaluation_prior_share_order_tracking"] = round(eval_share, 4)
     report["per_class_recall"] = {l: round(float(r), 4) for l, r in zip(labels, per_class_recall)}
     _write_report(args.report, report)
+    rows_path = _write_row_predictions(args.report, eval_frame, rows)
+    if rows_path:
+        print(f"  per-row predictions:  {rows_path}")
 
 
     print("\n[reply] safety and compliance")

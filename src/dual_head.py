@@ -27,6 +27,30 @@ MINILM_MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
 MINILM_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
 
 
+def _aligned_sample_weight(
+    weights: Optional[Sequence[float]], expected_length: int
+) -> Optional[np.ndarray]:
+    """Validate per-row sample weights, or return ``None`` for uniform weighting.
+
+    Rejecting bad weights loudly matters here: a silently ignored weight vector
+    would look like a successful run that quietly trained with different
+    regularisation than intended, which is very hard to notice downstream.
+    """
+    if weights is None:
+        return None
+    values = np.asarray(weights, dtype=float)
+    if values.ndim != 1 or values.shape[0] != expected_length:
+        raise ValueError(
+            "sample weights must align with the labels "
+            f"({values.shape[0] if values.ndim else 0} vs {expected_length})"
+        )
+    if not np.all(np.isfinite(values)) or np.any(values < 0):
+        raise ValueError("sample weights must be finite and non-negative")
+    if values.sum() <= 0:
+        raise ValueError("sample weights must not sum to zero")
+    return values
+
+
 def _softmax(logits: np.ndarray) -> np.ndarray:
     values = np.asarray(logits, dtype=float)
     values = values - np.max(values, axis=-1, keepdims=True)
@@ -499,6 +523,7 @@ class DualHeadSupportModel:
         contrastive_texts: Optional[Sequence[str]] = None,
         contrastive_labels: Optional[Sequence[str]] = None,
         intent_natural_prior: Optional[Dict[str, float]] = None,
+        escalation_sample_weight: Optional[Sequence[float]] = None,
     ) -> "DualHeadSupportModel":
         if self.contrastive_pair_count > 0:
             if not contrastive_texts or not contrastive_labels:
@@ -536,7 +561,19 @@ class DualHeadSupportModel:
             self._select_escalation_regularization(
                 escalation_features, np.asarray(escalation_labels, dtype=bool)
             )
-        self.escalation_head.fit(escalation_features, list(escalation_labels))
+        # Recency weighting. The temporal protocol shows the escalation head's
+        # ranking decays on recent traffic (precision at a 0.85 recall floor falls
+        # from 1.48x the base rate to 1.23x), and a threshold change cannot repair
+        # ordering. Weighting older rows down is the cheap remedy: it lets the head
+        # spend its capacity on the phrasing in current use instead of on patterns
+        # that have drifted. Weights are supplied by the caller so this stays a
+        # measured configuration choice rather than a silent default.
+        escalation_weights = _aligned_sample_weight(escalation_sample_weight, len(escalation_labels))
+        self.escalation_head.fit(
+            escalation_features,
+            list(escalation_labels),
+            sample_weight=escalation_weights,
+        )
         self.classes_ = list(self.intent_head.classes_)
 
         cal_intent_embeddings = self.encoder.encode(cal_intent_texts)

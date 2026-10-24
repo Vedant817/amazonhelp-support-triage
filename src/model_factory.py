@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List, Optional
 
 import pandas as pd
+import numpy as np
 import joblib
 from sklearn.model_selection import train_test_split
 
@@ -147,6 +148,41 @@ def _prune_pipeline_caches(directory: Path, keep: str, retain: int = 3) -> List[
     return removed
 
 
+def _recency_weights(
+    frame: pd.DataFrame,
+    half_life_days: float,
+    timestamp_column: str = "customer_created_at",
+) -> Optional[np.ndarray]:
+    """Exponential-decay sample weights, newest rows weighted highest.
+
+    Older traffic is still evidence about the task, just weaker evidence about
+    current phrasing, so weights decay geometrically rather than cutting the old
+    rows out. ``half_life_days <= 0`` returns ``None``, meaning "weight every row
+    equally" — the behaviour before this existed, kept as the default so enabling
+    recency is a measured choice rather than a silent change.
+
+    Weights are normalised to mean 1 so the effective sample size stays readable
+    and the regularisation strength means the same thing at any half-life.
+    """
+    if half_life_days is None or float(half_life_days) <= 0.0 or len(frame) == 0:
+        return None
+    if timestamp_column not in frame.columns:
+        return None
+    timestamps = pd.to_datetime(frame[timestamp_column], errors="coerce", utc=True, format="mixed")
+    if timestamps.isna().all():
+        return None
+    newest = timestamps.max()
+    # Rows with an unparseable timestamp get the median age rather than being
+    # dropped or silently treated as brand new.
+    age_days = (newest - timestamps).dt.total_seconds() / 86400.0
+    age_days = age_days.fillna(float(age_days.median()))
+    weights = np.power(0.5, age_days.to_numpy(dtype=float) / float(half_life_days))
+    total = weights.sum()
+    if not np.isfinite(total) or total <= 0:
+        return None
+    return weights * (len(weights) / total)
+
+
 def _cap_per_class(frame: pd.DataFrame, label_column: str, cap: int, seed: int) -> pd.DataFrame:
     """Subsample each class to at most ``cap`` rows.
 
@@ -211,7 +247,19 @@ def build_learned_pipeline(
     contrastive_cache_dir: str = "models",
     pipeline_cache_dir: Optional[str] = "models/pipeline_cache",
     seed: int = 42,
+    escalation_recency_half_life_days: Optional[float] = None,
 ) -> PipelineArtifacts:
+    # Recency half-life is read from the environment so experiments do not need a
+    # code change, and 0 / unset means "weight every row equally".
+    _requested_half_life = os.getenv("SUPPORT_ESCALATION_RECENCY_HALFLIFE_DAYS", "").strip()
+    if _requested_half_life:
+        try:
+            escalation_recency_half_life_days = float(_requested_half_life)
+        except ValueError:
+            raise ValueError(
+                "SUPPORT_ESCALATION_RECENCY_HALFLIFE_DAYS must be a number of days "
+                f"(got {_requested_half_life!r})"
+            )
     source_root = Path(__file__).resolve().parent
     fingerprint_paths = [Path(pairs_csv)]
     if gold_csv:
@@ -233,7 +281,10 @@ def build_learned_pipeline(
             "context_gate": True,
             "balance_intent_classes": True,
             "max_ratio": os.getenv("SUPPORT_INTENT_BALANCE_RATIO", "0.0"),
-            "use_probabilistic_labels": os.getenv("SUPPORT_USE_PROBABILISTIC_LABELS", "1"),
+            # Default matches the code default in this function, not the older
+            # value, so the fingerprint describes the configuration actually used.
+            "use_probabilistic_labels": os.getenv("SUPPORT_USE_PROBABILISTIC_LABELS", "0"),
+            "escalation_recency_half_life_days": escalation_recency_half_life_days,
             "confidence_penalty": 0.05,
             "runtime": _runtime_signature(),
             "seed": seed,
@@ -366,6 +417,9 @@ def build_learned_pipeline(
         random_state=seed,
         stratify=escalation_rows["escalate_label"],
     )
+    escalation_recency_weight = _recency_weights(
+        escalation_train, half_life_days=escalation_recency_half_life_days
+    )
 
     encoder = MiniLMEncoder()
     model = DualHeadSupportModel(
@@ -396,6 +450,7 @@ def build_learned_pipeline(
         contrastive_texts,
         contrastive_labels,
         intent_natural_prior,
+        escalation_sample_weight=escalation_recency_weight,
     )
 
     retrieval_frame = supervision.copy()

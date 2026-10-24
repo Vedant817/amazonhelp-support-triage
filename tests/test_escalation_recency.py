@@ -2,11 +2,11 @@
 
 The temporal protocol showed the escalation head's ranking decays on recent
 traffic: precision at a 0.85 recall floor falls from 1.48x the base rate on
-same-period traffic to 1.23x on the newest 15% of conversations, and a
-sweep over every threshold (scripts_recall_recoverability.py) confirmed no
-operating point repairs it. Weighting older rows down is the cheap remedy, so
-the mechanism has to be exactly right: silent weight bugs would show up as a
-quiet change in regularisation strength rather than as a visible failure.
+same-period traffic to 1.23x on the newest 15% of conversations, and sweeping
+every threshold over that run's own risk scores confirmed no operating point
+repairs it. Weighting older rows down is the cheap remedy, so the mechanism has
+to be exactly right: silent weight bugs would show up as a quiet change in
+regularisation strength rather than as a visible failure.
 """
 
 import numpy as np

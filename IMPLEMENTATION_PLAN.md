@@ -14,7 +14,8 @@ set, which is an active-learning sample of the hardest rows in the corpus.
 - **Drift**: temporal holdout 0.845 accuracy / 0.622 macro-F1, deployment accuracy 0.830
 - **Drift diagnosis**: the escalation shortfall is decayed ranking, not a stale
   threshold — precision at a 0.85 recall floor is only 1.23x the base rate under
-  drift against 1.42-1.56x on same-period traffic (`scripts_recall_recoverability.py`),
+  drift against 1.42-1.56x on same-period traffic (measured by sweeping every
+  threshold over the temporal run's own saved risk scores),
   so the fix is retraining on recent traffic, not a new operating point
 - **Safety**: all seven hard gates verified; guardrail pass rate 1.000; zero PII violations
 - **Test suite**: 285 tests, including an adversarial suite and a security middleware suite
@@ -30,7 +31,7 @@ set, which is an active-learning sample of the hardest rows in the corpus.
 | 1. Foundation | **Done** | Test suite, coverage config, dependency floors, reproducibility scripts |
 | 1.6 Golden set | Superseded | Replaced by three holdout protocols (`review`/`random`/`temporal`), which are stronger than a static golden file because they cannot be tuned against |
 | 2. Monitoring | **Partial** | Security headers, rate limiting, request IDs, health endpoint; no metrics export or alerting |
-| 3. Human labelling | **Started, blocked on people** | The measurement apparatus is in place (`scripts_cv_audit.py` quantifies label circularity; the review-sample protocol scores hard cases). Producing better labels requires annotators, not code |
+| 3. Human labelling | **Done (needs annotator time)** | `scripts_label_workflow.py` samples, adjudicates by majority and gates on Cohen's kappa; the pipeline loads the result automatically. Producing the labels themselves requires annotators, not code |
 | 4. Contrastive fine-tuning | **Tried, disabled** | Corrupted the encoder on weak labels; left off with the gate documented |
 | 5. Retrieval & generation | **Partial** | Retrieval in place; generation is template-grounded |
 | 6. Safety hardening | **Done** | Unsafe pickle removed, cache manifest trust, CORS/host/body limits, PII leak fixed |

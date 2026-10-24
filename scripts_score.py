@@ -290,8 +290,8 @@ def main() -> int:
 
     # Label provenance, so a report records whether supervision included
     # model-generated labels. Those score ~0.90 out-of-fold against ~0.64 for
-    # reply-derived labels (scripts_cv_audit.py), so a score computed over a
-    # label set containing them is not comparable to one computed without.
+    # reply-derived labels, so a score computed over a label set containing them
+    # is not comparable to one computed without.
     _provenance = labelled.get("intent_label_source")
     if _provenance is not None:
         probabilistic_rows = int((_provenance == "probabilistic_weak_label_model").sum())

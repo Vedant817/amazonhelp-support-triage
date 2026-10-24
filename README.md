@@ -142,21 +142,21 @@ roughly 29 accuracy points.
   refund language is labelled `REFUND_AND_RETURN`. Part of every label is
   unlearnable by construction, which is the dominant term in the remaining error.
 - **The model is at the measured ceiling for this label set.** A plain TF-IDF +
-  logistic-regression recipe reaches 0.8289/0.6414 on the same corpus
-  (`scripts_feature_ab.py`), and the fitted pipeline reaches 0.8170/0.6142 — so
-  the feature stack is not the bottleneck and the remaining gap is supervision,
-  not capacity. More model will not help; better labels will.
+  logistic-regression recipe reaches 0.8289/0.6414 on the same corpus, and the
+  fitted pipeline reaches 0.8170/0.6142 — so the feature stack is not the
+  bottleneck and the remaining gap is supervision, not capacity. More model will
+  not help; better labels will.
 - **Escalation recall is the safety-critical metric, and drift breaks its target.**
   On `random` it is 0.927 with a 0.822 lower bound; on `temporal` it falls to
   0.768 (lower bound 0.657), below the 0.85 target.
 - **The drift shortfall is not fixable by re-deriving the threshold.** Sweeping
-  every threshold over the temporal run's own risk scores
-  (`scripts_recall_recoverability.py`) shows precision at a 0.85 recall floor is
-  0.186, only **1.23× the base rate**, and it decays to 1.09× at a 0.95 floor. On
-  same-period traffic the same sweep holds **1.42–1.56×** across the whole recall
-  range. The score still reaches the floor, but only by escalating nearly
-  everything — so the *ordering* has decayed, and the fix is retraining or new
-  features. Anyone reaching for a threshold change here would be fixing the
+  every threshold over the temporal run's own saved risk scores (they are written
+  alongside each report as `<report>.rows.csv`) shows precision at a 0.85 recall
+  floor is 0.186, only **1.23× the base rate**, and it decays to 1.09× at a 0.95
+  floor. On same-period traffic the same sweep holds **1.42–1.56×** across the
+  whole recall range. The score still reaches the floor, but only by escalating
+  nearly everything — so the *ordering* has decayed, and the fix is retraining or
+  new features. Anyone reaching for a threshold change here would be fixing the
   wrong thing.
 - **Recency weighting was tried and does not earn its place.**
   `SUPPORT_ESCALATION_RECENCY_HALFLIFE_DAYS` weights older rows down
@@ -204,27 +204,32 @@ went 0.4690 → 0.5241, deployment accuracy 0.5277 → 0.6152, and ECE
 Diagnostics used to reach these numbers:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts_diagnose.py         # label noise, prior mismatch, majority floor
-.\.venv\Scripts\python.exe scripts_cv_audit.py         # label circularity: reply-derived vs model-generated
-.\.venv\Scripts\python.exe scripts_feature_ab.py       # is the feature stack the bottleneck? (no)
-.\.venv\Scripts\python.exe scripts_preprocess_ab.py    # identifier normalisation (noise)
-.\.venv\Scripts\python.exe scripts_ceiling.py          # what is learnable from customer text
+# Reproduce the score matrix under any protocol
 .\.venv\Scripts\python.exe scripts_score.py --holdout random     # deployment-representative
 .\.venv\Scripts\python.exe scripts_score.py --holdout temporal   # drift check
 .\.venv\Scripts\python.exe scripts_score.py                      # hard-case review sample
-.\.venv\Scripts\python.exe scripts_compare_reports.py A.json B.json   # paired comparison
-.\.venv\Scripts\python.exe scripts_recall_recoverability.py models/x.json.rows.csv  # is a recall miss a stale threshold or decayed ranking?
-```
 
-The recoverability check exists because a recall shortfall has two possible
-causes that call for opposite responses — a stale threshold, or a score that has
-stopped ordering recent traffic — and they are distinguishable by sweeping
-thresholds over the run's own risk scores. It reports which one you have.
+# Compare two runs (writes McNemar's exact test when per-row dumps exist)
+.\.venv\Scripts\python.exe scripts_compare_reports.py A.json B.json
+
+# Verify a running instance
+.\.venv\Scripts\python.exe scripts_smoke.py            # end-to-end HTTP, hostile inputs
+.\.venv\Scripts\python.exe scripts_ui_check.py         # dashboard structure contract
+.\.venv\Scripts\python.exe scripts_security_check.py   # headers, CORS, body and session limits
+.\.venv\Scripts\python.exe scripts_audit.py            # dependency advisories
+
+# Produce human labels
+.\.venv\Scripts\python.exe scripts_label_workflow.py sample --annotators alice,bob
+```
 
 `scripts_compare_reports.py` runs McNemar's exact test on the two runs' per-row
 predictions when both are present, because configurations scored on the same rows
 must be compared as paired data: most rows are easy and both systems get them
 right, so they say nothing about which is better.
+
+The three verification scripts are not in `tests/` because they need a live
+server: pytest covers the library, they cover the HTTP contract, the rendered
+dashboard and the middleware stack.
 
 Tuning knobs (each participates in the cache fingerprint, so variants cache
 separately):
@@ -288,7 +293,7 @@ protocols without saying so.
 ### On supervision quality
 
 Two facts about the labels bound what any model can score here, and both are
-measured rather than assumed (`scripts_cv_audit.py`):
+measured rather than assumed:
 
 - **The labels describe the agent's reply, not the customer's intent.** They are
   extracted from historical replies by rule, so a damage complaint answered with

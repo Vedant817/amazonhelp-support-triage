@@ -46,6 +46,6 @@ Useful flags: `--raw`, `--output`, `--max-pairs`, `--max-prior-turns`.
 The intent targets are **weak supervision**, extracted from historical agent
 replies by rule — not human judgement. They encode what the agent did, while the
 model only ever sees what the customer wrote, so part of every label is
-unlearnable by construction. This is the dominant term in the remaining error and
-it is measured in `scripts_cv_audit.py`; see the README's "On supervision
-quality" section.
+unlearnable by construction. This is the dominant term in the remaining error;
+see the README's "On supervision quality" section. `scripts_label_workflow.py`
+is the path to replacing these targets with human labels.

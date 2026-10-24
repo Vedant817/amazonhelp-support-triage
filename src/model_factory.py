@@ -356,10 +356,10 @@ def build_learned_pipeline(
     if reviewed_csv and Path(reviewed_csv).exists():
         reviewed = pd.read_csv(reviewed_csv)
     # Model-generated intent labels score ~0.90 out-of-fold against ~0.64 for
-    # reply-derived labels (scripts_cv_audit.py), i.e. they are largely
-    # reproducible from features the model already sees, because the model that
-    # produced them was trained on the same reply-derived labels. They are
-    # therefore close to information-free, and training on them makes internal
+    # reply-derived labels, i.e. they are largely reproducible from features the
+    # model already sees, because the model that produced them was trained on the
+    # same reply-derived labels. They are therefore close to information-free, and
+    # training on them makes internal
     # diagnostics misleading: cross-validated macro-F1 reads 0.81 over the pooled
     # set against 0.69 for the reply-derived subset.
     #

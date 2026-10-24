@@ -255,8 +255,16 @@ def build_learned_pipeline(
         gold = pd.read_csv(gold_csv)
         gold_ids = set(gold["tweet_id"].astype(str))
     if "conversation_context" not in pairs.columns or "prior_turn_count" not in pairs.columns:
+        # This message used to point at scripts/build_conversation_context.py, which
+        # does not exist in this repository and never did after the scripts/ tree was
+        # removed. Pointing a recoverable error at a missing file is worse than a
+        # bare failure: it costs the reader a search before they learn nothing.
         raise ValueError(
-            "Context-enriched pairs are required. Run scripts/build_conversation_context.py first."
+            f"{pairs_csv} is missing the conversation_context and prior_turn_count "
+            "columns, so it is not the context-enriched corpus this pipeline needs. "
+            "Rebuild it with: python -m src.data_pipeline "
+            "(requires the raw Twitter customer-support CSVs, which are not committed "
+            "because they exceed 50 MB; see data/README.md)."
         )
     pairs["conversation_context"] = pairs["conversation_context"].fillna("").astype(str)
     pairs["model_text"] = pairs.apply(

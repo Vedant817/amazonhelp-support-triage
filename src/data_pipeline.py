@@ -6,10 +6,13 @@ Filters and formats multi-turn Twitter customer support threads specifically for
 import os
 import csv
 import json
+import argparse
 import logging
 import re
+import sys
+from pathlib import Path
 import pandas as pd
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Sequence, Tuple
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -239,5 +242,66 @@ def process_amazon_conversations(
 
     return pairs_df
 
+def build_context_pairs(
+    raw_csv_path: str = "data/raw/twcs.csv",
+    output_csv: str = "data/processed/amazonhelp_context_pairs.csv",
+    max_pairs: int = 50000,
+    max_prior_turns: int = 4,
+) -> pd.DataFrame:
+    """Build the context-enriched corpus that every entry point reads.
+
+    ``process_amazon_conversations`` alone produces ``amazonhelp_pairs.csv``,
+    which lacks the ``conversation_context`` and ``prior_turn_count`` columns the
+    model factory requires. Reconstructing them needs a second pass over the raw
+    file, so the two steps are chained here rather than left for the caller to
+    discover by reading a stack trace.
+    """
+    pairs = process_amazon_conversations(
+        raw_csv_path=raw_csv_path, max_pairs=max_pairs
+    )
+    enriched = add_prior_conversation_context(
+        pairs, raw_csv_path=raw_csv_path, max_prior_turns=max_prior_turns
+    )
+    destination = Path(output_csv)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    enriched.to_csv(destination, index=False, quoting=csv.QUOTE_NONNUMERIC)
+    coverage = float((enriched["prior_turn_count"] > 0).mean()) if len(enriched) else 0.0
+    logger.info(
+        f"Wrote {len(enriched)} context-enriched pairs to {destination} "
+        f"({coverage:.1%} with prior turns)"
+    )
+    return enriched
+
+
+def _cli(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Rebuild the context-enriched support corpus from the raw Twitter CSVs."
+    )
+    parser.add_argument("--raw", default="data/raw/twcs.csv",
+                        help="Raw twcs.csv (not committed; exceeds 50 MB)")
+    parser.add_argument("--output", default="data/processed/amazonhelp_context_pairs.csv",
+                        help="Destination corpus path")
+    parser.add_argument("--max-pairs", type=int, default=50000,
+                        help="Cap on extracted customer/agent pairs")
+    parser.add_argument("--max-prior-turns", type=int, default=4,
+                        help="How many earlier turns to reconstruct per conversation")
+    args = parser.parse_args(argv)
+    if not Path(args.raw).exists():
+        print(
+            f"Raw corpus not found at {args.raw}.\n"
+            "Download the Twitter customer-support dataset (twcs.csv) into data/raw/ first; "
+            "it is not committed because it exceeds 50 MB. See data/README.md.",
+            file=sys.stderr,
+        )
+        return 2
+    build_context_pairs(
+        raw_csv_path=args.raw,
+        output_csv=args.output,
+        max_pairs=args.max_pairs,
+        max_prior_turns=args.max_prior_turns,
+    )
+    return 0
+
+
 if __name__ == "__main__":
-    process_amazon_conversations()
+    raise SystemExit(_cli())

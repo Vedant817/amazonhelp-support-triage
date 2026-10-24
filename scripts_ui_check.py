@@ -1,7 +1,8 @@
 """Structural validation of the served dashboard HTML.
 
-Catches the common UI bugs: missing element IDs referenced by JS, unbalanced tags,
-preset keys without copy, duplicate IDs, and broken endpoint references.
+Catches the common UI bugs: missing element IDs referenced by JS, dangling
+data-* hooks and classes the script queries but the markup never defines,
+unbalanced tags, duplicate IDs, and broken endpoint references.
 """
 
 import re
@@ -32,11 +33,22 @@ def main() -> int:
     dups = sorted({i for i in all_ids if all_ids.count(i) > 1})
     check("no duplicate element IDs", not dups, f"duplicates: {dups}")
 
-    # 3. Preset buttons all have copy in the presets object
-    preset_keys = set(re.findall(r'data-preset="([a-z_]+)"', html))
-    preset_block = re.search(r"const presets = \{(.*?)\};", html, re.S)
-    defined = set(re.findall(r"([a-z_]+)\s*:", preset_block.group(1))) if preset_block else set()
-    check("every preset button has copy", preset_keys <= defined, f"missing: {sorted(preset_keys - defined)}")
+    # 3. Every JS query hook resolves to something in the markup. This
+    #    generalises the old preset check: a data-* attribute the script binds
+    #    to, or a class it queries, that the markup never defines is silently
+    #    dead code, which is exactly how the demo-case buttons rotted.
+    queried_attrs = set(re.findall(r'querySelectorAll?\(\s*["\']\[(data-[a-z-]+)\]', html))
+    present_attrs = set(re.findall(r'\b(data-[a-z-]+)=', html))
+    dangling_attrs = sorted(queried_attrs - present_attrs)
+    check("every queried data-* attribute exists in markup", not dangling_attrs,
+          f"missing: {dangling_attrs}")
+
+    queried_classes = set(re.findall(r'querySelectorAll\(\s*["\']\.([a-z][a-z0-9-]*)["\']', html))
+    present_classes = set(re.findall(r'class="([^"]*)"', html))
+    flattened = {c for group in present_classes for c in group.split()}
+    dangling_classes = sorted(queried_classes - flattened)
+    check("every queried class exists in markup", not dangling_classes,
+          f"missing: {dangling_classes}")
 
     # 4. Balanced tags for structural elements
     for tag in ["div", "section", "aside", "main", "header", "ol", "li", "button", "span"]:

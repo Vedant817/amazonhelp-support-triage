@@ -126,6 +126,51 @@ class TestRowPredictionDump:
         assert path is None
 
 
+class TestLeakGuard:
+    """The exclusion list must be per-protocol and verified, not merely written.
+
+    A single shared path is a correctness bug: two runs under different protocols
+    overwrite each other's exclusion list, and whichever file is on disk when the
+    pipeline is fitted decides what gets excluded. That leaked 1097 of 1268
+    evaluation rows (86.5%) into their own training set and reported a 0.9259
+    accuracy which was pure memorisation.
+    """
+
+    def test_paths_differ_between_protocols(self, score_module):
+        random_path = score_module._holdout_ids_path("random", 42, 0.15)
+        temporal_path = score_module._holdout_ids_path("temporal", 42, 0.15)
+        review_path = score_module._holdout_ids_path("review", 42, 0.15)
+        assert len({random_path, temporal_path, review_path}) == 3
+
+    def test_random_path_encodes_seed_and_fraction(self, score_module):
+        first = score_module._holdout_ids_path("random", 1, 0.10)
+        second = score_module._holdout_ids_path("random", 2, 0.10)
+        third = score_module._holdout_ids_path("random", 1, 0.20)
+        assert len({first, second, third}) == 3
+
+    def test_accepts_a_matching_guard(self, score_module, tmp_path):
+        guard = str(tmp_path / "guard.csv")
+        eval_frame = pd.DataFrame({"inbound_id": ["a", "b", "c"]})
+        score_module._write_holdout_file(guard, eval_frame["inbound_id"])
+        score_module._verify_leak_guard(guard, eval_frame, when="in test")
+
+    def test_rejects_a_guard_missing_evaluation_rows(self, score_module, tmp_path):
+        guard = str(tmp_path / "guard.csv")
+        pd.DataFrame({"tweet_id": ["a"]}).to_csv(guard, index=False)
+        eval_frame = pd.DataFrame({"inbound_id": ["a", "b", "c"]})
+        with pytest.raises(RuntimeError, match="in the training set"):
+            score_module._verify_leak_guard(guard, eval_frame, when="in test")
+
+    def test_rejects_a_guard_from_another_protocol(self, score_module, tmp_path):
+        """The exact failure that produced a contaminated 0.9259 score."""
+        guard = str(tmp_path / "guard.csv")
+        temporal_rows = pd.DataFrame({"inbound_id": ["x", "y", "z"]})
+        score_module._write_holdout_file(guard, temporal_rows["inbound_id"])
+        random_rows = pd.DataFrame({"inbound_id": ["a", "b", "c"]})
+        with pytest.raises(RuntimeError):
+            score_module._verify_leak_guard(guard, random_rows, when="in test")
+
+
 class TestEscalationFrontier:
     def _scores(self, n: int = 400, seed: int = 0):
         rng = np.random.default_rng(seed)

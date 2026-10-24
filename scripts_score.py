@@ -42,16 +42,51 @@ from src.supervision import infer_reply_escalation, infer_reply_intent
 
 PAIRS_CSV = "data/processed/amazonhelp_context_pairs.csv"
 EVAL_CSV = "data/training/labels_for_human_review.csv"
-HOLDOUT_IDS = "models/_eval_holdout_ids.csv"
 REPORT_JSON = "models/_score_matrix.json"
 
 
-def _write_holdout_file(eval_ids) -> int:
+def _holdout_ids_path(mode: str, seed: int, fraction: float) -> str:
+    """Protocol-specific leak-guard path.
+
+    A single shared path is a correctness bug, not a tidiness one: two runs under
+    different protocols overwrite each other's exclusion list, and whichever file
+    happens to be on disk when the pipeline is fitted decides what gets excluded.
+    Running ``--holdout random`` and ``--holdout temporal`` concurrently leaked
+    1097 of 1268 evaluation rows (86.5%) into their own training set and produced
+    a 0.9259 accuracy that was pure contamination. The path is now a function of
+    the protocol, so parallel runs cannot collide.
+    """
+    if mode == "random":
+        return f"models/_eval_holdout_ids_random_seed{seed}_frac{fraction}.csv"
+    if mode == "temporal":
+        return f"models/_eval_holdout_ids_temporal_frac{fraction}.csv"
+    return "models/_eval_holdout_ids_review.csv"
+
+
+def _write_holdout_file(path: str, eval_ids) -> int:
     """Materialise the evaluation inbound_ids as a leak-guard file."""
     ids = [str(value) for value in eval_ids]
-    Path(HOLDOUT_IDS).parent.mkdir(parents=True, exist_ok=True)
-    pd.DataFrame({"tweet_id": ids}).to_csv(HOLDOUT_IDS, index=False)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"tweet_id": ids}).to_csv(path, index=False)
     return len(ids)
+
+
+def _verify_leak_guard(path: str, eval_frame, when: str) -> None:
+    """Fail loudly when the exclusion list is not exactly the evaluation set.
+
+    Without this check the failure mode is silent and flattering: a stale or
+    clobbered guard file leaves evaluation rows in the training set, and the
+    score matrix reports the resulting memorisation as model quality.
+    """
+    on_disk = set(pd.read_csv(path)["tweet_id"].astype(str))
+    expected = set(eval_frame["inbound_id"].astype(str))
+    if on_disk != expected:
+        leaked = expected - on_disk
+        raise RuntimeError(
+            f"Leak guard is wrong {when}: {path} excludes {len(on_disk)} ids, "
+            f"evaluation set has {len(expected)}, and {len(leaked)} evaluation "
+            f"rows are therefore in the training set. Refusing to report a score."
+        )
 
 
 def _labelled_corpus() -> pd.DataFrame:
@@ -223,10 +258,16 @@ def main() -> int:
         print("Mode: IN-SAMPLE (evaluation rows were part of training) — optimistic")
         artifacts = build_learned_pipeline(pairs_csv=PAIRS_CSV)
     else:
-        count = _write_holdout_file(eval_frame["inbound_id"])
+        holdout_path = _holdout_ids_path(args.holdout, args.seed, args.random_fraction)
+        count = _write_holdout_file(holdout_path, eval_frame["inbound_id"])
+        _verify_leak_guard(holdout_path, eval_frame, when="immediately after writing")
         print(f"Mode: HELD-OUT ({count} rows excluded from training)")
         print(f"Holdout: {protocol_label}")
-        artifacts = build_learned_pipeline(pairs_csv=PAIRS_CSV, gold_csv=HOLDOUT_IDS)
+        print(f"Leak guard: {holdout_path}")
+        artifacts = build_learned_pipeline(pairs_csv=PAIRS_CSV, gold_csv=holdout_path)
+        # Re-check after fitting: a concurrent run under a different protocol used
+        # to be able to rewrite the guard between writing and reading it.
+        _verify_leak_guard(holdout_path, eval_frame, when="after fitting")
     print(f"Pipeline ready in {time.time() - started:.1f}s (cache_hit={artifacts.cache_hit})")
 
     model = artifacts.model

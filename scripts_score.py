@@ -54,6 +54,16 @@ def _write_holdout_file(eval_ids) -> int:
     return len(ids)
 
 
+def _labelled_corpus() -> pd.DataFrame:
+    """The reply-labelled corpus with intent and escalation targets attached."""
+    pairs = pd.read_csv(PAIRS_CSV)
+    pairs["intent_label"] = pairs["reply_text"].fillna("").map(infer_reply_intent)
+    pairs["escalate_label"] = pairs["reply_text"].fillna("").map(infer_reply_escalation)
+    labelled = pairs[pairs["intent_label"].notna()].copy()
+    labelled["reviewed_reason_code"] = None
+    return labelled
+
+
 def _build_random_holdout(seed: int, fraction: float) -> pd.DataFrame:
     """Draw a deployment-representative random stratified holdout.
 
@@ -63,17 +73,56 @@ def _build_random_holdout(seed: int, fraction: float) -> pd.DataFrame:
     This draws a plain stratified random sample instead, labelled with the same
     reply-side supervision.
     """
-    pairs = pd.read_csv(PAIRS_CSV)
-    pairs["intent_label"] = pairs["reply_text"].fillna("").map(infer_reply_intent)
-    pairs["escalate_label"] = pairs["reply_text"].fillna("").map(infer_reply_escalation)
-    labelled = pairs[pairs["intent_label"].notna()].copy()
+    labelled = _labelled_corpus()
     parts = [
         group.sample(frac=fraction, random_state=seed)
         for _, group in labelled.groupby("intent_label", sort=True)
     ]
-    sample = pd.concat(parts, ignore_index=True)
-    sample["reviewed_reason_code"] = None
-    return sample
+    return pd.concat(parts, ignore_index=True)
+
+
+TWITTER_TIMESTAMP_FORMAT = "%a %b %d %H:%M:%S %z %Y"
+
+
+def _parse_timestamps(series: pd.Series) -> pd.Series:
+    """Parse the corpus's Twitter-style timestamps to UTC.
+
+    The corpus stores ``Tue Oct 31 22:16:32 +0000 2017``-style strings; parsing
+    them with an explicit format avoids pandas' per-element dateutil fallback and
+    its accompanying warning.
+    """
+    parsed = pd.to_datetime(series, format=TWITTER_TIMESTAMP_FORMAT, errors="coerce", utc=True)
+    if parsed.isna().all():
+        parsed = pd.to_datetime(series, errors="coerce", utc=True, format="mixed")
+    return parsed
+
+
+def _build_temporal_holdout(fraction: float) -> pd.DataFrame:
+    """Hold out the most recent ``fraction`` of conversations.
+
+    A random split shares its period with training, so it cannot show whether
+    the model survives drift — new products, new phrasings, changed agent
+    scripts. Training on the past and scoring the future is the closest offline
+    analogue of deploying today and serving next quarter, and it is the only
+    split here that can fail for a reason other than sampling noise.
+    """
+    labelled = _labelled_corpus()
+    labelled = labelled.assign(_timestamp=_parse_timestamps(labelled["customer_created_at"]))
+    dated = labelled[labelled["_timestamp"].notna()].sort_values("_timestamp")
+    cutoff = int(len(dated) * (1.0 - fraction))
+    holdout = dated.iloc[cutoff:].drop(columns=["_timestamp"])
+    return holdout.reset_index(drop=True)
+
+
+def _temporal_summary(frame: pd.DataFrame) -> str:
+    """Describe the evaluation window so a temporal score is interpretable."""
+    timestamps = _parse_timestamps(frame["customer_created_at"]).dropna()
+    if timestamps.empty:
+        return "temporal holdout (newest rows)"
+    return (
+        f"temporal holdout (newest rows): "
+        f"{timestamps.min():%Y-%m-%d} to {timestamps.max():%Y-%m-%d}"
+    )
 
 
 def _confusion_table(cm: list[list[int]], labels: list[str]) -> str:
@@ -89,9 +138,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--in-sample", action="store_true",
                         help="Reuse the served pipeline instead of retraining without the eval rows")
-    parser.add_argument("--holdout", choices=["review", "random"], default="review",
+    parser.add_argument("--holdout", choices=["review", "random", "temporal"], default="review",
                         help="review = active-learning hard cases (worst case); "
-                             "random = stratified traffic sample (expected case)")
+                             "random = stratified traffic sample (expected case); "
+                             "temporal = newest rows, i.e. train on the past and score the future")
     parser.add_argument("--random-fraction", type=float, default=0.15,
                         help="Fraction of labelled rows to hold out in random mode")
     parser.add_argument("--seed", type=int, default=42)
@@ -102,10 +152,15 @@ def main() -> int:
     if args.holdout == "random":
         eval_frame = _build_random_holdout(args.seed, args.random_fraction)
         protocol_label = "random traffic holdout (deployment-representative)"
+        print(f"Evaluation set: stratified random sample of {PAIRS_CSV} ({len(eval_frame)} rows)")
+    elif args.holdout == "temporal":
+        eval_frame = _build_temporal_holdout(args.random_fraction)
+        protocol_label = _temporal_summary(eval_frame)
+        print(f"Evaluation set: newest {args.random_fraction:.0%} of {PAIRS_CSV} ({len(eval_frame)} rows)")
     else:
         eval_frame = pd.read_csv(EVAL_CSV)
         protocol_label = "active-learning review sample (hardest cases)"
-    print(f"Evaluation set: {EVAL_CSV} ({len(eval_frame)} rows, weak labels)")
+        print(f"Evaluation set: {EVAL_CSV} ({len(eval_frame)} rows, weak labels)")
 
     started = time.time()
     if args.in_sample:
@@ -135,6 +190,17 @@ def main() -> int:
     from sklearn.linear_model import LogisticRegression
 
     labelled = eval_frame[eval_frame["intent_label"].notna()].reset_index(drop=True)
+
+    # Label provenance, so a report records whether supervision included
+    # model-generated labels. Those score ~0.90 out-of-fold against ~0.64 for
+    # reply-derived labels (scripts_cv_audit.py), so a score computed over a
+    # label set containing them is not comparable to one computed without.
+    _provenance = labelled.get("intent_label_source")
+    if _provenance is not None:
+        probabilistic_rows = int((_provenance == "probabilistic_weak_label_model").sum())
+        reply_derived_rows = int(len(labelled) - probabilistic_rows)
+    else:
+        probabilistic_rows, reply_derived_rows = 0, int(len(labelled))
 
     # A leak-free baseline: fit TF-IDF on the training corpus only.
     train_pairs = pd.read_csv(PAIRS_CSV)
@@ -273,6 +339,17 @@ def main() -> int:
         "eval_rows": int(len(eval_frame)),
         "intent_labelled": len(y_true),
         "escalation_labelled": len(esc_true),
+        "holdout": {
+            "mode": args.holdout,
+            "description": protocol_label,
+            "random_fraction": args.random_fraction if args.holdout == "random" else None,
+            "seed": args.seed,
+        },
+        "label_provenance": {
+            "reply_derived_rows": int(reply_derived_rows),
+            "probabilistic_rows": int(probabilistic_rows),
+        },
+        "generated_from": "scripts_score.py",
         "model_state": {
             "prior_correction_strength": float(getattr(model, "prior_correction_strength_", 0.0)),
             "prior_correction_calibration_gain": float(getattr(model, "prior_correction_calibration_gain_", 0.0)),

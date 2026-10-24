@@ -168,8 +168,14 @@ def _write_row_predictions(path: str, eval_frame, rows: dict) -> Optional[str]:
     of two label configurations could only report that the intervals overlapped.
     """
     try:
+        # Pairing by position is only valid if the collector emitted exactly one
+        # entry per evaluation row. If a row is ever skipped, writing the dump
+        # anyway would silently misalign truth with prediction and corrupt every
+        # paired test built on it, so refuse instead.
+        if len(rows["intent_true"]) != len(eval_frame):
+            return None
         frame = pd.DataFrame({
-            "inbound_id": eval_frame["inbound_id"].astype(str).tolist()[:len(rows["intent_true"])],
+            "inbound_id": eval_frame["inbound_id"].astype(str).tolist(),
             "intent_true": rows["intent_true"],
             "intent_pred": rows["intent_pred"],
             "confidence": rows["confidence"],
@@ -177,7 +183,7 @@ def _write_row_predictions(path: str, eval_frame, rows: dict) -> Optional[str]:
             "escalate_pred": rows["esc_pred"],
             "escalation_risk": rows["esc_risk"],
         })
-    except (KeyError, ValueError):
+    except (KeyError, ValueError, TypeError):
         return None
     destination = Path(f"{path}.rows.csv")
     frame.to_csv(destination, index=False)

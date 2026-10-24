@@ -1,11 +1,60 @@
 # 8-Week Implementation Plan: AmazonHelp Support Triage System
 
 ## Current State Assessment
-- **Core Pipeline**: Working (intent classification, escalation, retrieval, generation, guardrails)
-- **Safety**: 97.9% escalation recall, all 7 hard gates verified
-- **Weak Labels**: 382 samples, 39.5% intent accuracy (noise-limited)
-- **Missing**: Tests, CI/CD, monitoring, deployment, review UI, golden set, human labeling workflow
-- **Technical Debt**: No contrastive fine-tuning, confidence penalty disabled, no monitoring
+
+Measured under `scripts_score.py --holdout random` unless stated otherwise, i.e.
+a 1,268-row deployment-representative holdout drawn from the labelled corpus and
+excluded from training. `--holdout review` scores the 382-row checked-in review
+set, which is an active-learning sample of the hardest rows in the corpus.
+
+- **Core pipeline**: working (intent classification, escalation, retrieval, generation, guardrails)
+- **Intent**: 0.817 accuracy, 0.614 macro-F1, 0.705 macro precision, ECE 0.039
+- **Escalation**: 0.927 recall (one-sided 95% lower bound 0.822), 0.160 precision
+- **Safety**: all seven hard gates verified; guardrail pass rate 1.000; zero PII violations
+- **Test suite**: 285 tests, including an adversarial suite and a security middleware suite
+- **Supervision**: reply-derived labels only (model-generated labels excluded by default,
+  because they score 0.898 out-of-fold against 0.643 and are therefore largely circular)
+- **Ceiling**: a plain TF-IDF + logistic-regression recipe reaches 0.829/0.641 on the same
+  corpus, so the pipeline is at parity; the remaining error is label quality, not capacity
+
+### Progress against this plan
+
+| Week | Status | Notes |
+|---|---|---|
+| 1. Foundation | **Done** | Test suite, coverage config, dependency floors, reproducibility scripts |
+| 1.6 Golden set | Superseded | Replaced by three holdout protocols (`review`/`random`/`temporal`), which are stronger than a static golden file because they cannot be tuned against |
+| 2. Monitoring | **Partial** | Security headers, rate limiting, request IDs, health endpoint; no metrics export or alerting |
+| 3. Human labelling | **Started, blocked on people** | The measurement apparatus is in place (`scripts_cv_audit.py` quantifies label circularity; the review-sample protocol scores hard cases). Producing better labels requires annotators, not code |
+| 4. Contrastive fine-tuning | **Tried, disabled** | Corrupted the encoder on weak labels; left off with the gate documented |
+| 5. Retrieval & generation | **Partial** | Retrieval in place; generation is template-grounded |
+| 6. Safety hardening | **Done** | Unsafe pickle removed, cache manifest trust, CORS/host/body limits, PII leak fixed |
+| 7. Deployment | **Partial** | Loopback service, dashboard, warm-up guard; no container or orchestration |
+| 8. Documentation | **Partial** | README documents scores, protocols, knobs and the security model |
+
+### What actually moved the numbers
+
+Each change below is measured, not assumed. The order matters: several were
+fixes to measurement rather than to modelling, and the modelling "wins" they
+replaced were not real.
+
+1. **Blend weights were fitted to calibration noise.** Auxiliary intent heads had
+   their weights chosen as the best of up to 112 candidates on a single ~1,700-row
+   split, ranked by macro-F1 (standard error ~0.01), while admission required a
+   gain of only 0.001. The served model gave a nearest-centroid head over MiniLM
+   embeddings 0.6 of the final probability. Fixed with a nested select/verify
+   protocol plus a paired-bootstrap gate; the blend is now rejected outright.
+2. **Model-generated labels were mixed into supervision.** 5,616 of 14,067 intent
+   labels were produced by an earlier model trained on the same reply-derived
+   supervision, so they are largely reproducible from features the model already
+   sees. Excluded by default.
+3. **The confidence penalty fitted and served different transforms.** It fitted on
+   raw softmax outputs and served on temperature-scaled ones, selected rows by a
+   quantity unavailable in production, and treated `0` as maximum rather than no
+   penalty.
+4. **Prior correction and class reweighting were double-compensating**, and the
+   C grid stopped at 4 while the optimum sits at 8-32.
+5. **Evaluation was protocol-blind.** The headline number came from the hardest
+   382 rows in the corpus; reports now carry their protocol.
 
 ---
 

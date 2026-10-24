@@ -357,6 +357,10 @@ class DualHeadSupportModel:
         self.tune_escalation_regularization = bool(tune_escalation_regularization)
         self.enable_escalation_knn = bool(enable_escalation_knn)
         self.intent_confidence_penalty = float(intent_confidence_penalty)
+        # The penalty is only defined for predictions at least this confident,
+        # both when it is fitted and when it is applied.
+        self.confidence_penalty_threshold = 0.7
+        self.confidence_penalty_factor_ = 0.0
         self.intent_vectorizer = self._make_vectorizer()
         self.escalation_vectorizer = self._make_vectorizer()
         self.intent_head = OneVsRestClassifier(
@@ -626,62 +630,75 @@ class DualHeadSupportModel:
         return self
 
     def _fit_confidence_penalty(self, logits: np.ndarray, labels: np.ndarray) -> None:
-        """Fit a confidence penalty to reduce overconfident wrong predictions.
-        
-        This learns a temperature-like scaling that pulls probabilities toward uniform
-        for examples where the model is confident but wrong.
+        """Shrink confidence on predictions that are both confident and wrong.
+
+        Three things have to line up for this to mean anything, and none did:
+
+        * it is fitted on temperature-scaled probabilities, because that is what
+          the serving path applies the penalty to (it previously fitted on raw
+          softmax outputs while serving divided by the fitted temperature);
+        * it selects rows by the *predicted*-class probability, because that is
+          the only quantity observable at request time (it previously selected on
+          the true class's probability, which is unknowable in production);
+        * disabling the penalty means no penalty. ``intent_confidence_penalty=0``
+          used to set the factor to 1.0, which replaces the distribution with the
+          uniform one outright — the strongest possible penalty.
         """
+        labels = np.asarray(labels, dtype=int)
         if self.intent_confidence_penalty <= 0:
-            self.confidence_penalty_factor_ = 1.0
+            self.confidence_penalty_factor_ = 0.0
             return
-        
-        probs = _softmax(np.asarray(logits, dtype=float))
-        true_probs = probs[np.arange(len(labels)), labels]
-        
-        # Find examples where model is confident but wrong
-        pred_labels = np.argmax(probs, axis=1)
-        wrong = pred_labels != labels
-        confident_wrong = wrong & (true_probs > 0.7)
-        
-        if confident_wrong.sum() == 0:
-            self.confidence_penalty_factor_ = 0.0  # No penalty if no confident wrong predictions
+
+        probs = _softmax(
+            np.asarray(logits, dtype=float) / self.intent_temperature.temperature_
+        )
+        predicted = np.argmax(probs, axis=1)
+        predicted_confidence = probs[np.arange(len(labels)), predicted]
+        wrong = predicted != labels
+        targeted = wrong & (predicted_confidence > self.confidence_penalty_threshold)
+
+        if not targeted.any():
+            self.confidence_penalty_factor_ = 0.0
             return
-        
-        # Learn a penalty factor that reduces confidence on wrong predictions
+
         def penalty_nll(factor: float) -> float:
-            if factor <= 0:
-                return 1e9
+            uniform = np.ones_like(probs) / probs.shape[1]
             penalized = probs.copy()
-            # Reduce confidence on confident wrong predictions
-            penalty_mask = confident_wrong
-            if penalty_mask.any():
-                # Move probabilities toward uniform
-                uniform = np.ones_like(probs) / probs.shape[1]
-                penalized[penalty_mask] = (
-                    (1 - factor) * penalized[penalty_mask] + factor * uniform[penalty_mask]
-                )
-            # Renormalize
-            penalized = penalized / penalized.sum(axis=1, keepdims=True)
-            true_pen_probs = penalized[np.arange(len(labels)), labels]
-            return float(-np.mean(np.log(np.clip(true_pen_probs, 1e-12, 1.0))))
-        
-        from scipy.optimize import minimize_scalar
-        result = minimize_scalar(penalty_nll, bounds=(0.0, self.intent_confidence_penalty), method="bounded")
+            penalized[targeted] = (
+                (1.0 - factor) * penalized[targeted] + factor * uniform[targeted]
+            )
+            penalized = penalized / np.clip(penalized.sum(axis=1, keepdims=True), 1e-12, None)
+            true_probabilities = penalized[np.arange(len(labels)), labels]
+            return float(-np.mean(np.log(np.clip(true_probabilities, 1e-12, 1.0))))
+
+        result = minimize_scalar(
+            penalty_nll, bounds=(0.0, self.intent_confidence_penalty), method="bounded"
+        )
         self.confidence_penalty_factor_ = float(result.x)
-    
+
     def _apply_confidence_penalty(self, probs: np.ndarray) -> np.ndarray:
-        """Apply learned confidence penalty to probability vector."""
-        if not hasattr(self, 'confidence_penalty_factor_') or self.confidence_penalty_factor_ <= 0:
+        """Apply the fitted penalty to predictions the fit was made for.
+
+        The penalty was fitted only on rows whose predicted-class probability
+        exceeded ``confidence_penalty_threshold``, so it is applied only there.
+        Flattening every request toward uniform would penalise well-calibrated
+        confident predictions and inflate calibration error.
+        """
+        factor = float(getattr(self, "confidence_penalty_factor_", 0.0) or 0.0)
+        if factor <= 0.0:
             return probs
-        factor = self.confidence_penalty_factor_
-        if factor <= 0:
-            return probs
-        # Handle both 1D and 2D arrays
         if probs.ndim == 1:
+            if float(np.max(probs)) <= self.confidence_penalty_threshold:
+                return probs
             uniform = np.ones_like(probs) / probs.shape[0]
-            return (1 - factor) * probs + factor * uniform
+            return (1.0 - factor) * probs + factor * uniform
+        confident = np.max(probs, axis=1) > self.confidence_penalty_threshold
+        if not bool(np.any(confident)):
+            return probs
         uniform = np.ones_like(probs) / probs.shape[1]
-        return (1 - factor) * probs + factor * uniform
+        penalized = probs.copy()
+        penalized[confident] = (1.0 - factor) * penalized[confident] + factor * uniform[confident]
+        return penalized / np.clip(penalized.sum(axis=1, keepdims=True), 1e-12, None)
 
     def _prior_vector(self) -> Optional[np.ndarray]:
         """Natural class prior aligned to ``self.classes_`` (None when unset)."""
@@ -1273,8 +1290,7 @@ class DualHeadSupportModel:
         probs = _softmax(logits / self.intent_temperature.temperature_)
         
         # Apply confidence penalty to reduce overconfident wrong predictions
-        if hasattr(self, 'confidence_penalty_factor_') and self.confidence_penalty_factor_ > 0:
-            probs = self._apply_confidence_penalty(probs)
+        probs = self._apply_confidence_penalty(probs)
 
         # Auxiliary heads are only consulted when the admission gate kept them.
         # Each weight below is 0.0 unless a held-out verification half showed a

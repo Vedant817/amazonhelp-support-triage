@@ -146,14 +146,28 @@ roughly 29 accuracy points.
   (`scripts_feature_ab.py`), and the fitted pipeline reaches 0.8170/0.6142 — so
   the feature stack is not the bottleneck and the remaining gap is supervision,
   not capacity. More model will not help; better labels will.
-- **Escalation recall is the safety-critical metric.** On `random` it is 0.927
-  with a 0.822 lower bound; on `temporal` it falls to 0.768 (lower bound 0.657),
-  i.e. **drift breaks the 0.85 target**. Re-deriving the escalation threshold on
-  recent traffic should be treated as a scheduled operation, not a one-off.
-- **The learned escalation score is only weakly informative.** At a 0.70 recall
-  floor its precision is 0.20 against a 0.125 base rate (`random`), and 0.21
-  against 0.151 (`temporal`). The deterministic hard gates carry the safety
-  property; the head mostly adds throughput, not safety.
+- **Escalation recall is the safety-critical metric, and drift breaks its target.**
+  On `random` it is 0.927 with a 0.822 lower bound; on `temporal` it falls to
+  0.768 (lower bound 0.657), below the 0.85 target.
+- **The drift shortfall is not fixable by re-deriving the threshold.** Sweeping
+  every threshold over the temporal run's own risk scores
+  (`scripts_recall_recoverability.py`) shows precision at a 0.85 recall floor is
+  0.186, only **1.23× the base rate**, and it decays to 1.09× at a 0.95 floor. On
+  same-period traffic the same sweep holds **1.42–1.56×** across the whole recall
+  range. The score still reaches the floor, but only by escalating nearly
+  everything — so the *ordering* has decayed, and the fix is retraining or new
+  features. Anyone reaching for a threshold change here would be fixing the
+  wrong thing.
+- **The learned escalation score is modestly informative, not decisive.** Its
+  lift over the base rate is 1.4–1.6× on same-period traffic and 1.1–1.3× under
+  drift. The deterministic hard gates carry the safety property; the head mostly
+  adds throughput.
+- **The recall guarantee costs precision through overshoot.** The threshold is
+  certified so that true recall is ≥0.85 *with 95% confidence*, which on ~250
+  calibration positives means the observed recall runs to 0.95 at a precision of
+  0.163 — against 0.186 at the 0.85 floor. If the operator will accept a
+  point-estimate target rather than a confidence bound, the frontier below is the
+  cheaper operating point. Expose it as policy, not as a fixed constant.
 - **`review` is where the label noise shows.** Deployment accuracy 0.6152 against
   0.8174 on `random` — the active-learning sample is genuinely much harder, and
   the gap is the honest size of the "hard cases" effect.
@@ -189,7 +203,13 @@ Diagnostics used to reach these numbers:
 .\.venv\Scripts\python.exe scripts_score.py --holdout temporal   # drift check
 .\.venv\Scripts\python.exe scripts_score.py                      # hard-case review sample
 .\.venv\Scripts\python.exe scripts_compare_reports.py A.json B.json   # paired comparison
+.\.venv\Scripts\python.exe scripts_recall_recoverability.py models/x.json.rows.csv  # is a recall miss a stale threshold or decayed ranking?
 ```
+
+The recoverability check exists because a recall shortfall has two possible
+causes that call for opposite responses — a stale threshold, or a score that has
+stopped ordering recent traffic — and they are distinguishable by sweeping
+thresholds over the run's own risk scores. It reports which one you have.
 
 `scripts_compare_reports.py` runs McNemar's exact test on the two runs' per-row
 predictions when both are present, because configurations scored on the same rows

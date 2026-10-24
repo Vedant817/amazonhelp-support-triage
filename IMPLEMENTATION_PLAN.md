@@ -12,6 +12,10 @@ set, which is an active-learning sample of the hardest rows in the corpus.
 - **Escalation**: 0.927 recall (one-sided 95% lower bound 0.822), 0.160 precision;
   on the temporal holdout recall falls to 0.768, so drift breaks the 0.85 target
 - **Drift**: temporal holdout 0.845 accuracy / 0.622 macro-F1, deployment accuracy 0.830
+- **Drift diagnosis**: the escalation shortfall is decayed ranking, not a stale
+  threshold — precision at a 0.85 recall floor is only 1.23x the base rate under
+  drift against 1.42-1.56x on same-period traffic (`scripts_recall_recoverability.py`),
+  so the fix is retraining on recent traffic, not a new operating point
 - **Safety**: all seven hard gates verified; guardrail pass rate 1.000; zero PII violations
 - **Test suite**: 285 tests, including an adversarial suite and a security middleware suite
 - **Supervision**: reply-derived labels only (model-generated labels excluded by default,

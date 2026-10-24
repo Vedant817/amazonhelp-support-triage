@@ -103,51 +103,79 @@ smoke script is included for a running server:
 
 ## Scores
 
-Reproduce with `python scripts_score.py` (add `--in-sample` to reuse the served
-pipeline instead of refitting). The runner excludes the 382 review rows from
-training through the leak-guard hook, so the numbers are genuinely held out.
+Reproduce with `python scripts_score.py --holdout {random,temporal,review}`. Each
+protocol writes its own leak-guard file and verifies, twice, that the evaluation
+rows were actually excluded from training; a mismatch aborts the run rather than
+reporting a contaminated score.
 
-| Metric | Value |
-|---|---:|
-| Intent accuracy | 0.4690 |
-| Intent macro-F1 | 0.2660 |
-| Intent macro precision / recall | 0.2838 / 0.2953 |
-| Escalation recall (one-sided 95% lower bound) | 0.9375 (0.8463) |
-| Escalation precision | 0.3814 |
-| Expected calibration error (ECE / MCE) | 0.2352 / 0.6065 |
-| Guardrail pass rate | 1.0000 |
-| Guardrail PII violations | 0 |
-| Resolution-act realization | 1.0000 |
-| 280-character compliance | 1.0000 |
+### Results by protocol
 
-Context for those numbers:
+| Metric | `random` (expected traffic) | `temporal` (drift) | `review` (hardest rows) |
+|---|---:|---:|---:|
+| Evaluation rows | 1,268 | 1,268 | 382 |
+| Intent accuracy | **0.8170** | 0.8446 | 0.5241 |
+| 95% CI | [0.7957, 0.8383] | [0.8249, 0.8636] | [0.4655, 0.5828] |
+| Intent macro-F1 | **0.6142** | 0.6217 | 0.2731 |
+| Intent macro precision / recall | 0.7049 / 0.5637 | 0.6942 / 0.5808 | 0.2998 / 0.2852 |
+| Deployment accuracy (traffic prior) | **0.8174** | 0.8300 | 0.6152 |
+| ECE / MCE | **0.0277 / 0.0956** | 0.0424 / 0.0924 | 0.1848 / 0.5085 |
+| Escalation recall (one-sided 95% lower bound) | 0.9268 (0.8216) | 0.7679 (0.6565) | 0.9375 (0.8463) |
+| Escalation precision | 0.1597 | 0.1972 | 0.3814 |
+| Auto-handle precision / recall | 0.9667 / 0.3031 | 0.9145 / 0.4427 | 0.7000 / 0.0875 |
+| Guardrail pass rate | 1.0000 | 1.0000 | 1.0000 |
+| PII violations | 0 | 0 | 0 |
+| Resolution-act realization | 1.0000 | 1.0000 | 1.0000 |
+| 280-character compliance | 1.0000 | 1.0000 | 1.0000 |
+
+**Read the `random` column as the headline.** The `review` column is the hardest
+382 rows in the corpus, so it is a floor, not an expectation, and quoting it
+alone — as an earlier revision of this file did — understates the system by
+roughly 29 accuracy points.
+
+### How to read these numbers
 
 - **The reference labels are weak supervision**, derived from historical agent
-  replies, not independent human judgement. They measure agreement with the
-  supervision signal, not ground truth.
-- **The review sample is stratified** (54.5% `ORDER_TRACKING_AND_DELAY`) while
-  real traffic is ~68.7%. Reweighting per-class recall by the traffic prior
-  gives a deployment-representative accuracy of **0.5277**; the runner prints
-  both figures.
-- **The model is at the measured ceiling for this label set.** A plain
-  TF-IDF + logistic-regression recipe reaches 0.8106 cross-validated accuracy on
-  these labels (`scripts_ceiling.py`); the fitted pipeline reaches 0.8069
-  cross-validated macro-F1, so the remaining gap is supervision quality rather
-  than model capacity.
-- **Escalation recall is the safety-critical metric** and is carried by the
-  deterministic hard gates, which is why it stays at 0.94 while intent accuracy
-  is limited by the labels.
+  replies by rule, not independent human judgement. They measure agreement with
+  the supervision signal, not ground truth.
+- **The labels describe the agent's reply, not the customer's intent**, and the
+  model only ever sees the customer message. A damage complaint answered with
+  refund language is labelled `REFUND_AND_RETURN`. Part of every label is
+  unlearnable by construction, which is the dominant term in the remaining error.
+- **The model is at the measured ceiling for this label set.** A plain TF-IDF +
+  logistic-regression recipe reaches 0.8289/0.6414 on the same corpus
+  (`scripts_feature_ab.py`), and the fitted pipeline reaches 0.8170/0.6142 — so
+  the feature stack is not the bottleneck and the remaining gap is supervision,
+  not capacity. More model will not help; better labels will.
+- **Escalation recall is the safety-critical metric.** On `random` it is 0.927
+  with a 0.822 lower bound; on `temporal` it falls to 0.768 (lower bound 0.657),
+  i.e. **drift breaks the 0.85 target**. Re-deriving the escalation threshold on
+  recent traffic should be treated as a scheduled operation, not a one-off.
+- **The learned escalation score is only weakly informative.** At a 0.70 recall
+  floor its precision is 0.20 against a 0.125 base rate (`random`), and 0.21
+  against 0.151 (`temporal`). The deterministic hard gates carry the safety
+  property; the head mostly adds throughput, not safety.
+- **`review` is where the label noise shows.** Deployment accuracy 0.6152 against
+  0.8174 on `random` — the active-learning sample is genuinely much harder, and
+  the gap is the honest size of the "hard cases" effect.
 
-What moved the score from 0.31 to 0.47 accuracy (each change is measured, not
-assumed):
+### What moved the numbers
 
-| Change | Why |
+Each change is measured, not assumed. Several were fixes to *measurement*, and
+the modelling "wins" they replaced were not real.
+
+| Change | Effect |
 |---|---|
-| Fitted a deployment-prior correction on the calibration split | Balanced training produced a uniform prior; traffic is 69% one class |
-| Split before capping/balancing | The calibration slice was itself flattened, so the correction could not be selected |
-| Kept the natural class distribution for training | Balancing discarded ~80% of the dominant class's evidence |
-| Widened the C search to 32 | The optimum sits near C=8-30; the grid stopped at 4 |
-| Disabled class reweighting | Redundant once the prior is restored: +0.010 accuracy, -0.05 ECE for -0.0001 macro-F1 |
+| Nested blend admission with a paired-bootstrap gate | The prototype head held 0.6 of the final probability, fitted to calibration noise; now rejected outright. ECE 0.288 → 0.028 |
+| Excluded model-generated labels from supervision | 40% of intent labels were produced by an earlier model trained on the same reply-derived labels, so they scored 0.898 out-of-fold against 0.643. Accuracy +0.024, precision +0.060 |
+| Fit and serve the same confidence penalty | It fitted on untempered probabilities, selected rows by a quantity unavailable in production, and treated `0` as maximum rather than no penalty |
+| Disabled class reweighting | Redundant once the deployment prior is restored: +0.010 accuracy, −0.05 ECE for −0.0001 macro-F1 |
+| Widened the C search to 32 | The optimum sits at C=8–32; the grid stopped at 4 |
+| Kept the natural class distribution | Balancing discarded ~80% of the dominant class's evidence |
+| Split before capping/balancing | The calibration slice was itself flattened, so prior correction could not be selected |
+
+On the `review` protocol — the only protocol measured before and after — accuracy
+went 0.4690 → 0.5241, deployment accuracy 0.5277 → 0.6152, and ECE
+0.2352 → 0.1848.
 
 Diagnostics used to reach these numbers:
 
@@ -160,8 +188,13 @@ Diagnostics used to reach these numbers:
 .\.venv\Scripts\python.exe scripts_score.py --holdout random     # deployment-representative
 .\.venv\Scripts\python.exe scripts_score.py --holdout temporal   # drift check
 .\.venv\Scripts\python.exe scripts_score.py                      # hard-case review sample
-.\.venv\Scripts\python.exe scripts_compare_reports.py A.json B.json
+.\.venv\Scripts\python.exe scripts_compare_reports.py A.json B.json   # paired comparison
 ```
+
+`scripts_compare_reports.py` runs McNemar's exact test on the two runs' per-row
+predictions when both are present, because configurations scored on the same rows
+must be compared as paired data: most rows are easy and both systems get them
+right, so they say nothing about which is better.
 
 Tuning knobs (each participates in the cache fingerprint, so variants cache
 separately):

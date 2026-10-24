@@ -8,8 +8,10 @@ excluded from training. `--holdout review` scores the 382-row checked-in review
 set, which is an active-learning sample of the hardest rows in the corpus.
 
 - **Core pipeline**: working (intent classification, escalation, retrieval, generation, guardrails)
-- **Intent**: 0.817 accuracy, 0.614 macro-F1, 0.705 macro precision, ECE 0.039
-- **Escalation**: 0.927 recall (one-sided 95% lower bound 0.822), 0.160 precision
+- **Intent**: 0.817 accuracy, 0.614 macro-F1, 0.705 macro precision, ECE 0.028
+- **Escalation**: 0.927 recall (one-sided 95% lower bound 0.822), 0.160 precision;
+  on the temporal holdout recall falls to 0.768, so drift breaks the 0.85 target
+- **Drift**: temporal holdout 0.845 accuracy / 0.622 macro-F1, deployment accuracy 0.830
 - **Safety**: all seven hard gates verified; guardrail pass rate 1.000; zero PII violations
 - **Test suite**: 285 tests, including an adversarial suite and a security middleware suite
 - **Supervision**: reply-derived labels only (model-generated labels excluded by default,

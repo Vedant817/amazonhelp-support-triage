@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import numpy as np
-from scipy.optimize import minimize_scalar
+from scipy.optimize import minimize, minimize_scalar
 from scipy.stats import beta
 from scipy.sparse import csr_matrix, hstack
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -396,6 +396,19 @@ class DualHeadSupportModel:
         self.semantic_temperature = TemperatureScaler()
         self.semantic_blend_weight_ = 0.0
         self.semantic_blend_nll_gain_ = 0.0
+        # Blend admission is decided on a held-out `verify` half, never on the
+        # rows used to choose the weights. Rejected blends keep weight 0 and cost
+        # nothing at inference time.
+        self.semantic_blend_accepted_ = False
+        self.semantic_blend_verification_: Dict[str, Any] = {}
+        self.prototype_blend_accepted_ = False
+        self.prototype_blend_verification_: Dict[str, Any] = {}
+        self.ensemble_blend_accepted_ = False
+        self.ensemble_blend_verification_: Dict[str, Any] = {}
+        self.ensemble_blend_gain_ = 0.0
+        self.ensemble_hybrid_weight_ = 1.0
+        self.ensemble_semantic_weight_ = 0.0
+        self.ensemble_prototype_weight_ = 0.0
         self.intent_selected_c_ = 1.0
         self.intent_cv_macro_f1_ = 0.0
         self.escalation_selected_c_ = 0.5
@@ -538,7 +551,9 @@ class DualHeadSupportModel:
         self._fit_confidence_penalty(cal_intent_logits, numeric_labels)
         cal_semantic_logits = self.semantic_head.decision_function(cal_intent_embeddings)
         self.semantic_temperature.fit_multiclass(cal_semantic_logits, numeric_labels)
-        self._fit_semantic_blend(cal_intent_logits, cal_semantic_logits, numeric_labels)
+        self._fit_semantic_blend(
+            cal_intent_logits, cal_semantic_logits, numeric_labels, cal_intent_labels
+        )
         self._fit_prototype_ensemble(
             intent_embeddings[intent_keep],
             np.asarray(intent_labels)[intent_keep],
@@ -924,30 +939,204 @@ class DualHeadSupportModel:
             return np.asarray(best[3], dtype=float)
         return base
 
+    # ------------------------------------------------------------------ blending
+    #
+    # Every auxiliary head below (semantic, prototype, three-way ensemble) is a
+    # *candidate* that may or may not be allowed to influence serving. The
+    # protocol is the same everywhere:
+    #
+    #   1. split the calibration slice into a `select` half and a `verify` half,
+    #      stratified so rare classes appear on both sides;
+    #   2. choose blend weights on `select` by minimising log loss, which is a
+    #      proper scoring rule and varies smoothly with the weights;
+    #   3. re-score the chosen weights on `verify` and admit them only if they
+    #      beat the hybrid head beyond sampling noise in a paired bootstrap.
+    #
+    # The previous implementation instead took the argmax of up to 112 candidate
+    # weightings on a single ~1700-row split, ranked by macro-F1, whose standard
+    # error there is about 0.01 — an order of magnitude larger than the 0.001
+    # gain the gate required. Acceptance was therefore close to automatic and
+    # the weights fitted calibration noise. That is how a nearest-centroid head
+    # over 384-dimensional MiniLM embeddings came to carry 0.6 of the final
+    # probability while the much stronger lexical head carried 0.4.
+
+    def _mean_nll(self, probabilities: np.ndarray, truth_indices: np.ndarray) -> float:
+        rows = np.arange(len(truth_indices))
+        return float(-np.mean(np.log(np.clip(probabilities[rows, truth_indices], 1e-12, 1.0))))
+
+    def _label_indices(self, labels: Sequence[str]) -> np.ndarray:
+        class_to_index = {label: index for index, label in enumerate(self.classes_)}
+        unknown = object()
+        return np.asarray(
+            [class_to_index.get(label, class_to_index.get(str(label), -1)) for label in labels],
+            dtype=int,
+        )
+
+    def _probability_predictions(self, probabilities: np.ndarray) -> np.ndarray:
+        return np.asarray(self.classes_, dtype=object)[np.argmax(probabilities, axis=1)]
+
+    @staticmethod
+    def _blend_weights_from_theta(theta: np.ndarray) -> np.ndarray:
+        """Simplex weights from unconstrained parameters (last component pinned)."""
+        raw = np.concatenate([np.asarray(theta, dtype=float), np.zeros(1)])
+        shifted = raw - raw.max()
+        weights = np.exp(shifted)
+        return weights / weights.sum()
+
+    def _minimum_nll_weights(
+        self, components: Sequence[np.ndarray], truth_indices: np.ndarray
+    ) -> Optional[np.ndarray]:
+        """Convex combination of probability matrices with the lowest log loss."""
+        stack = np.stack([np.asarray(component, dtype=float) for component in components], axis=0)
+        n_components = stack.shape[0]
+        if n_components < 2 or stack.shape[1] == 0:
+            return None
+        rows = np.arange(stack.shape[1])
+
+        def nll_for_weights(weights: np.ndarray) -> float:
+            blended = np.tensordot(weights, stack, axes=(0, 0))
+            return float(-np.mean(np.log(np.clip(blended[rows, truth_indices], 1e-12, 1.0))))
+
+        if n_components == 2:
+
+            def scalar_nll(weight: float) -> float:
+                return nll_for_weights(np.asarray([1.0 - weight, weight]))
+
+            # Bounded scalar search is exact enough here and mirrors the shape of
+            # the problem; a smooth 1-D objective has no local minima to escape.
+            coarse = [
+                (scalar_nll(weight), weight) for weight in np.linspace(0.0, 1.0, 21)
+            ]
+            _, start = min(coarse)
+            result = minimize_scalar(
+                scalar_nll, bounds=(max(0.0, start - 0.1), min(1.0, start + 0.1)), method="bounded"
+            )
+            return np.asarray([1.0 - float(result.x), float(result.x)])
+
+        result = minimize(
+            lambda theta: nll_for_weights(self._blend_weights_from_theta(theta)),
+            np.zeros(n_components - 1),
+            method="Nelder-Mead",
+            options={"maxiter": 4000, "xatol": 1e-4, "fatol": 1e-9},
+        )
+        return self._blend_weights_from_theta(result.x)
+
+    def _calibration_split(
+        self, calibration_labels: Sequence[str], verify_fraction: float = 0.4, seed: int = 42
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Stratified select/verify split of the calibration slice."""
+        labels = np.asarray(calibration_labels, dtype=object)
+        rng = np.random.default_rng(seed)
+        select_index: List[int] = []
+        verify_index: List[int] = []
+        for label in np.unique(labels):
+            indices = rng.permutation(np.flatnonzero(labels == label))
+            cut = int(round(len(indices) * verify_fraction))
+            if len(indices) >= 2:
+                cut = min(max(cut, 1), len(indices) - 1)
+            verify_index.extend(indices[:cut].tolist())
+            select_index.extend(indices[cut:].tolist())
+        return np.asarray(sorted(select_index)), np.asarray(sorted(verify_index))
+
+    def _bootstrap_gain(
+        self,
+        candidate_predictions: np.ndarray,
+        baseline_predictions: np.ndarray,
+        truth: np.ndarray,
+        n_resamples: int = 200,
+        seed: int = 0,
+    ) -> tuple[float, float]:
+        """Paired bootstrap of the macro-F1 difference (candidate − baseline)."""
+        rng = np.random.default_rng(seed)
+        n_rows = len(truth)
+        if n_rows == 0:
+            return 0.0, 0.0
+        gains = np.empty(n_resamples, dtype=float)
+        for index in range(n_resamples):
+            sample = rng.integers(0, n_rows, size=n_rows)
+            gains[index] = float(
+                f1_score(truth[sample], candidate_predictions[sample], average="macro", zero_division=0)
+            ) - float(
+                f1_score(truth[sample], baseline_predictions[sample], average="macro", zero_division=0)
+            )
+        return float(gains.mean()), float((gains > 0).mean())
+
+    def _verify_blend(
+        self,
+        candidate_probabilities: np.ndarray,
+        baseline_probabilities: np.ndarray,
+        truth: np.ndarray,
+        win_rate_floor: float = 0.90,
+    ) -> Dict[str, Any]:
+        """Decide whether a blend may influence serving.
+
+        Admission requires a strictly positive mean macro-F1 gain that also wins
+        in at least ``win_rate_floor`` of paired bootstrap resamples. A blend
+        that only ties the baseline is rejected, because blending a weak head
+        into a strong one costs calibration even when argmax labels tie.
+        """
+        candidate_predictions = self._probability_predictions(candidate_probabilities)
+        baseline_predictions = self._probability_predictions(baseline_probabilities)
+        mean_gain, win_rate = self._bootstrap_gain(
+            candidate_predictions, baseline_predictions, truth
+        )
+        baseline_accuracy = float(np.mean(baseline_predictions == truth))
+        candidate_accuracy = float(np.mean(candidate_predictions == truth))
+        accepted = bool(mean_gain > 0.0 and win_rate >= win_rate_floor)
+        return {
+            "accepted": accepted,
+            "mean_macro_f1_gain": mean_gain,
+            "bootstrap_win_rate": win_rate,
+            "baseline_macro_f1": float(
+                f1_score(truth, baseline_predictions, average="macro", zero_division=0)
+            ),
+            "candidate_macro_f1": float(
+                f1_score(truth, candidate_predictions, average="macro", zero_division=0)
+            ),
+            "baseline_accuracy": baseline_accuracy,
+            "candidate_accuracy": candidate_accuracy,
+        }
+
     def _fit_semantic_blend(
         self,
         hybrid_logits: np.ndarray,
         semantic_logits: np.ndarray,
         numeric_labels: Sequence[int],
+        calibration_labels: Optional[Sequence[str]] = None,
     ) -> None:
         hybrid = _softmax(np.asarray(hybrid_logits) / self.intent_temperature.temperature_)
         semantic = _softmax(
             np.asarray(semantic_logits) / self.semantic_temperature.temperature_
         )
-        labels = np.asarray(numeric_labels, dtype=int)
+        if calibration_labels is None:
+            labels = np.asarray(self.classes_, dtype=object)[np.asarray(numeric_labels, dtype=int)]
+        else:
+            labels = np.asarray(calibration_labels, dtype=object)
+        select_index, verify_index = self._calibration_split(labels)
+        truth_index = self._label_indices(labels)
+        if len(select_index) == 0 or len(verify_index) == 0:
+            return
 
-        def nll(weight: float) -> float:
-            probabilities = (1.0 - weight) * hybrid + weight * semantic
-            return float(-np.mean(np.log(np.clip(
-                probabilities[np.arange(len(labels)), labels], 1e-12, 1.0
-            ))))
-
-        baseline = nll(0.0)
-        result = minimize_scalar(nll, bounds=(0.0, 1.0), method="bounded")
-        gain = baseline - float(result.fun)
-        if gain > 1e-4:
-            self.semantic_blend_weight_ = float(result.x)
-            self.semantic_blend_nll_gain_ = gain
+        weights = self._minimum_nll_weights(
+            [hybrid[select_index], semantic[select_index]], truth_index[select_index]
+        )
+        if weights is None:
+            return
+        self.semantic_blend_nll_gain_ = self._mean_nll(
+            hybrid[select_index], truth_index[select_index]
+        ) - self._mean_nll(
+            weights[0] * hybrid[select_index] + weights[1] * semantic[select_index],
+            truth_index[select_index],
+        )
+        verification = self._verify_blend(
+            weights[0] * hybrid[verify_index] + weights[1] * semantic[verify_index],
+            hybrid[verify_index],
+            labels[verify_index],
+        )
+        self.semantic_blend_verification_ = verification
+        self.semantic_blend_accepted_ = verification["accepted"]
+        if verification["accepted"]:
+            self.semantic_blend_weight_ = float(weights[1])
 
     def _prototype_probabilities(
         self, embeddings: np.ndarray, temperature: Optional[float] = None
@@ -965,35 +1154,69 @@ class DualHeadSupportModel:
         calibration_labels: Sequence[str],
         calibration_logits: np.ndarray,
     ) -> None:
-        """Learn semantic class prototypes and a conservative blend on holdout data."""
+        """Learn semantic class prototypes, then admit a blend only on evidence."""
         labels = np.asarray(train_labels, dtype=object)
         prototypes = []
         for class_name in self.classes_:
-            centroid = np.mean(train_embeddings[labels == class_name], axis=0)
+            members = labels == class_name
+            if not bool(np.any(members)):
+                prototypes.append(np.zeros(train_embeddings.shape[1], dtype=np.float32))
+                continue
+            centroid = np.mean(train_embeddings[members], axis=0)
             norm = np.linalg.norm(centroid)
             prototypes.append(centroid / norm if norm else centroid)
         self.intent_prototypes_ = np.asarray(prototypes, dtype=np.float32)
-        logistic = _softmax(
+
+        truth = np.asarray(calibration_labels, dtype=object)
+        select_index, verify_index = self._calibration_split(truth)
+        if len(select_index) == 0 or len(verify_index) == 0:
+            return
+        truth_index = self._label_indices(truth)
+        hybrid = _softmax(
             np.asarray(calibration_logits) / self.intent_temperature.temperature_
         )
-        truth = np.asarray(calibration_labels, dtype=object)
-        class_values = np.asarray(self.classes_, dtype=object)
-        baseline_pred = class_values[np.argmax(logistic, axis=1)]
-        baseline = float(f1_score(truth, baseline_pred, average="macro", zero_division=0))
-        best = (baseline, 0.0, self.prototype_temperature_)
+
+        # The temperature sets how sharp the nearest-prototype distribution is,
+        # so it has to be chosen jointly with the blend weight — but only on the
+        # select half, never on the half used to accept or reject the blend.
+        best: Optional[tuple[float, np.ndarray, float]] = None
         for temperature in (0.03, 0.05, 0.08, 0.1, 0.15, 0.2, 0.3, 0.5):
             prototype = self._prototype_probabilities(calibration_embeddings, temperature)
-            for weight in np.arange(0.05, 0.71, 0.05):
-                blended = (1.0 - weight) * logistic + weight * prototype
-                predicted = class_values[np.argmax(blended, axis=1)]
-                score = float(f1_score(truth, predicted, average="macro", zero_division=0))
-                candidate = (score, -float(weight), float(temperature))
-                if candidate > (best[0], -best[1], best[2]):
-                    best = (score, float(weight), float(temperature))
-        self.prototype_calibration_gain_ = max(0.0, best[0] - baseline)
-        if self.prototype_calibration_gain_ >= self.minimum_auxiliary_macro_f1_gain:
-            self.prototype_blend_weight_ = best[1]
-            self.prototype_temperature_ = best[2]
+            weights = self._minimum_nll_weights(
+                [hybrid[select_index], prototype[select_index]], truth_index[select_index]
+            )
+            if weights is None:
+                continue
+            nll = self._mean_nll(
+                weights[0] * hybrid[select_index] + weights[1] * prototype[select_index],
+                truth_index[select_index],
+            )
+            candidate = (nll, weights, float(temperature))
+            if best is None or candidate[0] < best[0]:
+                best = candidate
+        if best is None:
+            return
+
+        _, weights, temperature = best
+        selected = self._prototype_probabilities(calibration_embeddings, temperature)
+        self.prototype_temperature_ = temperature
+        self.prototype_calibration_gain_ = max(
+            0.0,
+            self._mean_nll(hybrid[select_index], truth_index[select_index])
+            - self._mean_nll(
+                weights[0] * hybrid[select_index] + weights[1] * selected[select_index],
+                truth_index[select_index],
+            ),
+        )
+        verification = self._verify_blend(
+            weights[0] * hybrid[verify_index] + weights[1] * selected[verify_index],
+            hybrid[verify_index],
+            truth[verify_index],
+        )
+        self.prototype_blend_verification_ = verification
+        self.prototype_blend_accepted_ = verification["accepted"]
+        if verification["accepted"]:
+            self.prototype_blend_weight_ = float(weights[1])
 
     def _fit_ensemble_blend(
         self,
@@ -1001,36 +1224,47 @@ class DualHeadSupportModel:
         calibration_labels: Sequence[str],
         calibration_logits: np.ndarray,
     ) -> None:
-        """Fit a 3-way ensemble: hybrid + semantic + prototype."""
+        """Fit a 3-way ensemble: hybrid + semantic + prototype (admission gated)."""
+        if self.intent_prototypes_ is None:
+            return
         hybrid = _softmax(np.asarray(calibration_logits) / self.intent_temperature.temperature_)
         semantic_logits = self.semantic_head.decision_function(calibration_embeddings)
         semantic = _softmax(semantic_logits / self.semantic_temperature.temperature_)
-        prototype = self._prototype_probabilities(calibration_embeddings, self.prototype_temperature_)
+        prototype = self._prototype_probabilities(
+            calibration_embeddings, self.prototype_temperature_
+        )
         truth = np.asarray(calibration_labels, dtype=object)
-        class_values = np.asarray(self.classes_, dtype=object)
-        
-        baseline_pred = class_values[np.argmax(hybrid, axis=1)]
-        baseline = float(f1_score(truth, baseline_pred, average="macro", zero_division=0))
-        
-        best = (baseline, 1.0, 0.0, 0.0)  # Start with baseline (hybrid only)
-        # Search over 3-way blend weights, including baseline
-        for w1 in np.arange(0.0, 1.01, 0.1):
-            for w2 in np.arange(0.0, 1.01 - w1, 0.1):
-                w3 = 1.0 - w1 - w2
-                if w3 < 0:
-                    continue
-                blended = w1 * hybrid + w2 * semantic + w3 * prototype
-                predicted = class_values[np.argmax(blended, axis=1)]
-                score = float(f1_score(truth, predicted, average="macro", zero_division=0))
-                candidate = (score, -w1, -w2, -w3)
-                if candidate > (best[0], -best[1], -best[2], -best[3]):
-                    best = (score, float(w1), float(w2), float(w3))
-        
-        self.ensemble_blend_gain_ = max(0.0, best[0] - baseline)
-        if self.ensemble_blend_gain_ >= self.minimum_auxiliary_macro_f1_gain:
-            self.ensemble_hybrid_weight_ = best[1]
-            self.ensemble_semantic_weight_ = best[2]
-            self.ensemble_prototype_weight_ = best[3]
+        select_index, verify_index = self._calibration_split(truth)
+        if len(select_index) == 0 or len(verify_index) == 0:
+            return
+        truth_index = self._label_indices(truth)
+
+        weights = self._minimum_nll_weights(
+            [hybrid[select_index], semantic[select_index], prototype[select_index]],
+            truth_index[select_index],
+        )
+        if weights is None:
+            return
+
+        def blend(indices: np.ndarray) -> np.ndarray:
+            return (
+                weights[0] * hybrid[indices]
+                + weights[1] * semantic[indices]
+                + weights[2] * prototype[indices]
+            )
+
+        self.ensemble_blend_gain_ = max(
+            0.0,
+            self._mean_nll(hybrid[select_index], truth_index[select_index])
+            - self._mean_nll(blend(select_index), truth_index[select_index]),
+        )
+        verification = self._verify_blend(blend(verify_index), hybrid[verify_index], truth[verify_index])
+        self.ensemble_blend_verification_ = verification
+        self.ensemble_blend_accepted_ = verification["accepted"]
+        if verification["accepted"]:
+            self.ensemble_hybrid_weight_ = float(weights[0])
+            self.ensemble_semantic_weight_ = float(weights[1])
+            self.ensemble_prototype_weight_ = float(weights[2])
 
     def _intent_view(self, text: str) -> Dict[str, Any]:
         embedding = self.encoder.encode([text])
@@ -1041,43 +1275,48 @@ class DualHeadSupportModel:
         # Apply confidence penalty to reduce overconfident wrong predictions
         if hasattr(self, 'confidence_penalty_factor_') and self.confidence_penalty_factor_ > 0:
             probs = self._apply_confidence_penalty(probs)
-        
-        # Use ensemble blending if available and beneficial
-        if hasattr(self, 'ensemble_blend_gain_') and self.ensemble_blend_gain_ >= self.minimum_auxiliary_macro_f1_gain:
-            if self.semantic_blend_weight_ > 0.0:
-                semantic_logits = self.semantic_head.decision_function(embedding)
+
+        # Auxiliary heads are only consulted when the admission gate kept them.
+        # Each weight below is 0.0 unless a held-out verification half showed a
+        # positive paired-bootstrap gain over the hybrid head.
+        semantic_probs: Optional[np.ndarray] = None
+        prototype_probs: Optional[np.ndarray] = None
+
+        def semantic_view() -> np.ndarray:
+            nonlocal semantic_probs
+            if semantic_probs is None:
                 semantic_probs = _softmax(
-                    semantic_logits / self.semantic_temperature.temperature_
+                    self.semantic_head.decision_function(embedding)
+                    / self.semantic_temperature.temperature_
                 )[0]
-            else:
-                semantic_probs = probs.copy()
-            if self.intent_prototypes_ is not None and self.prototype_blend_weight_ > 0.0:
+            return semantic_probs
+
+        def prototype_view() -> np.ndarray:
+            nonlocal prototype_probs
+            if prototype_probs is None:
                 prototype_probs = self._prototype_probabilities(embedding)[0]
-            else:
-                prototype_probs = probs.copy()
-            
-            # 3-way ensemble blend
+            return prototype_probs
+
+        if self.ensemble_blend_accepted_:
             probs = (
                 self.ensemble_hybrid_weight_ * probs
-                + self.ensemble_semantic_weight_ * semantic_probs
-                + self.ensemble_prototype_weight_ * prototype_probs
+                + self.ensemble_semantic_weight_ * semantic_view()
+                + self.ensemble_prototype_weight_ * prototype_view()
             )
         else:
-            # Fallback to original blending
-            if self.semantic_blend_weight_ > 0.0:
-                semantic_logits = self.semantic_head.decision_function(embedding)
-                semantic_probs = _softmax(
-                    semantic_logits / self.semantic_temperature.temperature_
-                )[0]
+            if self.semantic_blend_accepted_ and self.semantic_blend_weight_ > 0.0:
                 probs = (
                     (1.0 - self.semantic_blend_weight_) * probs
-                    + self.semantic_blend_weight_ * semantic_probs
+                    + self.semantic_blend_weight_ * semantic_view()
                 )
-            if self.intent_prototypes_ is not None and self.prototype_blend_weight_ > 0.0:
-                prototype_probs = self._prototype_probabilities(embedding)[0]
+            if (
+                self.prototype_blend_accepted_
+                and self.intent_prototypes_ is not None
+                and self.prototype_blend_weight_ > 0.0
+            ):
                 probs = (
                     (1.0 - self.prototype_blend_weight_) * probs
-                    + self.prototype_blend_weight_ * prototype_probs
+                    + self.prototype_blend_weight_ * prototype_view()
                 )
 
         # Average in bootstrap-aggregated heads (admitted on a calibration gain).

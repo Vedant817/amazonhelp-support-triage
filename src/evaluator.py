@@ -338,6 +338,58 @@ class SupportPipelineEvaluator:
             "cost_error_leak": cost_error_leak,
             "cost_curve": curve
         }
+
+    @staticmethod
+    def precision_at_recall_frontier(
+        y_true_esc: Sequence[bool],
+        risk_scores: Sequence[float],
+        recall_floors: Sequence[float] = (0.70, 0.80, 0.85, 0.90, 0.95, 1.00),
+    ) -> List[Dict[str, float]]:
+        """Highest precision achievable at each recall floor.
+
+        A single operating point hides the trade-off, and for a safety-critical
+        route the useful question is not "what is precision" but "what precision
+        can this model hold while still catching X% of escalations". Each row
+        reports the most precise threshold whose recall still meets the floor, so
+        the gap between rows is exactly what the model buys per point of recall.
+        """
+        truth = np.asarray(y_true_esc, dtype=bool)
+        scores = np.asarray(risk_scores, dtype=float)
+        positives = int(truth.sum())
+        if positives == 0:
+            return []
+        candidates = np.unique(np.concatenate(([0.0], scores, [1.0])))
+        frontier: List[Dict[str, float]] = []
+        for floor in recall_floors:
+            best_precision = 0.0
+            best_threshold = 1.0
+            best_recall = 1.0
+            reached = False
+            for threshold in candidates:
+                predicted = scores >= threshold
+                tp = int(np.sum(predicted & truth))
+                fp = int(np.sum(predicted & ~truth))
+                recall = tp / positives
+                if recall + 1e-12 < floor:
+                    continue
+                reached = True
+                precision = tp / max(tp + fp, 1)
+                # Among thresholds meeting the floor, prefer precision, then the
+                # highest threshold (fewest escalations) to break ties upward.
+                if (precision, threshold) > (best_precision, best_threshold):
+                    best_precision = precision
+                    best_threshold = float(threshold)
+                    best_recall = recall
+            frontier.append({
+                "recall_floor": float(floor),
+                "reached": bool(reached),
+                "threshold": round(best_threshold, 4),
+                "precision": round(best_precision, 4),
+                "recall": round(best_recall, 4),
+                "escalations": None,
+            })
+        return frontier
+
     @staticmethod
     def paired_mcnemar(
         truth: Sequence[Any], predictions_a: Sequence[Any], predictions_b: Sequence[Any]

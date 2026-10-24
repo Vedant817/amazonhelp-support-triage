@@ -8,7 +8,7 @@ import hmac
 import json
 import os
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import pandas as pd
 import joblib
@@ -113,6 +113,38 @@ def _write_cache_with_manifest(artifacts: "PipelineArtifacts", cache_file: Path)
     digest = _file_sha256(cache_file)
     manifest = cache_file.with_suffix(cache_file.suffix + ".sha256")
     manifest.write_text(f"{digest}  {cache_file.name}\n", encoding="utf-8")
+    _prune_pipeline_caches(cache_file.parent, keep=cache_file.name)
+
+
+def _prune_pipeline_caches(directory: Path, keep: str, retain: int = 3) -> List[str]:
+    """Delete stale pipeline caches, keeping the newest ``retain`` plus ``keep``.
+
+    The fingerprint changes whenever configuration, supervision or source changes,
+    so normal experimentation silently accumulates one ~42 MB artifact per
+    permutation — twelve were sitting in this repository before the policy
+    existed. Eviction is by modification time, failures are ignored (another
+    process may hold a file open, which Windows refuses to unlink), and the
+    manifest is removed alongside its cache so a half-deleted pair can never
+    look trusted.
+    """
+    try:
+        candidates = [
+            path
+            for path in directory.glob("pipeline-*.joblib")
+            if path.name != keep and not path.is_symlink()
+        ]
+    except OSError:
+        return []
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    removed: List[str] = []
+    for stale in candidates[max(0, retain - 1):]:
+        try:
+            stale.unlink()
+            stale.with_suffix(stale.suffix + ".sha256").unlink(missing_ok=True)
+            removed.append(stale.name)
+        except OSError:
+            continue
+    return removed
 
 
 def _cap_per_class(frame: pd.DataFrame, label_column: str, cap: int, seed: int) -> pd.DataFrame:
@@ -201,6 +233,7 @@ def build_learned_pipeline(
             "context_gate": True,
             "balance_intent_classes": True,
             "max_ratio": os.getenv("SUPPORT_INTENT_BALANCE_RATIO", "0.0"),
+            "use_probabilistic_labels": os.getenv("SUPPORT_USE_PROBABILISTIC_LABELS", "1"),
             "confidence_penalty": 0.05,
             "runtime": _runtime_signature(),
             "seed": seed,
@@ -240,8 +273,16 @@ def build_learned_pipeline(
     reviewed = None
     if reviewed_csv and Path(reviewed_csv).exists():
         reviewed = pd.read_csv(reviewed_csv)
+    # Model-generated intent labels score ~0.90 out-of-fold against ~0.64 for
+    # reply-derived labels, i.e. they are largely reproducible from the features
+    # the model already sees. They are therefore close to information-free and
+    # inflate any score computed over a label set that contains them, so whether
+    # to train on them is a measured choice rather than an assumption. See
+    # scripts_cv_audit.py and SUPPORT_USE_PROBABILISTIC_LABELS.
+    _requested_prob_labels = os.getenv("SUPPORT_USE_PROBABILISTIC_LABELS", "1").strip().lower()
+    use_probabilistic_labels = _requested_prob_labels not in {"0", "false", "no", "off"}
     supervision = build_reply_supervision(
-        pairs, reviewed, use_probabilistic_intent_labels=True
+        pairs, reviewed, use_probabilistic_intent_labels=use_probabilistic_labels
     )
 
     intent_rows = supervision[supervision["intent_label"].notna()].copy()

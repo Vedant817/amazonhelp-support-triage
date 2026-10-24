@@ -95,6 +95,8 @@ def main() -> int:
     parser.add_argument("--random-fraction", type=float, default=0.15,
                         help="Fraction of labelled rows to hold out in random mode")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--report", default=REPORT_JSON,
+                        help="Where to write the JSON report (parallel runs need distinct paths)")
     args = parser.parse_args()
 
     if args.holdout == "random":
@@ -244,6 +246,10 @@ def main() -> int:
         [t for t in rows["esc_true"] if t is not None],
         [r for r, t in zip(rows["esc_risk"], rows["esc_true"]) if t is not None],
     )
+    escalation_frontier = evaluator.precision_at_recall_frontier(
+        [t for t in rows["esc_true"] if t is not None],
+        [r for r, t in zip(rows["esc_risk"], rows["esc_true"]) if t is not None],
+    )
 
     # ------------------------------------------------------------------ baselines
     baseline_true = [t for t, p in zip(rows["intent_true"], rows["baseline_tfidf_pred"]) if t and p]
@@ -285,6 +291,22 @@ def main() -> int:
             ],
             "context_gate_confidence": float(getattr(model, "context_gate_confidence_", 0.0)),
             "intent_labels_pruned": int(getattr(model, "intent_pruned_count_", 0)),
+            "blend_admission": {
+                name: {
+                    "accepted": bool(getattr(model, f"{name}_accepted_", False)),
+                    **{
+                        key: round(float(value), 4)
+                        for key, value in (getattr(model, f"{name}_verification_", None) or {}).items()
+                        if isinstance(value, (int, float))
+                    },
+                }
+                for name in ("semantic_blend", "prototype_blend", "ensemble_blend")
+            },
+            "intent_bagging": {
+                "accepted": bool(getattr(model, "intent_bagging_accepted_", False)),
+                "calibration_gain": float(getattr(model, "intent_bagging_gain_", 0.0)),
+                "heads": len(getattr(model, "intent_bagging_heads_", []) or []),
+            },
         },
         "intent": intent_metrics,
         "intent_ci": intent_ci,
@@ -294,6 +316,7 @@ def main() -> int:
         "coverage_curve": coverage,
         "reply": reply_metrics,
         "cost_optimal": {k: cost[k] for k in ("optimal_threshold", "minimum_loss")},
+        "escalation_recall_frontier": escalation_frontier,
         "baselines": {
             "majority_intent": majority_intent,
             "always_escalate": always_esc,
@@ -301,7 +324,7 @@ def main() -> int:
             "keyword_escalation": keyword_esc,
         },
     }
-    Path(REPORT_JSON).write_text(json.dumps(report, indent=2), encoding="utf-8")
+    Path(args.report).write_text(json.dumps(report, indent=2), encoding="utf-8")
 
     # ------------------------------------------------------------------ print
     print("\n" + "=" * 76)
@@ -339,28 +362,39 @@ def main() -> int:
     print(f"  intent labels pruned     {state['intent_labels_pruned']}")
     print(f"  escalation temperature   {state['escalation_temperature']:.4f}")
     print(f"  escalation threshold     {state['escalation_threshold']:.4f}")
+    bagging = state.get("intent_bagging", {})
+    print(f"  intent bagging           accepted={bagging.get('accepted')} "
+          f"heads={bagging.get('heads')} cal_gain={bagging.get('calibration_gain', 0.0):.4f}")
+    for name, verification in (state.get("blend_admission") or {}).items():
+        print(f"  {name:<24s} accepted={verification.get('accepted')} "
+              f"gain={verification.get('mean_macro_f1_gain', 0.0):+.4f} "
+              f"win_rate={verification.get('bootstrap_win_rate', 0.0):.2f}")
 
     print("\n[calibration]")
     print(f"  ECE                {ece['ece']:.4f}")
     print(f"  MCE                {ece['mce']:.4f}")
 
     print("\n[distribution-matched accuracy]")
-    print("  The review sample is stratified (54.5% ORDER_TRACKING) while real")
-    print("  traffic is ~68.7%. Reweighting per-class recall by the traffic prior")
-    print("  gives a deployment-representative estimate.")
+    eval_share = float((np.asarray(y_true) == "ORDER_TRACKING_AND_DELAY").mean()) if len(y_true) else 0.0
+    print(f"  Evaluation set share of ORDER_TRACKING_AND_DELAY: {eval_share:.2%}")
+    print("  Reweighting per-class recall by the traffic prior gives a")
+    print("  deployment-representative estimate that is comparable across protocols.")
     cm = np.asarray(intent_metrics["confusion_matrix"], dtype=float)
     row_totals = cm.sum(axis=1, keepdims=True)
     per_class_recall = np.divide(cm.diagonal()[:, None], np.clip(row_totals, 1, None)).ravel()
-    # Traffic prior comes from the training corpus, not the stratified sample.
+    # Traffic prior comes from the training corpus, not the (possibly stratified)
+    # evaluation sample.
     traffic_labels = train_pairs["reply_text"].fillna("").map(infer_reply_intent)
     traffic_counts = traffic_labels.dropna().value_counts(normalize=True)
     traffic_prior = np.asarray([float(traffic_counts.get(l, 0.0)) for l in labels])
     if traffic_prior.sum() > 0:
         traffic_prior = traffic_prior / traffic_prior.sum()
+    print(f"  traffic prior share of ORDER_TRACKING_AND_DELAY: {traffic_counts.get('ORDER_TRACKING_AND_DELAY', 0.0):.2%}")
     deployment_accuracy = float(np.sum(traffic_prior * per_class_recall))
     print(f"  empirical accuracy (eval prior)     {intent_metrics['accuracy']:.4f}")
     print(f"  deployment accuracy (traffic prior) {deployment_accuracy:.4f}")
     report["deployment_accuracy"] = round(deployment_accuracy, 4)
+    report["evaluation_prior_share_order_tracking"] = round(eval_share, 4)
     report["per_class_recall"] = {l: round(float(r), 4) for l, r in zip(labels, per_class_recall)}
 
     print("\n[reply] safety and compliance")
@@ -374,6 +408,18 @@ def main() -> int:
     print("\n[cost] loss = 1.0*FP + 10.0*FN")
     print(f"  optimal threshold  {cost['optimal_threshold']:.2f}")
     print(f"  minimum loss       {cost['minimum_loss']:.1f}")
+
+    print("\n[escalation frontier] highest precision at each recall floor")
+    print(f"  {'recall floor':>12s} {'precision':>10s} {'recall':>8s} {'threshold':>10s}")
+    for row in escalation_frontier:
+        if not row["reached"]:
+            print(f"  {row['recall_floor']:>12.2f} {'unreachable':>10s}")
+            continue
+        print(f"  {row['recall_floor']:>12.2f} {row['precision']:>10.4f} "
+              f"{row['recall']:>8.4f} {row['threshold']:>10.2f}")
+    print("  The gap between rows is what extra recall costs in human work:")
+    print("  precision near the base rate means the learned score adds little and")
+    print("  the deterministic hard gates carry the safety property.")
 
     print("\n[coverage] accuracy retained by confidence threshold")
     for row in coverage[::2]:
@@ -395,7 +441,7 @@ def main() -> int:
     print("\n[confusion] intent (rows = reference, cols = predicted)")
     print(_confusion_table(intent_metrics["confusion_matrix"], labels))
 
-    print(f"\nFull JSON report: {REPORT_JSON}")
+    print(f"\nFull JSON report: {args.report}")
     print("NOTE: reference labels are WEAK SUPERVISION, not human gold.")
     return 0
 

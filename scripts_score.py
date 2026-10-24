@@ -134,6 +134,30 @@ def _confusion_table(cm: list[list[int]], labels: list[str]) -> str:
     return "\n".join(rows)
 
 
+def _deployment_accuracy(intent_metrics, train_pairs, labels, y_true):
+    """Reweight per-class recall by the traffic prior.
+
+    The evaluation sample is stratified while real traffic is not, so raw
+    accuracy depends on the protocol. Reweighting per-class recall by the
+    corpus prior gives a figure that is comparable across protocols. The prior
+    comes from the training corpus, never from the sample being scored.
+    """
+    cm = np.asarray(intent_metrics["confusion_matrix"], dtype=float)
+    row_totals = cm.sum(axis=1, keepdims=True)
+    per_class_recall = np.divide(cm.diagonal()[:, None], np.clip(row_totals, 1, None)).ravel()
+    traffic_labels = train_pairs["reply_text"].fillna("").map(infer_reply_intent)
+    traffic_counts = traffic_labels.dropna().value_counts(normalize=True)
+    traffic_prior = np.asarray([float(traffic_counts.get(label, 0.0)) for label in labels])
+    if traffic_prior.sum() > 0:
+        traffic_prior = traffic_prior / traffic_prior.sum()
+    return float(np.sum(traffic_prior * per_class_recall)), traffic_prior, per_class_recall, traffic_counts
+
+
+def _write_report(path: str, report: dict) -> None:
+    """Persist the report. Called once, after every metric has been attached."""
+    Path(path).write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--in-sample", action="store_true",
@@ -401,7 +425,10 @@ def main() -> int:
             "keyword_escalation": keyword_esc,
         },
     }
-    Path(args.report).write_text(json.dumps(report, indent=2), encoding="utf-8")
+    # NOTE: the report is written from the distribution-matched section below,
+    # once every metric has been attached. Writing here previously dropped
+    # deployment_accuracy and per_class_recall from the JSON, so the console
+    # printed figures that the report never contained.
 
     # ------------------------------------------------------------------ print
     print("\n" + "=" * 76)
@@ -453,26 +480,20 @@ def main() -> int:
 
     print("\n[distribution-matched accuracy]")
     eval_share = float((np.asarray(y_true) == "ORDER_TRACKING_AND_DELAY").mean()) if len(y_true) else 0.0
+    deployment_accuracy, traffic_prior, per_class_recall, traffic_counts = _deployment_accuracy(
+        intent_metrics, train_pairs, labels, y_true
+    )
     print(f"  Evaluation set share of ORDER_TRACKING_AND_DELAY: {eval_share:.2%}")
     print("  Reweighting per-class recall by the traffic prior gives a")
     print("  deployment-representative estimate that is comparable across protocols.")
-    cm = np.asarray(intent_metrics["confusion_matrix"], dtype=float)
-    row_totals = cm.sum(axis=1, keepdims=True)
-    per_class_recall = np.divide(cm.diagonal()[:, None], np.clip(row_totals, 1, None)).ravel()
-    # Traffic prior comes from the training corpus, not the (possibly stratified)
-    # evaluation sample.
-    traffic_labels = train_pairs["reply_text"].fillna("").map(infer_reply_intent)
-    traffic_counts = traffic_labels.dropna().value_counts(normalize=True)
-    traffic_prior = np.asarray([float(traffic_counts.get(l, 0.0)) for l in labels])
-    if traffic_prior.sum() > 0:
-        traffic_prior = traffic_prior / traffic_prior.sum()
     print(f"  traffic prior share of ORDER_TRACKING_AND_DELAY: {traffic_counts.get('ORDER_TRACKING_AND_DELAY', 0.0):.2%}")
-    deployment_accuracy = float(np.sum(traffic_prior * per_class_recall))
     print(f"  empirical accuracy (eval prior)     {intent_metrics['accuracy']:.4f}")
     print(f"  deployment accuracy (traffic prior) {deployment_accuracy:.4f}")
     report["deployment_accuracy"] = round(deployment_accuracy, 4)
     report["evaluation_prior_share_order_tracking"] = round(eval_share, 4)
     report["per_class_recall"] = {l: round(float(r), 4) for l, r in zip(labels, per_class_recall)}
+    _write_report(args.report, report)
+
 
     print("\n[reply] safety and compliance")
     print(f"  guardrail pass     {reply_metrics['guardrail_pass_rate']:.4f}")

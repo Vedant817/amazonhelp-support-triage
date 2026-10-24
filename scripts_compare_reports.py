@@ -18,11 +18,20 @@ from typing import Any, Dict, List, Optional, Tuple
 
 
 def _get(report: Dict[str, Any], path: str) -> Optional[float]:
+    """Look up a dotted path, accepting numeric segments as list indices."""
     node: Any = report
     for key in path.split("."):
-        if not isinstance(node, dict) or key not in node:
+        if isinstance(node, dict):
+            if key not in node:
+                return None
+            node = node[key]
+        elif isinstance(node, list) and key.isdigit():
+            index = int(key)
+            if index >= len(node):
+                return None
+            node = node[index]
+        else:
             return None
-        node = node[key]
     return node if isinstance(node, (int, float)) and not isinstance(node, bool) else None
 
 
@@ -53,8 +62,11 @@ def main() -> int:
 
     label_a = first_path.stem
     label_b = second_path.stem
-    protocol_a = (first.get("protocol") or {}).get("holdout", "?")
-    protocol_b = (second.get("protocol") or {}).get("holdout", "?")
+    # `protocol` is the string "held-out"/"in-sample"; `holdout` carries the mode.
+    mode_a = (first.get("holdout") or {}).get("mode", "?")
+    mode_b = (second.get("holdout") or {}).get("mode", "?")
+    protocol_a = f"{first.get('protocol', '?')}/{mode_a}"
+    protocol_b = f"{second.get('protocol', '?')}/{mode_b}"
 
     print("=" * 78)
     print("  SCORE MATRIX COMPARISON")

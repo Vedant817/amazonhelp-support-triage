@@ -152,10 +152,15 @@ assumed):
 Diagnostics used to reach these numbers:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts_diagnose.py      # label noise, prior mismatch, majority floor
-.\.venv\Scripts\python.exe scripts_ceiling.py       # what is learnable from customer text
-.\.venv\Scripts\python.exe scripts_ceiling_eval.py  # simple recipe vs pipeline, same split
-.\.venv\Scripts\python.exe scripts_score.py         # full score matrix
+.\.venv\Scripts\python.exe scripts_diagnose.py         # label noise, prior mismatch, majority floor
+.\.venv\Scripts\python.exe scripts_cv_audit.py         # label circularity: reply-derived vs model-generated
+.\.venv\Scripts\python.exe scripts_feature_ab.py       # is the feature stack the bottleneck? (no)
+.\.venv\Scripts\python.exe scripts_preprocess_ab.py    # identifier normalisation (noise)
+.\.venv\Scripts\python.exe scripts_ceiling.py          # what is learnable from customer text
+.\.venv\Scripts\python.exe scripts_score.py --holdout random     # deployment-representative
+.\.venv\Scripts\python.exe scripts_score.py --holdout temporal   # drift check
+.\.venv\Scripts\python.exe scripts_score.py                      # hard-case review sample
+.\.venv\Scripts\python.exe scripts_compare_reports.py A.json B.json
 ```
 
 Tuning knobs (each participates in the cache fingerprint, so variants cache
@@ -166,6 +171,38 @@ separately):
 | `SUPPORT_INTENT_BALANCE_RATIO` | `0.0` (natural) | `>0` re-balances classes; measured to cost ~0.06 accuracy |
 | `SUPPORT_INTENT_CAP_PER_CLASS` | `20000` | Lower values truncate the dominant class's evidence |
 | `SUPPORT_INTENT_CLASS_WEIGHT` | `none` | `balanced` re-enables class reweighting |
+| `SUPPORT_USE_PROBABILISTIC_LABELS` | `1` | Include model-generated intent labels in supervision (see below) |
+| `SUPPORT_DISABLE_PIPELINE_CACHE` | unset | `1` forces a retrain instead of loading the cache |
+
+### Evaluation protocols
+
+The runner supports three holdout protocols, because a single number cannot
+describe a model that has to survive drift. Reports record which protocol
+produced them, and `scripts_compare_reports.py` refuses to compare across
+protocols without saying so.
+
+| Protocol | Command | What it measures |
+|---|---|---|
+| `review` | `--holdout review` | The 382 checked-in review rows. An **active-learning** sample (`active_learning_score` mean 0.767 over 0.52-0.93), i.e. the hardest rows in the corpus. A worst-case floor, not expected traffic. |
+| `random` | `--holdout random` | A stratified random sample of the labelled corpus, excluded from training. Deployment-representative, and the default basis for reported numbers. |
+| `temporal` | `--holdout temporal` | The newest 15% of conversations (`2017-12-02` to `2017-12-03` here). Train on the past, score the future — the only protocol that can fail for a reason other than sampling noise. |
+
+### On supervision quality
+
+Two facts about the labels bound what any model can score here, and both are
+measured rather than assumed (`scripts_cv_audit.py`):
+
+- **The labels describe the agent's reply, not the customer's intent.** They are
+  extracted from historical replies by rule, so a damage complaint answered with
+  refund language is labelled `REFUND_AND_RETURN`. The model only ever sees the
+  customer message, so part of the label is unlearnable by construction. This is
+  the dominant term in the remaining error and it is not fixable with modelling.
+- **40% of the intent labels were produced by an earlier weak-label model**
+  (5,616 of 14,067). Those labels score 0.898 out-of-fold macro-F1 against 0.643
+  for reply-derived labels, i.e. they are largely reproducible from features the
+  model already sees. Pooling them inflates any score computed over a label set
+  that contains them — an earlier revision of this file reported 0.81
+  cross-validated macro-F1 on that basis, against 0.64 for the honest subset.
 
 ## Security model
 

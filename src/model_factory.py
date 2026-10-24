@@ -148,6 +148,29 @@ def _prune_pipeline_caches(directory: Path, keep: str, retain: int = 3) -> List[
     return removed
 
 
+DEFAULT_ADJUDICATED_LABELS = "data/training/labels_human_adjudicated.csv"
+
+
+def _resolve_reviewed_csv(reviewed_csv: Optional[str]) -> Optional[str]:
+    """Pick up adjudicated human labels automatically when they exist.
+
+    The merge logic for human labels has always existed, but nothing ever passed
+    a path to it, so producing labels would have changed nothing. The convention
+    is overridable with SUPPORT_ADJUDICATED_LABELS (use an empty value to opt out)
+    and the file participates in the cache fingerprint, so adding labels
+    invalidates the cached pipeline instead of being silently ignored.
+    """
+    requested = os.getenv("SUPPORT_ADJUDICATED_LABELS")
+    if requested is not None:
+        requested = requested.strip()
+        if not requested:
+            return None
+        return requested if Path(requested).exists() else None
+    if reviewed_csv:
+        return reviewed_csv
+    return DEFAULT_ADJUDICATED_LABELS if Path(DEFAULT_ADJUDICATED_LABELS).exists() else None
+
+
 def _recency_weights(
     frame: pd.DataFrame,
     half_life_days: float,
@@ -240,8 +263,7 @@ def _balance_intent_classes(frame: pd.DataFrame, label_column: str, seed: int, m
 def build_learned_pipeline(
     pairs_csv: str,
     gold_csv: Optional[str] = None,
-    reviewed_csv: Optional[str] = None,
-    intent_cap_per_class: int = 20000,
+    reviewed_csv: Optional[str] = None,    intent_cap_per_class: int = 20000,
     retrieval_size: int = 8000,
     contrastive_pairs: int = 0,
     contrastive_cache_dir: str = "models",
@@ -260,6 +282,7 @@ def build_learned_pipeline(
                 "SUPPORT_ESCALATION_RECENCY_HALFLIFE_DAYS must be a number of days "
                 f"(got {_requested_half_life!r})"
             )
+    reviewed_csv = _resolve_reviewed_csv(reviewed_csv)
     source_root = Path(__file__).resolve().parent
     fingerprint_paths = [Path(pairs_csv)]
     if gold_csv:

@@ -20,6 +20,8 @@ htmlcov/
 data/raw/
 data/processed/amazonhelp_pairs.csv
 data/processed/amazonhelp_pairs.jsonl
+# Annotator working files: scratch, and they contain raw customer text.
+data/annotations/
 
 # Distribution / packaging
 build/
